@@ -1,0 +1,4 @@
+# Normalize every text file to LF in the repository and on checkout,
+# regardless of the contributor's OS or core.autocrlf setting.
+# Binary files are auto-detected by Git and left untouched.
+* text=auto eol=lf

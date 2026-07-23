@@ -1,0 +1,8 @@
+[package]
+name = "agoralume-backend"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Backend API server for AgoraLume, an open-source platform for user and multi-AI group chats with modular personas."
+
+[dependencies]
