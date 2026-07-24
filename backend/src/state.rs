@@ -7,12 +7,18 @@
 //! the API — just as the simulated turn will give way to a real LLM.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
+use crate::agent::event::Event;
+use crate::agent::turn::{AgentRuntime, coordinator_loop};
 use crate::models::{Message, ReadReceipt};
 use crate::workspace::Workspace;
+
+/// How many pending commands a group's coordinator buffers before senders back
+/// off. Turns are infrequent, so this is generous.
+const COMMAND_CAPACITY: usize = 64;
 
 /// How many live events a group's channel buffers for slow subscribers before
 /// they start lagging. Generous — turns are tiny and infrequent.
@@ -31,16 +37,50 @@ pub struct AppState {
     workspace: Mutex<Workspace>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     channels: Mutex<HashMap<String, broadcast::Sender<StreamEvent>>>,
+    /// The swappable agent runtime (brain + memory + loop config).
+    pub runtime: AgentRuntime,
+    /// One command channel per group, feeding its coordinator task. Created
+    /// lazily on first dispatch so idle groups run nothing.
+    coordinators: Mutex<HashMap<String, mpsc::Sender<Event>>>,
 }
 
 impl AppState {
-    /// Builds the seeded demo workspace.
-    pub fn seeded() -> Self {
+    /// Builds the seeded workspace with a specific runtime. `main` passes the
+    /// runtime the config selected; tests inject a scripted brain, a shared
+    /// memory store, or deterministic loop config.
+    pub fn with_runtime(runtime: AgentRuntime) -> Self {
         Self {
             workspace: Mutex::new(Workspace::seeded()),
             messages: Mutex::new(seed_messages()),
             channels: Mutex::new(HashMap::new()),
+            runtime,
+            coordinators: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Hands an event to a group's coordinator, spawning the coordinator task on
+    /// first use. Returns immediately; the turn runs in the background and its
+    /// replies, moods, and read receipts arrive on the group's stream.
+    pub fn dispatch(self: &Arc<Self>, group_id: &str, event: Event) {
+        let sender = self.coordinator(group_id);
+        // A full buffer means a burst of unserviced commands; dropping the
+        // newest is acceptable back-pressure for a chat turn.
+        let _ = sender.try_send(event);
+    }
+
+    /// The command sender for a group's coordinator, creating (and spawning) it
+    /// on first use.
+    fn coordinator(self: &Arc<Self>, group_id: &str) -> mpsc::Sender<Event> {
+        self.coordinators
+            .lock()
+            .unwrap()
+            .entry(group_id.to_string())
+            .or_insert_with(|| {
+                let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
+                tokio::spawn(coordinator_loop(self.clone(), group_id.to_string(), receiver));
+                sender
+            })
+            .clone()
     }
 
     /// Locks the workspace for reading or mutation. All CRUD invariants live on

@@ -189,6 +189,34 @@ paths:
                 $ref: '#/components/schemas/Group'
         '404':
           description: ''
+  /groups/{id}/events:
+    post:
+      tags:
+      - chat
+      summary: |-
+        Posts an environment event into a group — rain, time passing, an emergency —
+        letting the world outside the chat influence the agents. Accepted and queued
+        for the group's coordinator; its effect (reactions, moods) arrives on the
+        group's SSE stream.
+      operationId: post_event
+      parameters:
+      - name: id
+        in: path
+        description: Group id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBody'
+        required: true
+      responses:
+        '202':
+          description: Event accepted
+        '404':
+          description: Unknown group
   /groups/{id}/messages:
     get:
       tags:
@@ -538,6 +566,20 @@ components:
             type: string
           propertyNames:
             type: string
+    EventBody:
+      type: object
+      description: The body of an environment-event request.
+      required:
+      - description
+      properties:
+        description:
+          type: string
+          description: A short description of what changed, e.g. "It starts to rain."
+        urgent:
+          type: boolean
+          description: |-
+            Urgent events preempt the current turn (discarding the in-flight agent);
+            ordinary ones fold into the context at the next agent boundary.
     Group:
       type: object
       description: |-

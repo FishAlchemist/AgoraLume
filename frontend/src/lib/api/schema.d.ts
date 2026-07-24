@@ -28,6 +28,15 @@ export interface paths {
     delete: operations["delete_group"];
     patch: operations["update_group"];
   };
+  "/groups/{id}/events": {
+    /**
+     * Posts an environment event into a group — rain, time passing, an emergency —
+     * letting the world outside the chat influence the agents. Accepted and queued
+     * for the group's coordinator; its effect (reactions, moods) arrives on the
+     * group's SSE stream.
+     */
+    post: operations["post_event"];
+  };
   "/groups/{id}/messages": {
     /** The full message history for a group, oldest first. */
     get: operations["list_messages"];
@@ -101,6 +110,16 @@ export interface components {
       variables?: {
         [key: string]: string;
       } | null;
+    };
+    /** @description The body of an environment-event request. */
+    EventBody: {
+      /** @description A short description of what changed, e.g. "It starts to rain." */
+      description: string;
+      /**
+       * @description Urgent events preempt the current turn (discarding the in-flight agent);
+       * ordinary ones fold into the context at the next agent boundary.
+       */
+      urgent?: boolean;
     };
     /**
      * @description A chat room: the AI personas that may speak, plus the user identity that
@@ -381,6 +400,35 @@ export interface operations {
           "application/json": components["schemas"]["Group"];
         };
       };
+      404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * Posts an environment event into a group — rain, time passing, an emergency —
+   * letting the world outside the chat influence the agents. Accepted and queued
+   * for the group's coordinator; its effect (reactions, moods) arrives on the
+   * group's SSE stream.
+   */
+  post_event: {
+    parameters: {
+      path: {
+        /** @description Group id */
+        id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["EventBody"];
+      };
+    };
+    responses: {
+      /** @description Event accepted */
+      202: {
+        content: never;
+      };
+      /** @description Unknown group */
       404: {
         content: never;
       };

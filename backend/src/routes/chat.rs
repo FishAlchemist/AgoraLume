@@ -15,8 +15,8 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::agent::event::Event as AgentEvent;
 use crate::models::{Message, ServerMeta};
-use crate::sim::schedule_turn;
 use crate::state::{AppState, StreamEvent};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
@@ -24,6 +24,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(health))
         .routes(routes!(meta))
         .routes(routes!(list_messages, send_message))
+        .routes(routes!(post_event))
         .routes(routes!(stream))
 }
 
@@ -38,12 +39,14 @@ async fn health() -> &'static str {
 /// in-memory) from a production one — separately from mere reachability.
 #[utoipa::path(get, path = "/meta", tag = "service",
     responses((status = 200, description = "Server capabilities", body = ServerMeta)))]
-async fn meta() -> Json<ServerMeta> {
-    // This build has no LLM and no persistence, so it reports mock mode.
-    // Flip `llm`/`persistent` (and `mock`) here as those land.
+async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
+    // Reflect the actual runtime: mock mode is the rule-based, in-memory data
+    // layer; leaving it (AGORALUME_LLM) means a real LLM drives the agents.
+    // Persistence is not toggleable yet, so it is always off in this build.
+    let mock = state.runtime.mock;
     Json(ServerMeta {
-        mock: true,
-        llm: false,
+        mock,
+        llm: !mock,
         persistent: false,
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
@@ -100,8 +103,46 @@ async fn send_message(
     let message = Message::conversation(&id, author, body.text.clone(), Some(vec![]));
     state.store(&id, message.clone());
 
-    schedule_turn(state, id, message.id().to_string(), body.text);
+    // Hand the turn to the group's coordinator; replies stream in over SSE.
+    state.dispatch(&id, AgentEvent::User { message_id: message.id().to_string() });
     Ok(Json(message))
+}
+
+/// The body of an environment-event request.
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct EventBody {
+    /// A short description of what changed, e.g. "It starts to rain."
+    description: String,
+    /// Urgent events preempt the current turn (discarding the in-flight agent);
+    /// ordinary ones fold into the context at the next agent boundary.
+    #[serde(default)]
+    urgent: bool,
+}
+
+/// Posts an environment event into a group — rain, time passing, an emergency —
+/// letting the world outside the chat influence the agents. Accepted and queued
+/// for the group's coordinator; its effect (reactions, moods) arrives on the
+/// group's SSE stream.
+#[utoipa::path(post, path = "/groups/{id}/events", tag = "chat",
+    params(("id" = String, Path, description = "Group id")),
+    request_body = EventBody,
+    responses(
+        (status = 202, description = "Event accepted"),
+        (status = 404, description = "Unknown group")))]
+async fn post_event(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<EventBody>,
+) -> StatusCode {
+    if state.workspace().turn_members(&id).is_none() {
+        return StatusCode::NOT_FOUND;
+    }
+    state.dispatch(
+        &id,
+        AgentEvent::Environment { description: body.description, urgent: body.urgent },
+    );
+    StatusCode::ACCEPTED
 }
 
 /// Server-Sent Events for a group: default `message` events (AI replies and

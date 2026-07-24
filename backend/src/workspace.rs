@@ -8,7 +8,7 @@
 //! Everything is in memory and seeded on startup — this build never touches
 //! disk. Persistence will slot in behind the same API later.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -252,6 +252,40 @@ impl Workspace {
             .cloned()
             .collect();
         Some((group.self_persona_id.clone(), ai_members))
+    }
+
+    /// A single persona by id, cloned for use outside the workspace lock.
+    pub fn persona(&self, id: &str) -> Option<Persona> {
+        self.personas.iter().find(|p| p.id == id).cloned()
+    }
+
+    /// The template variables in scope for a persona, resolved down the
+    /// inheritance chain: organization → department → persona, each level
+    /// overriding the last. This is what a model needs to fill its prompt, so it
+    /// lives in the SSOT rather than being recomputed per client.
+    pub fn resolve_variables(&self, persona: &Persona) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        if let Some(dept_id) = &persona.department_id
+            && let Some(dept) = self.departments.iter().find(|d| &d.id == dept_id)
+        {
+            if let Some(org) = self.organizations.iter().find(|o| o.id == dept.organization_id)
+                && let Some(v) = &org.variables
+            {
+                vars.extend(v.clone());
+            }
+            if let Some(v) = &dept.variables {
+                vars.extend(v.clone());
+            }
+        } else if let Some(org_id) = &persona.organization_id
+            && let Some(org) = self.organizations.iter().find(|o| &o.id == org_id)
+            && let Some(v) = &org.variables
+        {
+            vars.extend(v.clone());
+        }
+        if let Some(v) = &persona.variables {
+            vars.extend(v.clone());
+        }
+        vars
     }
 }
 

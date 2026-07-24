@@ -8,10 +8,10 @@
 //!
 //! Point the frontend at it with `VITE_API_BASE_URL=http://127.0.0.1:8080`.
 
+mod agent;
 mod config;
 mod models;
 mod routes;
-mod sim;
 mod state;
 mod workspace;
 
@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
+use crate::agent::turn::AgentRuntime;
 use crate::config::Config;
 use crate::state::AppState;
 
@@ -46,7 +47,20 @@ async fn main() {
         .init();
 
     let config = Config::from_env();
-    let state = Arc::new(AppState::seeded());
+
+    // Pick the agent runtime the config asks for. Mock is the default so a plain
+    // run never spends API budget; `AGORALUME_LLM` opts out of it. No LLM adapter
+    // is wired yet, so opting in fails fast rather than silently running the mock.
+    let runtime = if config.llm {
+        eprintln!(
+            "AGORALUME_LLM is set, but no LLM adapter is wired yet. \
+             Unset it to run the default mock brain."
+        );
+        std::process::exit(1);
+    } else {
+        AgentRuntime::mock()
+    };
+    let state = Arc::new(AppState::with_runtime(runtime));
     let app = routes::router(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind)
