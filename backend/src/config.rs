@@ -13,6 +13,14 @@ pub struct Config {
     /// default so a plain run never spends API budget; set `AGORALUME_LLM` to
     /// opt in. No adapter is wired yet, so opting in fails fast at startup.
     pub llm: bool,
+    /// Explicit path to the built frontend to serve. Normally left unset — the
+    /// bundle ships the SPA in a `web/` directory next to the executable, which
+    /// is discovered automatically. Set `AGORALUME_WEB_DIR` to override.
+    pub web_dir: Option<String>,
+    /// Whether to open the site in a browser once the server is up. Only acts
+    /// when the SPA is actually being served (bundle mode); a plain API run
+    /// never launches a browser. On by default; set `AGORALUME_OPEN=0` to skip.
+    pub open_browser: bool,
 }
 
 impl Config {
@@ -22,7 +30,15 @@ impl Config {
             .parse()
             .unwrap_or_else(|_| panic!("invalid AGORALUME_BIND `{bind}` (want host:port)"));
         let data_dir = std::env::var("AGORALUME_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-        Self { bind, data_dir, llm: env_flag("AGORALUME_LLM") }
+        let web_dir = std::env::var("AGORALUME_WEB_DIR").ok();
+        // Default on, so double-clicking the bundle "just works"; only an
+        // explicit unset-like value opts out.
+        let open_browser = std::env::var("AGORALUME_OPEN")
+            .map(|v| {
+                !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(true);
+        Self { bind, data_dir, llm: env_flag("AGORALUME_LLM"), web_dir, open_browser }
     }
 }
 

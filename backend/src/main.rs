@@ -15,8 +15,12 @@ mod routes;
 mod state;
 mod workspace;
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::net::TcpListener;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
 use crate::agent::turn::AgentRuntime;
@@ -63,17 +67,88 @@ async fn main() {
     let state = Arc::new(AppState::with_runtime(runtime));
     let app = routes::router(state);
 
-    let listener = tokio::net::TcpListener::bind(config.bind)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {}: {e}", config.bind));
+    // Bundle mode: if a built frontend sits next to us, serve it from the same
+    // origin as the API so one executable is the whole site. Unknown paths fall
+    // back to index.html for the SPA's client-side routes. A plain `cargo run`
+    // has no `web/` dir, so this is skipped and the server is API-only.
+    let web_dir = resolve_web_dir(&config);
+    let app = match &web_dir {
+        Some(dir) => {
+            let index = dir.join("index.html");
+            // `.fallback` (not `.not_found_service`) serves index.html with its
+            // natural 200 for unknown paths, so a hard refresh on a client-side
+            // route loads the SPA instead of a 404.
+            let serve = ServeDir::new(dir).fallback(ServeFile::new(index));
+            app.fallback_service(serve)
+        }
+        None => app,
+    };
+
+    // Prefer the configured address; if it's taken, fall back to an OS-assigned
+    // port so double-clicking the bundle never dies on a port clash.
+    let listener = match TcpListener::bind(config.bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                address = %config.bind,
+                error = %e,
+                "could not bind the configured address; falling back to an OS-assigned port"
+            );
+            let fallback = SocketAddr::new(config.bind.ip(), 0);
+            TcpListener::bind(fallback)
+                .await
+                .unwrap_or_else(|e| panic!("failed to bind fallback port: {e}"))
+        }
+    };
+    let addr = listener.local_addr().unwrap_or(config.bind);
+
+    // A wildcard bind (0.0.0.0) isn't a browsable host; point the browser and
+    // the log at loopback in that case.
+    let host = if addr.ip().is_unspecified() {
+        std::net::Ipv4Addr::LOCALHOST.to_string()
+    } else {
+        addr.ip().to_string()
+    };
+    let url = format!("http://{host}:{}", addr.port());
 
     tracing::info!(
-        address = %config.bind,
+        %url,
         data_dir = %config.data_dir,
+        serving_web = web_dir.is_some(),
         "AgoraLume backend listening (in-memory store; simulated replies, no LLM yet)"
     );
 
-    axum::serve(listener, app)
-        .await
-        .expect("server error");
+    // Only pop a browser when we're actually the site (bundle mode) and the
+    // operator hasn't opted out. `webbrowser::open` blocks, so keep it off the
+    // async runtime's worker.
+    if web_dir.is_some() && config.open_browser {
+        let url = url.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = webbrowser::open(&url) {
+                tracing::warn!(error = %e, "could not open a browser; open {url} manually");
+            }
+        });
+    }
+
+    axum::serve(listener, app).await.expect("server error");
+}
+
+/// Finds the built frontend to serve, or `None` to run API-only.
+///
+/// Checks, in order: an explicit `AGORALUME_WEB_DIR`, a `web/` directory beside
+/// the executable (the bundle layout), then `web/` in the working directory.
+fn resolve_web_dir(config: &Config) -> Option<PathBuf> {
+    if let Some(dir) = &config.web_dir {
+        let path = PathBuf::from(dir);
+        return path.is_dir().then_some(path);
+    }
+    if let Some(beside_exe) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("web")))
+        && beside_exe.is_dir()
+    {
+        return Some(beside_exe);
+    }
+    let cwd = PathBuf::from("web");
+    cwd.is_dir().then_some(cwd)
 }

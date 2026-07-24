@@ -21,6 +21,10 @@ id_rsa
 id_ed25519
 *.der
 
+# ---- Packaged bundle output -------------------------------------------------
+# Staging + zip produced by scripts/bundle.mjs (backend exe + built frontend).
+/dist-bundle/
+
 # ---- Archives & large binaries ----------------------------------------------
 # (Manually curated. Keep bulky/build artifacts out of git; use Releases or LFS.)
 *.zip

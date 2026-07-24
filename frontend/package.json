@@ -13,6 +13,7 @@
     "backend": "cargo run --manifest-path ../backend/Cargo.toml",
     "dev:full": "concurrently -k -n backend,web -c blue,green \"pnpm backend\" \"pnpm dev:api\"",
     "build": "tsc --noEmit && vite build",
+    "build:bundle": "tsc --noEmit && cross-env VITE_SAME_ORIGIN=1 vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint .",

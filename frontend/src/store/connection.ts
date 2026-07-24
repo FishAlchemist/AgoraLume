@@ -6,7 +6,15 @@ import { persist } from 'zustand/middleware';
 // the choice is persisted.
 const envUrl = import.meta.env.VITE_API_BASE_URL?.trim();
 const forceMock = import.meta.env.VITE_USE_MOCK === '1';
-const initialBackendUrl = !forceMock && envUrl ? envUrl : null;
+// The single-binary bundle serves the SPA and the API from one origin. Building
+// with VITE_SAME_ORIGIN=1 makes the app default to that origin (a real,
+// non-empty URL, so every `if (backendUrl)` consumer treats it as a live
+// backend) instead of the in-browser mock.
+const sameOrigin =
+  import.meta.env.VITE_SAME_ORIGIN === '1' && typeof window !== 'undefined'
+    ? window.location.origin
+    : null;
+const initialBackendUrl = forceMock ? null : envUrl || sameOrigin || null;
 
 interface ConnectionState {
   /** The backend to talk to; `null` means the in-browser mock. */
