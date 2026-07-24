@@ -13,6 +13,18 @@ export interface ReadReceipt {
 export type ReadHandler = (receipt: ReadReceipt) => void;
 
 /**
+ * What the data source offers. `mock` means no LLM and no persistence (the
+ * in-memory build) — distinct from whether the backend is reachable. The
+ * in-browser mock reports `mock: true` too.
+ */
+export interface ServerMeta {
+  mock: boolean;
+  llm: boolean;
+  persistent: boolean;
+  version?: string;
+}
+
+/**
  * The contract between the frontend and any AgoraLume message backend. The UI
  * depends only on this interface, never on a concrete transport, so chat runs
  * unchanged against the in-memory mock or a real HTTP backend.
@@ -22,10 +34,22 @@ export type ReadHandler = (receipt: ReadReceipt) => void;
  * offline. A real backend would later sync that store.
  */
 export interface ChatApi {
+  /**
+   * Probes the data source: resolves its {@link ServerMeta} when reachable, or
+   * `null` when unreachable. Combines liveness (null?) with mode (mock?), so the
+   * UI can show "offline" and "mock" as separate facts. The in-browser mock
+   * always resolves (never null).
+   */
+  probe(): Promise<ServerMeta | null>;
+
   listMessages(groupId: string): Promise<Message[]>;
 
-  /** Sends a user message and resolves with the persisted message. */
-  sendMessage(groupId: string, text: string): Promise<Message>;
+  /**
+   * Sends a user message and resolves with the persisted message. `personaId`
+   * is the active "you" identity to author it as; when omitted the backend
+   * falls back to the group's stored self identity.
+   */
+  sendMessage(groupId: string, text: string, personaId?: string): Promise<Message>;
 
   /**
    * Subscribes to messages the backend pushes for a group (AI replies, mood

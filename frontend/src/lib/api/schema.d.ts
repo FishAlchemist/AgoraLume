@@ -46,8 +46,15 @@ export interface paths {
     get: operations["stream"];
   };
   "/health": {
-    /** Liveness probe. */
+    /** Liveness probe — cheap "is the server up" check. */
     get: operations["health"];
+  };
+  "/meta": {
+    /**
+     * The server's mode, so the client can distinguish a mock build (no LLM,
+     * in-memory) from a production one — separately from mere reachability.
+     */
+    get: operations["meta"];
   };
   "/organizations": {
     get: operations["list_orgs"];
@@ -178,8 +185,31 @@ export interface components {
     };
     /** @description The body of a send request. */
     SendBody: {
-      /** @description The message text to post as the group's current "you" identity. */
+      /**
+       * @description The "you" identity to author the message as. When omitted, the group's
+       * stored `selfPersonaId` is used.
+       */
+      personaId?: string | null;
+      /** @description The message text. */
       text: string;
+    };
+    /**
+     * @description What the running server offers — lets the client tell a mock build (no LLM,
+     * in-memory only) apart from a production one, independently of whether the
+     * server is reachable at all.
+     */
+    ServerMeta: {
+      /** @description An LLM is wired in to generate replies. */
+      llm: boolean;
+      /**
+       * @description No LLM and no persistence — the "mock" mode. Equivalent to
+       * `!llm && !persistent`.
+       */
+      mock: boolean;
+      /** @description State is persisted and survives a restart. */
+      persistent: boolean;
+      /** @description Server crate version. */
+      version: string;
     };
     /** @description User-level preferences. */
     Settings: {
@@ -421,13 +451,27 @@ export interface operations {
       };
     };
   };
-  /** Liveness probe. */
+  /** Liveness probe — cheap "is the server up" check. */
   health: {
     responses: {
       /** @description Service is up */
       200: {
         content: {
           "text/plain": string;
+        };
+      };
+    };
+  };
+  /**
+   * The server's mode, so the client can distinguish a mock build (no LLM,
+   * in-memory) from a production one — separately from mere reachability.
+   */
+  meta: {
+    responses: {
+      /** @description Server capabilities */
+      200: {
+        content: {
+          "application/json": components["schemas"]["ServerMeta"];
         };
       };
     };

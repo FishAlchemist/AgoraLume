@@ -92,6 +92,23 @@ pub struct Group {
     pub self_persona_id: String,
 }
 
+/// What the running server offers — lets the client tell a mock build (no LLM,
+/// in-memory only) apart from a production one, independently of whether the
+/// server is reachable at all.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerMeta {
+    /// No LLM and no persistence — the "mock" mode. Equivalent to
+    /// `!llm && !persistent`.
+    pub mock: bool,
+    /// An LLM is wired in to generate replies.
+    pub llm: bool,
+    /// State is persisted and survives a restart.
+    pub persistent: bool,
+    /// Server crate version.
+    pub version: String,
+}
+
 /// User-level preferences.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

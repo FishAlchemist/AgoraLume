@@ -1,5 +1,5 @@
 import type { Message } from '../../types';
-import type { ChatApi, MessageHandler, ReadHandler, ReadReceipt } from './types';
+import type { ChatApi, MessageHandler, ReadHandler, ReadReceipt, ServerMeta } from './types';
 
 /**
  * Talks to an AgoraLume backend over HTTP. The base URL is injected via
@@ -21,15 +21,26 @@ export class HttpChatApi implements ChatApi {
     return (await res.json()) as T;
   }
 
+  async probe(): Promise<ServerMeta | null> {
+    try {
+      const res = await fetch(`${this.baseUrl}/meta`, { headers: { Accept: 'application/json' } });
+      if (!res.ok) return null;
+      return (await res.json()) as ServerMeta;
+    } catch {
+      // Network error / server down.
+      return null;
+    }
+  }
+
   listMessages(groupId: string): Promise<Message[]> {
     return this.getJson<Message[]>(`/groups/${groupId}/messages`);
   }
 
-  async sendMessage(groupId: string, text: string): Promise<Message> {
+  async sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {
     const res = await fetch(`${this.baseUrl}/groups/${groupId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, personaId }),
     });
     if (!res.ok) throw new Error(`sendMessage failed: ${res.status}`);
     return (await res.json()) as Message;

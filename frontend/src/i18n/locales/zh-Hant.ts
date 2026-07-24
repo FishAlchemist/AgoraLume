@@ -12,6 +12,13 @@ export const zhHant: TranslationSchema = {
   },
   badge: {
     mock: '模擬',
+    mockLocal: '模擬·本地',
+    mockHint: '無 LLM、純記憶體',
+    checking: '連線中…',
+    offline: '離線',
+    offlineHint: '無法連上後端——請確認它正在執行',
+    live: '上線',
+    liveHint: '已連上具備 LLM 的後端',
   },
   common: {
     save: '儲存',

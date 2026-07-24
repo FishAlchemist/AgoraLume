@@ -262,8 +262,8 @@ paths:
   /health:
     get:
       tags:
-      - chat
-      summary: Liveness probe.
+      - service
+      summary: Liveness probe — cheap "is the server up" check.
       operationId: health
       responses:
         '200':
@@ -272,6 +272,21 @@ paths:
             text/plain:
               schema:
                 type: string
+  /meta:
+    get:
+      tags:
+      - service
+      summary: |-
+        The server's mode, so the client can distinguish a mock build (no LLM,
+        in-memory) from a production one — separately from mere reachability.
+      operationId: meta
+      responses:
+        '200':
+          description: Server capabilities
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerMeta'
   /organizations:
     get:
       tags:
@@ -721,9 +736,42 @@ components:
       required:
       - text
       properties:
+        personaId:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The "you" identity to author the message as. When omitted, the group's
+            stored `selfPersonaId` is used.
         text:
           type: string
-          description: The message text to post as the group's current "you" identity.
+          description: The message text.
+    ServerMeta:
+      type: object
+      description: |-
+        What the running server offers — lets the client tell a mock build (no LLM,
+        in-memory only) apart from a production one, independently of whether the
+        server is reachable at all.
+      required:
+      - mock
+      - llm
+      - persistent
+      - version
+      properties:
+        llm:
+          type: boolean
+          description: An LLM is wired in to generate replies.
+        mock:
+          type: boolean
+          description: |-
+            No LLM and no persistence — the "mock" mode. Equivalent to
+            `!llm && !persistent`.
+        persistent:
+          type: boolean
+          description: State is persisted and survives a restart.
+        version:
+          type: string
+          description: Server crate version.
     Settings:
       type: object
       description: User-level preferences.
@@ -740,6 +788,8 @@ components:
         uiLanguage:
           type: string
 tags:
+- name: service
+  description: Liveness and server mode
 - name: chat
   description: Messages and the live SSE stream
 - name: organizations

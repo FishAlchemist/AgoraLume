@@ -33,6 +33,7 @@ use crate::state::AppState;
         description = "AgoraLume API: user + multi-AI group chat with modular personas. The backend is the single source of truth for the workspace (organizations, departments, personas, groups, settings) and streams chat over SSE. This is the production API contract; the current build backs it with an in-memory store and simulated agent replies until an LLM is connected."
     ),
     tags(
+        (name = "service", description = "Liveness and server mode"),
         (name = "chat", description = "Messages and the live SSE stream"),
         (name = "organizations", description = "Top-level persona buckets"),
         (name = "departments", description = "Sub-units within an organization"),

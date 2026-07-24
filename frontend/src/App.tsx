@@ -1,4 +1,4 @@
-import { AppShell, Badge, Burger, Group, Text, Title } from '@mantine/core';
+import { AppShell, Badge, Burger, Group, Text, Title, Tooltip } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -8,7 +8,7 @@ import { ConfirmDialog } from './components/ConfirmDialog';
 import { HeaderControls } from './components/HeaderControls';
 import { PersonaCard } from './components/PersonaCard';
 import { PersonaFormModal } from './components/PersonaFormModal';
-import { usingMock } from './lib/api';
+import { useBackendStatus } from './lib/useBackendStatus';
 import { ChatPage } from './pages/ChatPage';
 import { OrganizationsPage } from './pages/OrganizationsPage';
 import { PersonasPage } from './pages/PersonasPage';
@@ -27,7 +27,7 @@ export function App() {
 }
 
 function Shell() {
-  const { t, i18n } = useTranslation();
+  const { i18n } = useTranslation();
   const [opened, { toggle, close }] = useDisclosure();
   const uiLanguage = useWorkspace((s) => s.settings.uiLanguage);
   const navigate = useNavigate();
@@ -59,11 +59,7 @@ function Shell() {
                 AgoraLume
               </Text>
             </Title>
-            {usingMock && (
-              <Badge variant="light" color="yellow" size="sm">
-                {t('badge.mock')}
-              </Badge>
-            )}
+            <DataSourceBadge />
           </Group>
           <HeaderControls />
         </Group>
@@ -90,6 +86,49 @@ function Shell() {
       <PersonaEditorHost />
       <ConfirmDialog />
     </AppShell>
+  );
+}
+
+/**
+ * Header badge showing the data source. Keeps two facts separate: is the
+ * backend reachable (offline vs online), and is it in mock mode — no LLM,
+ * in-memory (mock/yellow) vs a live LLM backend (live/green).
+ */
+function DataSourceBadge() {
+  const { t } = useTranslation();
+  const { reachable, mock } = useBackendStatus();
+
+  if (reachable === 'checking') {
+    return (
+      <Badge variant="light" color="gray" size="sm">
+        {t('badge.checking')}
+      </Badge>
+    );
+  }
+  if (reachable === 'offline') {
+    return (
+      <Tooltip label={t('badge.offlineHint')}>
+        <Badge variant="light" color="red" size="sm">
+          {t('badge.offline')}
+        </Badge>
+      </Tooltip>
+    );
+  }
+  if (mock) {
+    return (
+      <Tooltip label={t('badge.mockHint')}>
+        <Badge variant="light" color="yellow" size="sm">
+          {reachable === 'local' ? t('badge.mockLocal') : t('badge.mock')}
+        </Badge>
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip label={t('badge.liveHint')}>
+      <Badge variant="light" color="green" size="sm">
+        {t('badge.live')}
+      </Badge>
+    </Tooltip>
   );
 }
 

@@ -86,7 +86,7 @@ export function ChatView({ group, personas }: Props) {
   const handleSend = async (text: string) => {
     if (locked || awaitingReply) return;
     setAwaitingReply(true);
-    const message = await api.sendMessage(group.id, text);
+    const message = await api.sendMessage(group.id, text, selfId);
     setMessages((prev) => (prev ? [...prev, message] : [message]));
     setPendingId(message.id);
   };

@@ -15,22 +15,38 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::models::Message;
+use crate::models::{Message, ServerMeta};
 use crate::sim::schedule_turn;
 use crate::state::{AppState, StreamEvent};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(health))
+        .routes(routes!(meta))
         .routes(routes!(list_messages, send_message))
         .routes(routes!(stream))
 }
 
-/// Liveness probe.
-#[utoipa::path(get, path = "/health", tag = "chat",
+/// Liveness probe — cheap "is the server up" check.
+#[utoipa::path(get, path = "/health", tag = "service",
     responses((status = 200, description = "Service is up", body = String)))]
 async fn health() -> &'static str {
     "ok"
+}
+
+/// The server's mode, so the client can distinguish a mock build (no LLM,
+/// in-memory) from a production one — separately from mere reachability.
+#[utoipa::path(get, path = "/meta", tag = "service",
+    responses((status = 200, description = "Server capabilities", body = ServerMeta)))]
+async fn meta() -> Json<ServerMeta> {
+    // This build has no LLM and no persistence, so it reports mock mode.
+    // Flip `llm`/`persistent` (and `mock`) here as those land.
+    Json(ServerMeta {
+        mock: true,
+        llm: false,
+        persistent: false,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }
 
 /// The full message history for a group, oldest first.
@@ -46,9 +62,14 @@ async fn list_messages(
 
 /// The body of a send request.
 #[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct SendBody {
-    /// The message text to post as the group's current "you" identity.
+    /// The message text.
     text: String,
+    /// The "you" identity to author the message as. When omitted, the group's
+    /// stored `selfPersonaId` is used.
+    #[serde(default)]
+    persona_id: Option<String>,
 }
 
 /// Posts a user message and kicks off the agents' turn. The returned line is the
@@ -66,14 +87,17 @@ async fn send_message(
     Json(body): Json<SendBody>,
 ) -> Result<Json<Message>, StatusCode> {
     // `turn_members` doubles as an existence check and gives us the group's
-    // active "you" identity to author the message as.
+    // stored "you" identity to fall back on.
     let Some((self_id, _ai)) = state.workspace().turn_members(&id) else {
         return Err(StatusCode::NOT_FOUND);
     };
+    // Author as the caller's active identity when provided (until the workspace
+    // is synced, the client is the source of truth for who "you" currently are).
+    let author = body.persona_id.clone().unwrap_or(self_id);
 
     // Store the user's line (seeded with an empty read set) and hand it back.
     // It is not broadcast: the client already renders it from this response.
-    let message = Message::conversation(&id, self_id, body.text.clone(), Some(vec![]));
+    let message = Message::conversation(&id, author, body.text.clone(), Some(vec![]));
     state.store(&id, message.clone());
 
     schedule_turn(state, id, message.id().to_string(), body.text);

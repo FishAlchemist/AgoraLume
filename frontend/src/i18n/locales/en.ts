@@ -10,6 +10,13 @@ export const en = {
   },
   badge: {
     mock: 'mock',
+    mockLocal: 'mock · local',
+    mockHint: 'No LLM, in-memory only',
+    checking: 'connecting…',
+    offline: 'offline',
+    offlineHint: 'Backend unreachable — check it is running',
+    live: 'live',
+    liveHint: 'Connected to a live LLM backend',
   },
   common: {
     save: 'Save',

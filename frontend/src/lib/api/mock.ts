@@ -1,6 +1,6 @@
 import { useWorkspace } from '../../store/workspace';
 import type { Message } from '../../types';
-import type { ChatApi, MessageHandler, ReadHandler } from './types';
+import type { ChatApi, MessageHandler, ReadHandler, ServerMeta } from './types';
 
 let seq = 0;
 const nextId = () => `m${Date.now()}-${seq++}`;
@@ -18,16 +18,24 @@ export class MockChatApi implements ChatApi {
   private subs = new Map<string, Set<MessageHandler>>();
   private readSubs = new Map<string, Set<ReadHandler>>();
 
+  async probe(): Promise<ServerMeta> {
+    // The mock runs entirely in-browser — always reachable, always mock mode.
+    return { mock: true, llm: false, persistent: false };
+  }
+
   async listMessages(groupId: string): Promise<Message[]> {
     // Return a copy so callers never alias (and mutate) our internal array.
     return [...(this.messages[groupId] ?? [])];
   }
 
-  async sendMessage(groupId: string, text: string): Promise<Message> {
+  async sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {
     const state = useWorkspace.getState();
     const group = state.groups.find((g) => g.id === groupId);
     const selfId =
-      group?.selfPersonaId || state.personas.find((p) => p.kind === 'user')?.id || 'user';
+      personaId ||
+      group?.selfPersonaId ||
+      state.personas.find((p) => p.kind === 'user')?.id ||
+      'user';
     const msg: Message = {
       id: nextId(),
       groupId,
