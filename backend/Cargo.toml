@@ -6,3 +6,14 @@ license = "AGPL-3.0-only"
 description = "Backend API server for AgoraLume, an open-source platform for user and multi-AI group chats with modular personas."
 
 [dependencies]
+axum = "0.8.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "yaml"] }
+utoipa-axum = "0.2.0"
+uuid = { version = "1.24.0", features = ["v4"] }

@@ -6,8 +6,9 @@ import type { ChatApi, MessageHandler, ReadHandler, ReadReceipt } from './types'
  * VITE_API_BASE_URL, so the frontend stays fully decoupled: point it at any
  * compatible backend, or leave it unset to fall back to the in-memory mock.
  *
- * Endpoints are a proposal for the backend to implement, not a hard contract
- * yet — adjust here (and in the backend) as the API firms up.
+ * The endpoints below follow the backend's OpenAPI contract (`openapi.yml` at
+ * the repo root); the generated request/response types live in `./schema.d.ts`
+ * (regenerate both with `pnpm gen:api`).
  */
 export class HttpChatApi implements ChatApi {
   constructor(private readonly baseUrl: string) {}

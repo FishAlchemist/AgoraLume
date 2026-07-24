@@ -9,13 +9,19 @@
   "author": "",
   "scripts": {
     "dev": "vite",
+    "dev:api": "cross-env VITE_API_BASE_URL=http://127.0.0.1:8080 vite",
+    "backend": "cargo run --manifest-path ../backend/Cargo.toml",
+    "dev:full": "concurrently -k -n backend,web -c blue,green \"pnpm backend\" \"pnpm dev:api\"",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "check": "biome check .",
-    "check:fix": "biome check --write ."
+    "check:fix": "biome check --write .",
+    "openapi": "cargo run --quiet --manifest-path ../backend/Cargo.toml -- --dump-openapi ../openapi.yml",
+    "gen:types": "openapi-typescript ../openapi.yml -o src/lib/api/schema.d.ts",
+    "gen:api": "pnpm openapi && pnpm gen:types"
   },
   "devEngines": {
     "packageManager": {
@@ -42,6 +48,9 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.4",
+    "concurrently": "^10.0.3",
+    "cross-env": "^10.1.0",
+    "openapi-typescript": "^6.7.6",
     "typescript": "^7.0.2",
     "vite": "^8.1.5"
   }
