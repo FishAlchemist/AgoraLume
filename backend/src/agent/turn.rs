@@ -16,7 +16,6 @@ use tokio::sync::mpsc;
 
 use crate::agent::brain::{Action, AgentBrain, AgentPersona, AgentPrompt, Respond};
 use crate::agent::event::{Event, Salience, appraise};
-use crate::agent::memory::{InMemoryStore, MemoryEntry, MemoryStore};
 use crate::agent::mock::RuleBrain;
 use crate::models::{Message, now_ms};
 use crate::state::AppState;
@@ -29,12 +28,6 @@ pub struct LoopConfig {
     /// only leads to another if it produced speech; a silent round ends the
     /// turn early. Default 1.
     pub max_rounds: usize,
-    /// How many private memories to retrieve into an agent's prompt.
-    pub memory_k: usize,
-    /// Salience at or above which a memo is persisted.
-    pub memory_threshold: f32,
-    /// Compact a persona's memories once they exceed this many.
-    pub memory_cap: usize,
     /// Cosmetic delay between a mood and its message, for natural pacing; set to
     /// 0 in tests.
     pub pace_ms: u64,
@@ -45,39 +38,26 @@ pub struct LoopConfig {
 
 impl Default for LoopConfig {
     fn default() -> Self {
-        Self {
-            max_rounds: 1,
-            memory_k: 5,
-            memory_threshold: 0.5,
-            memory_cap: 64,
-            pace_ms: 450,
-            seed: None,
-        }
+        Self { max_rounds: 1, pace_ms: 450, seed: None }
     }
 }
 
-/// The agent runtime bundled into [`AppState`]: the swappable brain, the memory
-/// store, and the loop tunables. Swap `brain` for an LLM-backed implementation
-/// and the same orchestrator drives a real model — nothing else changes.
+/// The agent runtime bundled into [`AppState`]: the swappable brain and the loop
+/// tunables. Swap `brain` for an LLM-backed implementation and the same
+/// orchestrator drives a real model — nothing else changes.
 pub struct AgentRuntime {
     pub brain: Arc<dyn AgentBrain>,
-    pub memory: Arc<dyn MemoryStore>,
     pub config: LoopConfig,
-    /// True when this is the mock data layer (rule brain, in-memory notes) rather
-    /// than a real LLM-backed runtime. Surfaced through `/meta`.
+    /// True when this is the mock data layer (rule brain) rather than a real
+    /// LLM-backed runtime. Surfaced through `/meta`.
     pub mock: bool,
 }
 
 impl AgentRuntime {
-    /// The default runtime: rule-based replies, in-memory notes — no LLM, no
-    /// persistence. The "mock" data layer behind the production API.
+    /// The default runtime: rule-based replies — no LLM, no persistence. The
+    /// "mock" data layer behind the production API.
     pub fn mock() -> Self {
-        Self {
-            brain: Arc::new(RuleBrain::new()),
-            memory: Arc::new(InMemoryStore::new()),
-            config: LoopConfig::default(),
-            mock: true,
-        }
+        Self { brain: Arc::new(RuleBrain::new()), config: LoopConfig::default(), mock: true }
     }
 }
 
@@ -155,11 +135,10 @@ async fn run_turn(
                 continue;
             };
             let transcript = build_transcript(state, group_id);
-            let memories = runtime.memory.retrieve(&persona_id, cfg.memory_k);
 
             // Assemble the prompt — the orchestrator owns context, so a brain is
             // just prompt-in/decision-out (the LLM boundary).
-            let prompt = assemble_prompt(&persona, &transcript, &memories, &injected_events);
+            let prompt = assemble_prompt(&persona, &transcript, &injected_events);
             tracing::trace!(
                 target: "agent::prompt",
                 persona = %persona_id,
@@ -199,8 +178,8 @@ async fn run_turn(
                 }
             };
 
-            // Phase 4: route the decision to the three streams.
-            let Respond { action, message, mood, remember } = respond;
+            // Phase 4: route the decision to the two streams.
+            let Respond { action, message, mood } = respond;
             match action {
                 Action::Speak => {
                     if let Some(text) = message {
@@ -224,18 +203,6 @@ async fn run_turn(
                     }
                 }
                 Action::Read => {}
-            }
-
-            // Memory: persist the memo only if it clears the salience threshold,
-            // then keep the store bounded.
-            if let Some(memo) = remember
-                && memo.weight >= cfg.memory_threshold
-            {
-                runtime.memory.write(
-                    &persona_id,
-                    MemoryEntry { note: memo.note, weight: memo.weight, ts: now_ms() },
-                );
-                runtime.memory.consolidate(&persona_id, cfg.memory_cap);
             }
 
             // Every agent processed the message, whatever it chose to do.
@@ -310,13 +277,12 @@ fn build_persona(state: &AppState, id: &str) -> Option<AgentPersona> {
     })
 }
 
-/// Renders the persona, memories, clean transcript, and injected events into the
-/// prompt a brain consumes. This is the self-managing context: everything a
-/// model needs is here, so swapping in an LLM brain needs no other change.
+/// Renders the persona, clean transcript, and injected events into the prompt a
+/// brain consumes. This is the self-managing context: everything a model needs
+/// is here, so swapping in an LLM brain needs no other change.
 fn assemble_prompt(
     persona: &AgentPersona,
     transcript: &[ContextLine],
-    memories: &[MemoryEntry],
     events: &[String],
 ) -> AgentPrompt {
     use std::fmt::Write as _;
@@ -335,13 +301,6 @@ fn assemble_prompt(
             let _ = writeln!(system, "- {key}: {value}");
         }
     }
-    if !memories.is_empty() {
-        system.push_str("\nYou remember:\n");
-        for entry in memories {
-            let _ = writeln!(system, "- {}", entry.note);
-        }
-    }
-
     let mut conversation = String::new();
     for line in transcript {
         let _ = writeln!(conversation, "{}: {}", line.name, line.text);
@@ -413,8 +372,8 @@ mod tests {
         LoopConfig { pace_ms: 0, seed: Some(7), ..LoopConfig::default() }
     }
 
-    fn app(brain: Arc<dyn AgentBrain>, memory: Arc<dyn MemoryStore>, config: LoopConfig) -> Arc<AppState> {
-        Arc::new(AppState::with_runtime(AgentRuntime { brain, memory, config, mock: true }))
+    fn app(brain: Arc<dyn AgentBrain>, config: LoopConfig) -> Arc<AppState> {
+        Arc::new(AppState::with_runtime(AgentRuntime { brain, config, mock: true }))
     }
 
     /// Stores a user line the way the send handler does, returning its id.
@@ -430,15 +389,6 @@ mod tests {
     async fn run_once(state: &AppState, group: &str, trigger: Event) -> TurnOutcome {
         let (_tx, mut rx) = mpsc::channel::<Event>(8);
         run_turn(state, group, trigger, &mut rx).await
-    }
-
-    /// A brain that returns the same decision for every agent.
-    struct FixedBrain(Respond);
-    #[async_trait]
-    impl AgentBrain for FixedBrain {
-        async fn decide(&self, _prompt: &AgentPrompt) -> Respond {
-            self.0.clone()
-        }
     }
 
     /// Counts how many times it is asked to decide (to prove round bounds).
@@ -482,7 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_member_reads_and_turn_completes() {
-        let state = app(Arc::new(RuleBrain::seeded(42)), Arc::new(InMemoryStore::new()), cfg());
+        let state = app(Arc::new(RuleBrain::seeded(42)), cfg());
         let mid = store_user(&state, "lab", "hello aria");
 
         let outcome = run_once(&state, "lab", Event::User { message_id: mid.clone() }).await;
@@ -507,7 +457,7 @@ mod tests {
         let brain = Arc::new(CountingReadBrain { calls: calls.clone() });
         // Allow up to 3 rounds; a fully-silent round must still stop after one.
         let config = LoopConfig { max_rounds: 3, ..cfg() };
-        let state = app(brain, Arc::new(InMemoryStore::new()), config);
+        let state = app(brain, config);
         let mid = store_user(&state, "lab", "hi");
         let mut stream = state.channel("lab").subscribe();
 
@@ -545,31 +495,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memo_respects_threshold() {
-        // Below threshold (0.2 < 0.5): nothing is stored.
-        let low = Arc::new(InMemoryStore::new());
-        let brain = Arc::new(FixedBrain(Respond::read().remembering("note", 0.2)));
-        let state = app(brain, low.clone(), cfg());
-        let mid = store_user(&state, "lab", "hi");
-        run_once(&state, "lab", Event::User { message_id: mid }).await;
-        assert_eq!(low.len("aria"), 0);
-        assert_eq!(low.len("nox"), 0);
-
-        // At/above threshold: each agent keeps its own memo.
-        let high = Arc::new(InMemoryStore::new());
-        let brain = Arc::new(FixedBrain(Respond::read().remembering("kept", 0.8)));
-        let state = app(brain, high.clone(), cfg());
-        let mid = store_user(&state, "lab", "hi");
-        run_once(&state, "lab", Event::User { message_id: mid }).await;
-        assert_eq!(high.len("aria"), 1);
-        assert_eq!(high.len("nox"), 1);
-    }
-
-    #[tokio::test]
     async fn soft_event_injected_at_boundary() {
         let seen = Arc::new(Mutex::new(Vec::<AgentPrompt>::new()));
         let brain = Arc::new(RecordingBrain { seen: seen.clone() });
-        let state = app(brain, Arc::new(InMemoryStore::new()), cfg());
+        let state = app(brain, cfg());
         let mid = store_user(&state, "lab", "hi");
 
         let (tx, mut rx) = mpsc::channel::<Event>(8);
@@ -594,7 +523,7 @@ mod tests {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let brain = Arc::new(GatedBrain { entered: entered.clone(), release: release.clone() });
-        let state = app(brain, Arc::new(InMemoryStore::new()), cfg());
+        let state = app(brain, cfg());
         let mid = store_user(&state, "lab", "hello");
 
         let (tx, mut rx) = mpsc::channel::<Event>(8);

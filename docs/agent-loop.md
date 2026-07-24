@@ -5,7 +5,7 @@ It lives in `backend/src/agent/`. This document describes the *shape and intent*
 the design; the code is the source of truth for every type, field, and constant.
 
 > It is a text chatroom, not a face-to-face conversation. Moods are a UI concern
-> and never enter the context other agents read (see [Three streams](#three-streams)).
+> and never enter the context other agents read (see [Two streams](#two-streams)).
 
 The loop has three parts:
 
@@ -13,9 +13,8 @@ The loop has three parts:
 - **Agent Local Loop** — within a turn, each agent decides once.
 - **Event & Salience** — one appraisal deciding how any incoming event interrupts.
 
-Code map: `brain.rs` (the LLM seam), `event.rs` (events + salience), `memory.rs`
-(per-agent memory), `mock.rs` (the non-LLM rule brain), `turn.rs` (the loop and
-prompt assembly).
+Code map: `brain.rs` (the LLM seam), `event.rs` (events + salience), `mock.rs`
+(the non-LLM rule brain), `turn.rs` (the loop and prompt assembly).
 
 ---
 
@@ -30,8 +29,7 @@ These are the *why* behind the mechanism — the part not recoverable from the c
 | 3 | **Willingness is free** | "Whether to speak" and "what to say" are the *same* single inference. There is no separate willingness pass — exactly one inference per agent per slot. |
 | 4 | **Hard interrupt discards** | A preempted agent's output is dropped entirely; nothing is committed to context. A half-formed answer is neither known in full nor clean, so it is not kept. |
 | 5 | **One salience entry point** | A single `appraise(event) → Hard \| Soft \| Ignore`. Message conflict and environment-event interruption are the same judgement. |
-| 6 | **Memory built in** | Retrieval + threshold write + consolidation are part of the design, not bolted on later (see [Memory](#memory)). |
-| 7 | **Moods are UI-only** | Other agents' context never contains moods — deliberate, because this is a text chatroom. |
+| 6 | **Moods are UI-only** | Other agents' context never contains moods — deliberate, because this is a text chatroom. |
 
 ---
 
@@ -61,21 +59,21 @@ These are the *why* behind the mechanism — the part not recoverable from the c
 Each agent runs **once** per slot and expresses exactly one of four actions.
 
 ```
- 1. Retrieve   persona (+ inherited variables) + Top-K memories + clean transcript
+ 1. Gather     persona (+ inherited variables) + clean transcript
  2. Assemble   → AgentPrompt { system, conversation, … }        (orchestrator-owned)
  3. Decide     brain.decide(prompt) → Respond                   (the one inference)
- 4. Route      fan the action out to the three streams          (see table below)
+ 4. Route      fan the action out to the two streams            (see table below)
  5. Handover   at the boundary, inject any pending Soft events for the next agent
 ```
 
 The four actions and where each lands:
 
-| Action | Context Stream | UI View | Memory (if `weight ≥ threshold`) |
-|--------|:--------------:|:-------:|:--------------------------------:|
-| `speak` | message | bubble | "I said X" |
-| `speak_with_mood` | message | bubble + mood | "I said X" |
-| `mood` | — | mood only | "I did Y" |
-| `read` | — | — | "why I stayed silent" (needs high weight) |
+| Action | Context Stream | UI View |
+|--------|:--------------:|:-------:|
+| `speak` | message | bubble |
+| `speak_with_mood` | message | bubble + mood |
+| `mood` | — | mood only |
+| `read` | — | — |
 
 The `respond` tool is the entire brain output surface. Its exact fields are the
 `Respond` type in `brain.rs`; do not restate them here.
@@ -100,55 +98,37 @@ covered by unit tests.
 
 ---
 
-## Memory
-
-Each agent has a private store (facts, motives, impressions, relationships).
-
-- **Write (threshold)** — `respond` may carry a memo `{ note, weight }`. The server
-  keeps it only when `weight ≥ memory_threshold`. The same threshold governs a
-  silent `read` turn: only a salient silence ("I deliberately held back") is worth
-  recording.
-- **Read (retrieval)** — step 1 pulls Top-K ranked by `recency × weight`, plus the
-  consolidated summary, into the prompt. This is a heuristic; the `MemoryStore`
-  trait lets a vector-similarity store replace it without touching callers.
-- **Consolidation** — when an agent exceeds `memory_cap`, the least-relevant
-  overflow is folded into one summary entry, approximating sleep-phase memory
-  consolidation. The in-memory build joins text as a placeholder summariser; the
-  trait boundary is unchanged.
-
-Ranking, threshold, and consolidation logic are in `memory.rs`.
-
----
-
-## Three streams
+## Two streams
 
 Information is deliberately segregated:
 
 - **Context Stream** — server-internal, `message`-only. *Not* a network stream: it
-  is the filtered history used to build each agent's prompt. Moods, read receipts,
-  and private memos are all excluded, keeping context maximally clean.
+  is the filtered history used to build each agent's prompt. Moods and read receipts
+  are excluded, keeping context maximally clean.
 - **UI View Stream** — the outward SSE feed (`message` + mood), rendering bubbles
   and mood animations. Corresponds to `GET /groups/{id}/stream`.
-- **Agent Memory** — per-agent private store, written only above threshold.
+
+> Per-agent long-term memory is intentionally **not** part of this build. Personas
+> reason over the current transcript only; the conversation itself is the shared
+> record. A private memory store can slot in behind the orchestrator later without
+> changing the `AgentBrain` seam.
 
 ---
 
 ## Testing without an LLM
 
 The whole loop is orchestration *except* the single inference in step 3, so the
-entire loop is deterministically testable behind three injection seams:
+entire loop is deterministically testable behind two injection seams:
 
 1. **`AgentBrain`** — the only seam a real LLM replaces. The bundled `RuleBrain`
    scripts decisions (e.g. "speak when addressed, otherwise pick a mood/read").
 2. **Clock / event source** — injectable delays (or `tokio::time::pause()`) so a
    hard interrupt can be fired precisely mid-inference without flakiness.
-3. **`MemoryStore`** — the read/write/consolidate interface; the mock uses an
-   in-memory map.
 
 Assertable behaviours: single-pass shuffled pipeline, correct per-action stream
-routing, memory threshold gating, `max_rounds` termination and silent-round
-end, Soft boundary injection, Hard preemption (abort + discard + restart), and
-stream segregation (context carries only messages).
+routing, `max_rounds` termination and silent-round end, Soft boundary injection,
+Hard preemption (abort + discard + restart), and stream segregation (context
+carries only messages).
 
 > This matches the project stance: the API is production-grade; only the data layer
 > (in-memory store + simulated replies) is provisional. The `AgentBrain` seam keeps

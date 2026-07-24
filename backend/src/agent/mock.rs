@@ -51,17 +51,15 @@ impl AgentBrain for RuleBrain {
         let mood = MOODS[(roll as usize + prompt.persona_name.len()) % MOODS.len()].to_string();
 
         if addressed {
-            // Being named is worth remembering, and warrants a reply with a mood.
-            return Respond::speak_with_mood(reply_line(last), mood)
-                .remembering(format!("Was addressed; replied to \u{201c}{}\u{201d}.", last.trim()), 0.7);
+            // Being named warrants a reply with a mood.
+            return Respond::speak_with_mood(reply_line(last), mood);
         }
 
         match roll % 3 {
             0 => Respond::speak(reply_line(last)),
             1 => Respond::mood(mood),
-            // Read-but-don't-reply, with a low-salience note (dropped by the
-            // threshold unless configured otherwise).
-            _ => Respond::read().remembering("Read without replying.", 0.2),
+            // Read-but-don't-reply.
+            _ => Respond::read(),
         }
     }
 }

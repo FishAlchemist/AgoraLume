@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 /// One of the four mutually-exclusive things an agent may do on its turn — the
 /// entire surface of the `respond` tool. The orchestrator routes each variant to
-/// the three streams (Context / UI View / Memory); see `agent::turn`.
+/// the two streams (Context / UI View); see `agent::turn`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     /// A spoken line. Enters the Context Stream and the UI.
@@ -28,16 +28,6 @@ pub enum Action {
     Read,
 }
 
-/// A private memory the agent chose to record this turn. The store only keeps it
-/// when `weight` clears the configured threshold (see `agent::turn::LoopConfig`).
-#[derive(Clone, Debug)]
-pub struct Memo {
-    pub note: String,
-    /// Salience in `[0, 1]`. Even a silent turn (Read) can carry a high-weight
-    /// memo — e.g. "I chose to stay quiet to watch how this plays out".
-    pub weight: f32,
-}
-
 /// The output of a single agent turn: exactly what the `respond` tool carries.
 #[derive(Clone, Debug)]
 pub struct Respond {
@@ -46,19 +36,17 @@ pub struct Respond {
     pub message: Option<String>,
     /// Required for [`Action::Mood`] / [`Action::SpeakWithMood`].
     pub mood: Option<String>,
-    /// Optional private note to remember, gated by weight.
-    pub remember: Option<Memo>,
 }
 
 impl Respond {
     /// Read — processed silently; nothing is broadcast.
     pub fn read() -> Self {
-        Self { action: Action::Read, message: None, mood: None, remember: None }
+        Self { action: Action::Read, message: None, mood: None }
     }
 
     /// Speak — a spoken line.
     pub fn speak(message: impl Into<String>) -> Self {
-        Self { action: Action::Speak, message: Some(message.into()), mood: None, remember: None }
+        Self { action: Action::Speak, message: Some(message.into()), mood: None }
     }
 
     /// Speak with mood — a spoken line plus a UI-only mood.
@@ -67,19 +55,12 @@ impl Respond {
             action: Action::SpeakWithMood,
             message: Some(message.into()),
             mood: Some(mood.into()),
-            remember: None,
         }
     }
 
     /// Mood — a UI-only mood, no spoken line.
     pub fn mood(mood: impl Into<String>) -> Self {
-        Self { action: Action::Mood, message: None, mood: Some(mood.into()), remember: None }
-    }
-
-    /// Attaches a private memo, kept if its weight clears the threshold.
-    pub fn remembering(mut self, note: impl Into<String>, weight: f32) -> Self {
-        self.remember = Some(Memo { note: note.into(), weight });
-        self
+        Self { action: Action::Mood, message: None, mood: Some(mood.into()) }
     }
 }
 
@@ -94,10 +75,10 @@ pub struct AgentPersona {
 }
 
 /// The fully-assembled prompt handed to a brain — the self-managed context, in
-/// the form a model consumes. `system` carries the persona (with variables) and
-/// retrieved memories; `conversation` carries the clean transcript plus injected
-/// environment events. `persona_name` and `last_line` are conveniences so a
-/// non-LLM brain need not re-parse the text.
+/// the form a model consumes. `system` carries the persona (with variables);
+/// `conversation` carries the clean transcript plus injected environment events.
+/// `persona_name` and `last_line` are conveniences so a non-LLM brain need not
+/// re-parse the text.
 #[derive(Clone, Debug)]
 pub struct AgentPrompt {
     pub system: String,

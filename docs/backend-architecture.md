@@ -42,7 +42,7 @@ Each file owns one concern; follow the link into the code for detail.
 
 ## Data flow
 
-A group has three distinct flows, deliberately kept apart (see the agent-loop doc
+A group has two distinct flows, deliberately kept apart (see the agent-loop doc
 for the rationale):
 
 - **Context Stream** — server-internal, message-only history used to build agent
@@ -50,7 +50,6 @@ for the rationale):
 - **UI View Stream** — the outward SSE feed (`GET /groups/{id}/stream`): default
   `message` frames (replies and moods) and named `read` frames (read receipts),
   fanned out per group via a tokio `broadcast` channel.
-- **Agent Memory** — per-agent private stores inside `agent/`.
 
 ## Request → turn lifecycle
 
