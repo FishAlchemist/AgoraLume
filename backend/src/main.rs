@@ -23,6 +23,7 @@ use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
+use crate::agent::llm::LlmBrain;
 use crate::agent::turn::AgentRuntime;
 use crate::config::Config;
 use crate::state::AppState;
@@ -43,6 +44,11 @@ async fn main() {
         return;
     }
 
+    // Load a `.env` beside the executable (or the working dir in dev) before
+    // anything reads the environment, so bundle users configure with a file
+    // instead of a dozen shell exports. Real env vars still take precedence.
+    Config::load_dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -53,14 +59,28 @@ async fn main() {
     let config = Config::from_env();
 
     // Pick the agent runtime the config asks for. Mock is the default so a plain
-    // run never spends API budget; `AGORALUME_LLM` opts out of it. No LLM adapter
-    // is wired yet, so opting in fails fast rather than silently running the mock.
+    // run never spends API budget; `AGORALUME_LLM` opts into a real model driven
+    // by the OpenAI-compatible `llm_*` settings.
     let runtime = if config.llm {
-        eprintln!(
-            "AGORALUME_LLM is set, but no LLM adapter is wired yet. \
-             Unset it to run the default mock brain."
-        );
-        std::process::exit(1);
+        let (Some(base_url), Some(model)) =
+            (config.llm_base_url.as_deref(), config.llm_model.as_deref())
+        else {
+            eprintln!(
+                "AGORALUME_LLM is set but the endpoint is not configured.\n\
+                 Set AGORALUME_LLM_BASE_URL (e.g. https://api.openai.com/v1 or \
+                 http://localhost:11434/v1) and AGORALUME_LLM_MODEL, plus \
+                 AGORALUME_LLM_API_KEY if your endpoint needs a key."
+            );
+            std::process::exit(1);
+        };
+        let api_key = config.llm_api_key.as_deref().unwrap_or("");
+        match LlmBrain::new(base_url, model, api_key, config.llm_max_tokens) {
+            Ok(brain) => AgentRuntime::llm(Arc::new(brain)),
+            Err(e) => {
+                eprintln!("failed to initialise the LLM brain: {e}");
+                std::process::exit(1);
+            }
+        }
     } else {
         AgentRuntime::mock()
     };
@@ -111,11 +131,13 @@ async fn main() {
     };
     let url = format!("http://{host}:{}", addr.port());
 
+    // Reflect the actual reply source: a real model, or the rule-based mock.
+    let replies = if config.llm { "LLM-backed replies" } else { "simulated replies (mock)" };
     tracing::info!(
         %url,
         data_dir = %config.data_dir,
         serving_web = web_dir.is_some(),
-        "AgoraLume backend listening (in-memory store; simulated replies, no LLM yet)"
+        "AgoraLume backend listening (in-memory store; {replies})"
     );
 
     // Only pop a browser when we're actually the site (bundle mode) and the

@@ -13,8 +13,9 @@ The loop has three parts:
 - **Agent Local Loop** — within a turn, each agent decides once.
 - **Event & Salience** — one appraisal deciding how any incoming event interrupts.
 
-Code map: `brain.rs` (the LLM seam), `event.rs` (events + salience), `mock.rs`
-(the non-LLM rule brain), `turn.rs` (the loop and prompt assembly).
+Code map: `brain.rs` (the seam), `event.rs` (events + salience), `mock.rs`
+(the non-LLM rule brain), `llm.rs` (the OpenAI-compatible LLM brain), `turn.rs`
+(the loop and prompt assembly).
 
 ---
 
@@ -121,7 +122,9 @@ The whole loop is orchestration *except* the single inference in step 3, so the
 entire loop is deterministically testable behind two injection seams:
 
 1. **`AgentBrain`** — the only seam a real LLM replaces. The bundled `RuleBrain`
-   scripts decisions (e.g. "speak when addressed, otherwise pick a mood/read").
+   scripts decisions (e.g. "speak when addressed, otherwise pick a mood/read");
+   the `LlmBrain` in `llm.rs` is the real one, enabled with `AGORALUME_LLM=1`
+   plus the `AGORALUME_LLM_*` endpoint settings.
 2. **Clock / event source** — injectable delays (or `tokio::time::pause()`) so a
    hard interrupt can be fired precisely mid-inference without flakiness.
 
@@ -130,7 +133,7 @@ routing, `max_rounds` termination and silent-round end, Soft boundary injection,
 Hard preemption (abort + discard + restart), and stream segregation (context
 carries only messages).
 
-> This matches the project stance: the API is production-grade; only the data layer
-> (in-memory store + simulated replies) is provisional. The `AgentBrain` seam keeps
-> the temporary mock brain and a future LLM adapter cleanly separated behind an
-> unchanged orchestrator.
+> This matches the project stance: the API is production-grade; only the persistence
+> layer (the in-memory store) is provisional. Replies come from either the mock
+> `RuleBrain` (default) or the real `LlmBrain` (`AGORALUME_LLM=1`), kept cleanly
+> separated behind an unchanged orchestrator by the `AgentBrain` seam.

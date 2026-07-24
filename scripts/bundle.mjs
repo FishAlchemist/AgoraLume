@@ -41,6 +41,9 @@ rmSync(stageDir, { recursive: true, force: true });
 mkdirSync(stageDir, { recursive: true });
 cpSync(join(repoRoot, 'backend', 'target', 'release', exeName), join(stageDir, exeName));
 cpSync(join(repoRoot, 'frontend', 'dist'), join(stageDir, 'web'), { recursive: true });
+// Ship the settings template beside the exe; users copy it to `.env` (which the
+// backend loads on startup) to configure without exporting env vars by hand.
+cpSync(join(repoRoot, '.env.example'), join(stageDir, '.env.example'));
 
 // 4. Zip the staged folder with each OS's standard tool.
 const zipName = `AgoraLume-${process.platform}-${process.arch}.zip`;

@@ -59,6 +59,12 @@ impl AgentRuntime {
     pub fn mock() -> Self {
         Self { brain: Arc::new(RuleBrain::new()), config: LoopConfig::default(), mock: true }
     }
+
+    /// A runtime driven by a real LLM brain. `mock` is false, so `/meta` reports
+    /// the server is talking to a model.
+    pub fn llm(brain: Arc<dyn AgentBrain>) -> Self {
+        Self { brain, config: LoopConfig::default(), mock: false }
+    }
 }
 
 /// How a turn ended.

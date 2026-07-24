@@ -33,7 +33,7 @@ Each file owns one concern; follow the link into the code for detail.
 | Module | Owns |
 |--------|------|
 | `main.rs` | Process entry, tracing, `--dump-openapi` one-shot, server bind. |
-| `config.rs` | Environment-driven configuration (bind address, data dir). |
+| `config.rs` | Environment-driven configuration (bind address, data dir, LLM). Loads a `.env` beside the executable (or the working dir in dev) at startup, so a bundle is configured with a file rather than shell exports; real env vars still win. |
 | `models.rs` | Wire types: `Message` (conversation / mood), `ReadReceipt`, `ServerMeta`. |
 | `workspace.rs` | The SSOT: personas, groups, memberships; persona/variable resolution with org→dept→persona inheritance. |
 | `state.rs` | In-memory `AppState`: workspace, per-group message logs, per-group SSE broadcast channels, per-group coordinators, and the agent runtime. |
@@ -85,9 +85,13 @@ Key properties:
 Everything above is production orchestration. The *only* component a real LLM
 replaces is the `AgentBrain` trait (`agent/brain.rs`): a pure prompt → decision
 function. The orchestrator owns all context assembly, so swapping the bundled rule
-brain for an LLM adapter changes nothing else. This is what makes the loop testable
-without an LLM and connectable to one without a rewrite — detailed in
-[agent-loop.md](./agent-loop.md).
+brain (`agent/mock.rs`) for the LLM brain (`agent/llm.rs`) changes nothing else.
+The LLM brain is a rig-core extractor over any OpenAI-compatible endpoint; enable
+it with `AGORALUME_LLM=1` and set `AGORALUME_LLM_BASE_URL` / `AGORALUME_LLM_MODEL`
+(and `AGORALUME_LLM_API_KEY` if the endpoint needs one) — via the shell or a
+`.env` file beside the executable (see `.env.example`). This is what makes the
+loop testable without an LLM and connectable to one without a rewrite — detailed
+in [agent-loop.md](./agent-loop.md).
 
 ## Conventions
 
