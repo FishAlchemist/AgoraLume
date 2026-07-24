@@ -1,14 +1,50 @@
+import { useConnection } from '../../store/connection';
+import type { Message } from '../../types';
 import { HttpChatApi } from './http';
 import { MockChatApi } from './mock';
-import type { ChatApi } from './types';
+import type { ChatApi, MessageHandler, ReadHandler, ServerMeta } from './types';
 
-const baseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
-const forceMock = import.meta.env.VITE_USE_MOCK === '1';
+/**
+ * A stable `ChatApi` that routes every call to the currently configured data
+ * source — the in-browser mock, or an HTTP backend — read live from the
+ * connection store. Because the object identity never changes, components can
+ * `import { api }` once; switching backends (or connecting to one that comes up
+ * later) takes effect on the next call, with no reload.
+ */
+class RoutingChatApi implements ChatApi {
+  private readonly mock = new MockChatApi();
+  // One client per URL, reused so repeated switches don't leak connections.
+  private readonly httpByUrl = new Map<string, HttpChatApi>();
 
-/** True when the app is running against the in-memory mock. */
-export const usingMock = forceMock || !baseUrl;
+  private impl(): ChatApi {
+    const url = useConnection.getState().backendUrl;
+    if (!url) return this.mock;
+    let http = this.httpByUrl.get(url);
+    if (!http) {
+      http = new HttpChatApi(url);
+      this.httpByUrl.set(url, http);
+    }
+    return http;
+  }
+
+  probe(): Promise<ServerMeta | null> {
+    return this.impl().probe();
+  }
+  listMessages(groupId: string): Promise<Message[]> {
+    return this.impl().listMessages(groupId);
+  }
+  sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {
+    return this.impl().sendMessage(groupId, text, personaId);
+  }
+  subscribe(groupId: string, handler: MessageHandler): () => void {
+    return this.impl().subscribe(groupId, handler);
+  }
+  subscribeReads(groupId: string, handler: ReadHandler): () => void {
+    return this.impl().subscribeReads(groupId, handler);
+  }
+}
 
 /** The single ChatApi instance the whole UI depends on. */
-export const api: ChatApi = !usingMock && baseUrl ? new HttpChatApi(baseUrl) : new MockChatApi();
+export const api: ChatApi = new RoutingChatApi();
 
 export type { ChatApi } from './types';

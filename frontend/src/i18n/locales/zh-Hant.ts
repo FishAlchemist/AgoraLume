@@ -171,5 +171,12 @@ export const zhHant: TranslationSchema = {
     fontM: '中',
     fontL: '大',
     fontXl: '特大',
+    connectionTitle: '後端連線',
+    connectionHint: '將應用指向後端,或使用瀏覽器內建模擬。立即生效——之後才上線的後端會自動連上。',
+    backendUrl: '後端網址',
+    connect: '連線',
+    useMock: '使用模擬',
+    connectedTo: '後端:{{url}}',
+    usingMock: '使用瀏覽器內建模擬(無 LLM、純記憶體)。',
   },
 };

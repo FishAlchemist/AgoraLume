@@ -1,5 +1,7 @@
 import {
   Box,
+  Button,
+  Group,
   Paper,
   SegmentedControl,
   Select,
@@ -9,8 +11,11 @@ import {
   Title,
   useMantineColorScheme,
 } from '@mantine/core';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { DataSourceBadge } from '../components/DataSourceBadge';
 import { UI_LANGUAGES } from '../i18n';
+import { useConnection } from '../store/connection';
 import { useWorkspace } from '../store/workspace';
 import type { UiLanguage } from '../types';
 
@@ -78,7 +83,67 @@ export function SettingsPage() {
             </Text>
           </Paper>
         </Stack>
+
+        <ConnectionSettings />
       </Stack>
     </Box>
+  );
+}
+
+/** Runtime choice of data source: the in-browser mock, or an HTTP backend. */
+function ConnectionSettings() {
+  const { t } = useTranslation();
+  const backendUrl = useConnection((s) => s.backendUrl);
+  const setBackendUrl = useConnection((s) => s.setBackendUrl);
+  const [draft, setDraft] = useState(backendUrl ?? '');
+
+  // Re-seed the field if the URL is changed elsewhere (e.g. reset to mock).
+  const [lastUrl, setLastUrl] = useState(backendUrl);
+  if (backendUrl !== lastUrl) {
+    setLastUrl(backendUrl);
+    setDraft(backendUrl ?? '');
+  }
+
+  const normalized = draft.trim().replace(/\/+$/, '');
+  const canConnect = normalized.length > 0 && normalized !== backendUrl;
+
+  return (
+    <Stack gap={4}>
+      <Group justify="space-between" align="center">
+        <Title order={6}>{t('settings.connectionTitle')}</Title>
+        <DataSourceBadge />
+      </Group>
+      <Text size="xs" c="dimmed">
+        {t('settings.connectionHint')}
+      </Text>
+      <Group align="flex-end" gap="xs" wrap="nowrap">
+        <TextInput
+          flex={1}
+          label={t('settings.backendUrl')}
+          placeholder="http://127.0.0.1:8080"
+          value={draft}
+          onChange={(e) => setDraft(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && canConnect) setBackendUrl(draft);
+          }}
+        />
+        <Button onClick={() => setBackendUrl(draft)} disabled={!canConnect}>
+          {t('settings.connect')}
+        </Button>
+      </Group>
+      <Group justify="space-between" align="center" mt={4}>
+        <Text size="xs" c="dimmed">
+          {backendUrl ? t('settings.connectedTo', { url: backendUrl }) : t('settings.usingMock')}
+        </Text>
+        <Button
+          variant="subtle"
+          size="xs"
+          onClick={() => setBackendUrl(null)}
+          disabled={!backendUrl}
+        >
+          {t('settings.useMock')}
+        </Button>
+      </Group>
+    </Stack>
   );
 }

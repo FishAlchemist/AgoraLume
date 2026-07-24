@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { api, usingMock } from './api';
+import { useConnection } from '../store/connection';
+import { api } from './api';
 
 /**
  * Reachability of the data source, kept separate from its *mode*:
@@ -21,16 +22,23 @@ export interface BackendStatus {
 }
 
 /**
- * Polls the configured backend's `/meta` for liveness + mode. In-browser mock
- * mode makes no network calls: it reports `local` / `mock` immediately.
+ * Polls the configured backend's `/meta` for liveness + mode, re-checking
+ * whenever the configured backend changes. In-browser mock mode makes no
+ * network calls: it reports `local` / `mock` immediately. A backend that only
+ * comes up later flips from `offline` to `online` on the next poll.
  */
 export function useBackendStatus(intervalMs = 10_000): BackendStatus {
+  const backendUrl = useConnection((s) => s.backendUrl);
   const [status, setStatus] = useState<BackendStatus>(
-    usingMock ? { reachable: 'local', mock: true } : { reachable: 'checking' },
+    backendUrl ? { reachable: 'checking' } : { reachable: 'local', mock: true },
   );
 
   useEffect(() => {
-    if (usingMock) return; // constant 'local' — no polling.
+    if (!backendUrl) {
+      setStatus({ reachable: 'local', mock: true });
+      return;
+    }
+    setStatus({ reachable: 'checking' });
     let active = true;
 
     const check = async () => {
@@ -45,7 +53,7 @@ export function useBackendStatus(intervalMs = 10_000): BackendStatus {
       active = false;
       clearInterval(id);
     };
-  }, [intervalMs]);
+  }, [backendUrl, intervalMs]);
 
   return status;
 }

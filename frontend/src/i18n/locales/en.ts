@@ -170,6 +170,14 @@ export const en = {
     fontM: 'Medium',
     fontL: 'Large',
     fontXl: 'Extra large',
+    connectionTitle: 'Backend connection',
+    connectionHint:
+      'Point the app at a backend, or use the in-browser mock. Applies immediately — a backend that comes online later connects on its own.',
+    backendUrl: 'Backend URL',
+    connect: 'Connect',
+    useMock: 'Use mock',
+    connectedTo: 'Backend: {{url}}',
+    usingMock: 'Using the in-browser mock (no LLM, in-memory).',
   },
 };
 

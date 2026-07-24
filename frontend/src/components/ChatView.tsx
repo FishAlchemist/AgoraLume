@@ -2,6 +2,7 @@ import { Box, Center, Loader, ScrollArea, Stack, Text } from '@mantine/core';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
+import { useConnection } from '../store/connection';
 import { useWorkspace } from '../store/workspace';
 import type { Group, Message, Persona } from '../types';
 import { Composer } from './Composer';
@@ -15,6 +16,8 @@ interface Props {
 export function ChatView({ group, personas }: Props) {
   const { t } = useTranslation();
   const fontSize = useWorkspace((s) => s.settings.chatFontSize ?? 15);
+  // Re-bind history + streams when the active data source changes.
+  const backendUrl = useConnection((s) => s.backendUrl);
 
   // Fall back to any user identity so a group without an explicit self still works.
   const selfId = group.selfPersonaId || [...personas.values()].find((p) => p.kind === 'user')?.id;
@@ -35,6 +38,7 @@ export function ChatView({ group, personas }: Props) {
   const [pendingId, setPendingId] = useState<string | null>(null);
   const viewport = useRef<HTMLDivElement>(null);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: backendUrl is an intentional trigger — a change re-runs this so history and subscriptions rebind to the newly selected data source.
   useEffect(() => {
     let active = true;
     setMessages(null);
@@ -65,7 +69,7 @@ export function ChatView({ group, personas }: Props) {
       unsubscribe();
       unsubscribeReads();
     };
-  }, [group.id]);
+  }, [group.id, backendUrl]);
 
   // Unlock the composer once all AI members have processed the pending message
   // (whether they replied or read without replying).
