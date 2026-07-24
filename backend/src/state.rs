@@ -31,6 +31,10 @@ pub enum StreamEvent {
     Message(Message),
     /// A read receipt. Delivered as a named `read` SSE event.
     Read(ReadReceipt),
+    /// The group's coordinator started (`true`) or finished (`false`) a turn.
+    /// Delivered as a named `activity` SSE event; drives the composer lock so a
+    /// user message can never interleave with an in-flight turn.
+    Activity(bool),
 }
 
 pub struct AppState {
@@ -120,6 +124,13 @@ impl AppState {
             .entry(group_id.to_string())
             .or_default()
             .push(message);
+    }
+
+    /// Broadcasts whether the group's coordinator is actively running a turn.
+    /// The frontend keeps the composer locked while active so users send only
+    /// when the loop is idle.
+    pub fn set_active(&self, group_id: &str, active: bool) {
+        let _ = self.channel(group_id).send(StreamEvent::Activity(active));
     }
 
     /// Appends a message and broadcasts it to live subscribers.

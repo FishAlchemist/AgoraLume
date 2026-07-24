@@ -94,6 +94,10 @@ enum TurnOutcome {
 /// interrupt returns here and immediately re-runs with the preempting event.
 pub async fn coordinator_loop(state: Arc<AppState>, group_id: String, mut rx: mpsc::Receiver<Event>) {
     while let Some(event) = rx.recv().await {
+        // The loop is busy for the whole turn (including any hard-interrupt
+        // restarts); it goes idle only once fully done. The composer gates on
+        // this so a new user message can't interleave with a running turn.
+        state.set_active(&group_id, true);
         let mut trigger = event;
         loop {
             match run_turn(&state, &group_id, trigger, &mut rx).await {
@@ -101,6 +105,7 @@ pub async fn coordinator_loop(state: Arc<AppState>, group_id: String, mut rx: mp
                 TurnOutcome::Preempted(next) => trigger = next,
             }
         }
+        state.set_active(&group_id, false);
     }
 }
 
@@ -518,6 +523,7 @@ mod tests {
             match event {
                 StreamEvent::Message(_) => messages += 1,
                 StreamEvent::Read(_) => reads += 1,
+                StreamEvent::Activity(_) => {}
             }
         }
         assert_eq!(messages, 0);

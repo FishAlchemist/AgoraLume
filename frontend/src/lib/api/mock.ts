@@ -1,6 +1,6 @@
 import { useWorkspace } from '../../store/workspace';
 import type { Message } from '../../types';
-import type { ChatApi, MessageHandler, ReadHandler, ServerMeta } from './types';
+import type { ActivityHandler, ChatApi, MessageHandler, ReadHandler, ServerMeta } from './types';
 
 let seq = 0;
 const nextId = () => `m${Date.now()}-${seq++}`;
@@ -17,6 +17,7 @@ export class MockChatApi implements ChatApi {
   private messages: Record<string, Message[]> = seed();
   private subs = new Map<string, Set<MessageHandler>>();
   private readSubs = new Map<string, Set<ReadHandler>>();
+  private activitySubs = new Map<string, Set<ActivityHandler>>();
 
   async probe(): Promise<ServerMeta> {
     // The mock runs entirely in-browser — always reachable, always mock mode.
@@ -65,6 +66,17 @@ export class MockChatApi implements ChatApi {
     return () => set.delete(handler);
   }
 
+  subscribeActivity(groupId: string, handler: ActivityHandler): () => void {
+    const set = this.activitySubs.get(groupId) ?? new Set<ActivityHandler>();
+    set.add(handler);
+    this.activitySubs.set(groupId, set);
+    return () => set.delete(handler);
+  }
+
+  private setActive(groupId: string, active: boolean): void {
+    for (const handler of this.activitySubs.get(groupId) ?? []) handler(active);
+  }
+
   private emit(groupId: string, message: Message): void {
     this.messages[groupId] ??= [];
     this.messages[groupId].push(message);
@@ -100,6 +112,11 @@ export class MockChatApi implements ChatApi {
 
     const replier = readers[Math.floor(Math.random() * readers.length)];
     const mood = MOODS[Math.floor(Math.random() * MOODS.length)];
+
+    // The loop is busy until the last reader finishes; the composer gates on it.
+    this.setActive(groupId, true);
+    const doneAt = Math.max(1100, 400 + (readers.length - 1) * 160) + 50;
+    setTimeout(() => this.setActive(groupId, false), doneAt);
 
     let i = 0;
     for (const id of readers) {

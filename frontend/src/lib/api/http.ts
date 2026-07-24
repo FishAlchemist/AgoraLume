@@ -1,5 +1,12 @@
 import type { Message } from '../../types';
-import type { ChatApi, MessageHandler, ReadHandler, ReadReceipt, ServerMeta } from './types';
+import type {
+  ActivityHandler,
+  ChatApi,
+  MessageHandler,
+  ReadHandler,
+  ReadReceipt,
+  ServerMeta,
+} from './types';
 
 /**
  * Talks to an AgoraLume backend over HTTP. The base URL is injected via
@@ -70,6 +77,20 @@ export class HttpChatApi implements ChatApi {
     };
     // Read receipts arrive as a named "read" SSE event on the same stream.
     source.addEventListener('read', onRead);
+    return () => source.close();
+  }
+
+  subscribeActivity(groupId: string, handler: ActivityHandler): () => void {
+    const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
+    const onActivity = (event: MessageEvent<string>) => {
+      try {
+        handler((JSON.parse(event.data) as { active: boolean }).active);
+      } catch {
+        // Ignore malformed events.
+      }
+    };
+    // Turn activity arrives as a named "activity" SSE event on the same stream.
+    source.addEventListener('activity', onActivity);
     return () => source.close();
   }
 }

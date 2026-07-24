@@ -2,7 +2,7 @@ import { useConnection } from '../../store/connection';
 import type { Message } from '../../types';
 import { HttpChatApi } from './http';
 import { MockChatApi } from './mock';
-import type { ChatApi, MessageHandler, ReadHandler, ServerMeta } from './types';
+import type { ActivityHandler, ChatApi, MessageHandler, ReadHandler, ServerMeta } from './types';
 
 /**
  * A stable `ChatApi` that routes every call to the currently configured data
@@ -41,6 +41,9 @@ class RoutingChatApi implements ChatApi {
   }
   subscribeReads(groupId: string, handler: ReadHandler): () => void {
     return this.impl().subscribeReads(groupId, handler);
+  }
+  subscribeActivity(groupId: string, handler: ActivityHandler): () => void {
+    return this.impl().subscribeActivity(groupId, handler);
   }
 }
 

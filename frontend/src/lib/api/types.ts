@@ -12,6 +12,9 @@ export interface ReadReceipt {
 
 export type ReadHandler = (receipt: ReadReceipt) => void;
 
+/** Turn activity: `true` when the agent loop starts a turn, `false` when idle. */
+export type ActivityHandler = (active: boolean) => void;
+
 /**
  * What the data source offers. `mock` means no LLM and no persistence (the
  * in-memory build) — distinct from whether the backend is reachable. The
@@ -64,4 +67,12 @@ export interface ChatApi {
    * without replying). Returns an unsubscribe function.
    */
   subscribeReads(groupId: string, handler: ReadHandler): () => void;
+
+  /**
+   * Subscribes to the group's turn activity: `true` when the agent loop starts
+   * a turn, `false` when it goes idle. The composer stays locked while active,
+   * so a user message can never interleave with an in-flight turn. Returns an
+   * unsubscribe function.
+   */
+  subscribeActivity(groupId: string, handler: ActivityHandler): () => void;
 }

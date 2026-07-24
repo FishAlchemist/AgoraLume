@@ -8,7 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use utoipa::ToSchema;
@@ -145,12 +145,20 @@ async fn post_event(
     StatusCode::ACCEPTED
 }
 
+/// A turn-activity SSE frame: `true` while the group's agent loop runs a turn,
+/// `false` when it goes idle.
+#[derive(Serialize)]
+struct ActivityFrame {
+    active: bool,
+}
+
 /// Server-Sent Events for a group: default `message` events (AI replies and
-/// moods) and named `read` events (read receipts).
+/// moods), named `read` events (read receipts), and named `activity` events
+/// (the agent loop turning busy/idle).
 #[utoipa::path(get, path = "/groups/{id}/stream", tag = "chat",
     params(("id" = String, Path, description = "Group id")),
     responses((status = 200,
-        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt")))]
+        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`")))]
 async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     let receiver = state.channel(&id).subscribe();
     let events = BroadcastStream::new(receiver).filter_map(to_sse_event);
@@ -166,6 +174,9 @@ fn to_sse_event(
     let event = match item.ok()? {
         StreamEvent::Message(message) => Event::default().json_data(message).ok()?,
         StreamEvent::Read(receipt) => Event::default().event("read").json_data(receipt).ok()?,
+        StreamEvent::Activity(active) => {
+            Event::default().event("activity").json_data(ActivityFrame { active }).ok()?
+        }
     };
     Some(Ok(event))
 }
