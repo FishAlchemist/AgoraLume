@@ -1,32 +1,36 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { type WorkspaceSnapshot, workspaceClient } from '../lib/api/workspace';
 import type { PersonaBundle } from '../lib/transfer';
 import type { Department, Group, Organization, Persona, Settings } from '../types';
 import { DEFAULT_USER_PERSONA_ID } from '../types';
+import { useConnection } from './connection';
 
 const uid = () =>
   crypto.randomUUID?.() ?? `id-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-interface WorkspaceState {
+/** The workspace data — the shape mirrored by the backend SSOT. */
+interface WorkspaceData {
   organizations: Organization[];
   departments: Department[];
   personas: Persona[];
   groups: Group[];
   settings: Settings;
+}
 
-  addOrganization: (input: Omit<Organization, 'id'>) => Organization;
+interface WorkspaceState extends WorkspaceData {
+  addOrganization: (input: Omit<Organization, 'id'>) => void;
   updateOrganization: (id: string, patch: Partial<Omit<Organization, 'id'>>) => void;
   deleteOrganization: (id: string) => void;
 
-  addDepartment: (input: Omit<Department, 'id'>) => Department;
+  addDepartment: (input: Omit<Department, 'id'>) => void;
   updateDepartment: (id: string, patch: Partial<Omit<Department, 'id'>>) => void;
   deleteDepartment: (id: string) => void;
 
-  addPersona: (input: Omit<Persona, 'id'>) => Persona;
+  addPersona: (input: Omit<Persona, 'id'>) => void;
   updatePersona: (id: string, patch: Partial<Omit<Persona, 'id'>>) => void;
   deletePersona: (id: string) => void;
 
-  addGroup: (input: Omit<Group, 'id'>) => Group;
+  addGroup: (input: Omit<Group, 'id'>) => void;
   updateGroup: (id: string, patch: Partial<Omit<Group, 'id'>>) => void;
   deleteGroup: (id: string) => void;
 
@@ -34,7 +38,12 @@ interface WorkspaceState {
 
   /** Merges a backup bundle in with fresh ids; returns personas imported. */
   importBundle: (bundle: PersonaBundle) => number;
+
+  /** Re-reads the whole workspace from the connected backend (SSOT). */
+  hydrate: () => Promise<void>;
 }
+
+// --- Seed (mirrors backend/src/workspace.rs) --------------------------------
 
 function seedOrganizations(): Organization[] {
   return [
@@ -152,142 +161,265 @@ const defaultSettings: Settings = {
   chatFontSize: 15,
 };
 
-export const useWorkspace = create<WorkspaceState>()(
-  persist(
-    (set) => ({
-      organizations: seedOrganizations(),
-      departments: seedDepartments(),
-      personas: seedPersonas(),
-      groups: seedGroups(),
-      settings: defaultSettings,
+function seedData(): WorkspaceData {
+  return {
+    organizations: seedOrganizations(),
+    departments: seedDepartments(),
+    personas: seedPersonas(),
+    groups: seedGroups(),
+    settings: defaultSettings,
+  };
+}
 
-      addOrganization: (input) => {
-        const org: Organization = { ...input, id: uid() };
-        set((s) => ({ organizations: [...s.organizations, org] }));
-        return org;
-      },
-      updateOrganization: (id, patch) =>
-        set((s) => ({
-          organizations: s.organizations.map((o) => (o.id === id ? { ...o, ...patch } : o)),
-        })),
-      deleteOrganization: (id) =>
-        set((s) => {
-          const removedDeptIds = new Set(
-            s.departments.filter((d) => d.organizationId === id).map((d) => d.id),
-          );
-          return {
-            organizations: s.organizations.filter((o) => o.id !== id),
-            departments: s.departments.filter((d) => d.organizationId !== id),
-            // Members keep existing but lose the now-dangling org/department links.
-            personas: s.personas.map((p) =>
-              p.organizationId === id || (p.departmentId && removedDeptIds.has(p.departmentId))
-                ? { ...p, organizationId: undefined, departmentId: undefined }
-                : p,
-            ),
-          };
-        }),
+// --- Mock persistence -------------------------------------------------------
+//
+// Only the offline (mock) workspace is persisted to localStorage — it's the
+// editable copy the app owns when no backend is present. When connected to a
+// backend the workspace is a cache of the SSOT and is *not* written here, so
+// switching back to mock restores the user's own offline data untouched.
 
-      addDepartment: (input) => {
-        const department: Department = { ...input, id: uid() };
-        set((s) => ({ departments: [...s.departments, department] }));
-        return department;
-      },
-      updateDepartment: (id, patch) =>
-        set((s) => ({
-          departments: s.departments.map((d) => (d.id === id ? { ...d, ...patch } : d)),
-        })),
-      deleteDepartment: (id) =>
-        set((s) => ({
-          departments: s.departments.filter((d) => d.id !== id),
-          personas: s.personas.map((p) =>
-            p.departmentId === id ? { ...p, departmentId: undefined } : p,
-          ),
-        })),
+const MOCK_KEY = 'agoralume-workspace';
+const MOCK_VERSION = 2;
 
-      addPersona: (input) => {
-        const persona: Persona = { ...input, id: uid() };
-        set((s) => ({ personas: [...s.personas, persona] }));
-        return persona;
-      },
-      updatePersona: (id, patch) =>
-        set((s) => ({
-          personas: s.personas.map((p) => (p.id === id ? { ...p, ...patch } : p)),
-        })),
-      deletePersona: (id) =>
-        set((s) => {
-          const target = s.personas.find((p) => p.id === id);
-          // Keep at least one user identity around — groups always need a "you".
-          if (target?.kind === 'user' && s.personas.filter((p) => p.kind === 'user').length <= 1) {
-            return {};
-          }
-          const fallbackSelf = s.personas.find((p) => p.kind === 'user' && p.id !== id)?.id;
-          return {
-            personas: s.personas.filter((p) => p.id !== id),
-            groups: s.groups.map((g) => ({
-              ...g,
-              personaIds: g.personaIds.filter((pid) => pid !== id),
-              selfPersonaId:
-                g.selfPersonaId === id && fallbackSelf ? fallbackSelf : g.selfPersonaId,
-            })),
-          };
-        }),
+function loadMock(): WorkspaceData {
+  try {
+    const raw = localStorage.getItem(MOCK_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as { version?: number } & Partial<WorkspaceData>;
+      // Alpha: the schema still moves freely, so incompatible data is discarded.
+      if (parsed.version === MOCK_VERSION) {
+        return {
+          organizations: parsed.organizations ?? [],
+          departments: parsed.departments ?? [],
+          personas: parsed.personas ?? [],
+          groups: parsed.groups ?? [],
+          settings: parsed.settings ?? defaultSettings,
+        };
+      }
+    }
+  } catch {
+    // Corrupt or unavailable storage — fall through to a fresh seed.
+  }
+  return seedData();
+}
 
-      addGroup: (input) => {
-        const group: Group = { ...input, id: uid() };
-        set((s) => ({ groups: [...s.groups, group] }));
-        return group;
-      },
-      updateGroup: (id, patch) =>
-        set((s) => ({
-          groups: s.groups.map((g) => (g.id === id ? { ...g, ...patch } : g)),
-        })),
-      deleteGroup: (id) => set((s) => ({ groups: s.groups.filter((g) => g.id !== id) })),
+function saveMock(data: WorkspaceData): void {
+  try {
+    localStorage.setItem(MOCK_KEY, JSON.stringify({ version: MOCK_VERSION, ...data }));
+  } catch {
+    // Storage full or unavailable — nothing we can do; keep running in memory.
+  }
+}
 
-      updateSettings: (patch) => set((s) => ({ settings: { ...s.settings, ...patch } })),
+// --- Backend routing --------------------------------------------------------
 
-      importBundle: (bundle) => {
-        const orgIdMap = new Map<string, string>();
-        const deptIdMap = new Map<string, string>();
+/** The workspace client for the active backend, or `null` in mock mode. */
+function backend() {
+  const url = useConnection.getState().backendUrl;
+  return url ? workspaceClient(url) : null;
+}
 
-        const newOrgs = bundle.organizations.map((o) => {
-          const id = uid();
-          orgIdMap.set(o.id, id);
-          return { ...o, id };
-        });
-        const newDepartments = bundle.departments.map((d) => {
-          const id = uid();
-          deptIdMap.set(d.id, id);
-          return { ...d, id, organizationId: orgIdMap.get(d.organizationId) ?? d.organizationId };
-        });
-        const newPersonas = bundle.personas
-          .filter((p) => p.kind !== 'user')
-          .map((p) => ({
-            ...p,
-            id: uid(),
-            organizationId: p.organizationId ? orgIdMap.get(p.organizationId) : undefined,
-            departmentId: p.departmentId ? deptIdMap.get(p.departmentId) : undefined,
-          }));
+export const useWorkspace = create<WorkspaceState>()((set, get) => {
+  // If a mutation's optimistic guess ever disagrees with the backend, snap the
+  // whole store back to the SSOT so the two can't quietly drift apart.
+  const resync = () => {
+    void get().hydrate();
+  };
 
-        set((s) => ({
-          organizations: [...s.organizations, ...newOrgs],
-          departments: [...s.departments, ...newDepartments],
-          personas: [...s.personas, ...newPersonas],
-        }));
-        return newPersonas.length;
-      },
-    }),
-    {
-      name: 'agoralume-workspace',
-      // Alpha: the schema still moves freely, so we don't migrate old state —
-      // incompatible persisted data is simply discarded on load.
-      version: 1,
-      partialize: (s) => ({
-        organizations: s.organizations,
-        departments: s.departments,
-        personas: s.personas,
-        groups: s.groups,
-        settings: s.settings,
-      }),
+  return {
+    // Backend mode starts from the shared seed (identical to the backend's own
+    // seed, so there's no visible flash) and is replaced by hydrate(); mock mode
+    // loads the persisted offline copy.
+    ...(backend() ? seedData() : loadMock()),
+
+    addOrganization: (input) => {
+      const org: Organization = { ...input, id: uid() };
+      set((s) => ({ organizations: [...s.organizations, org] }));
+      backend()?.createOrganization(org).catch(resync);
     },
-  ),
-);
+    updateOrganization: (id, patch) => {
+      set((s) => ({
+        organizations: s.organizations.map((o) => (o.id === id ? { ...o, ...patch } : o)),
+      }));
+      backend()?.updateOrganization(id, patch).catch(resync);
+    },
+    deleteOrganization: (id) => {
+      set((s) => {
+        const removedDeptIds = new Set(
+          s.departments.filter((d) => d.organizationId === id).map((d) => d.id),
+        );
+        return {
+          organizations: s.organizations.filter((o) => o.id !== id),
+          departments: s.departments.filter((d) => d.organizationId !== id),
+          // Members keep existing but lose the now-dangling org/department links.
+          personas: s.personas.map((p) =>
+            p.organizationId === id || (p.departmentId && removedDeptIds.has(p.departmentId))
+              ? { ...p, organizationId: undefined, departmentId: undefined }
+              : p,
+          ),
+        };
+      });
+      backend()?.deleteOrganization(id).catch(resync);
+    },
+
+    addDepartment: (input) => {
+      const department: Department = { ...input, id: uid() };
+      set((s) => ({ departments: [...s.departments, department] }));
+      backend()?.createDepartment(department).catch(resync);
+    },
+    updateDepartment: (id, patch) => {
+      set((s) => ({
+        departments: s.departments.map((d) => (d.id === id ? { ...d, ...patch } : d)),
+      }));
+      backend()?.updateDepartment(id, patch).catch(resync);
+    },
+    deleteDepartment: (id) => {
+      set((s) => ({
+        departments: s.departments.filter((d) => d.id !== id),
+        personas: s.personas.map((p) =>
+          p.departmentId === id ? { ...p, departmentId: undefined } : p,
+        ),
+      }));
+      backend()?.deleteDepartment(id).catch(resync);
+    },
+
+    addPersona: (input) => {
+      const persona: Persona = { ...input, id: uid() };
+      set((s) => ({ personas: [...s.personas, persona] }));
+      backend()?.createPersona(persona).catch(resync);
+    },
+    updatePersona: (id, patch) => {
+      set((s) => ({
+        personas: s.personas.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+      }));
+      backend()?.updatePersona(id, patch).catch(resync);
+    },
+    deletePersona: (id) => {
+      const state = get();
+      const target = state.personas.find((p) => p.id === id);
+      // Keep at least one user identity around — groups always need a "you".
+      // The backend enforces the same guard (409), so we don't call it here.
+      if (target?.kind === 'user' && state.personas.filter((p) => p.kind === 'user').length <= 1) {
+        return;
+      }
+      const fallbackSelf = state.personas.find((p) => p.kind === 'user' && p.id !== id)?.id;
+      set((s) => ({
+        personas: s.personas.filter((p) => p.id !== id),
+        groups: s.groups.map((g) => ({
+          ...g,
+          personaIds: g.personaIds.filter((pid) => pid !== id),
+          selfPersonaId: g.selfPersonaId === id && fallbackSelf ? fallbackSelf : g.selfPersonaId,
+        })),
+      }));
+      backend()?.deletePersona(id).catch(resync);
+    },
+
+    addGroup: (input) => {
+      const group: Group = { ...input, id: uid() };
+      set((s) => ({ groups: [...s.groups, group] }));
+      backend()?.createGroup(group).catch(resync);
+    },
+    updateGroup: (id, patch) => {
+      set((s) => ({
+        groups: s.groups.map((g) => (g.id === id ? { ...g, ...patch } : g)),
+      }));
+      backend()?.updateGroup(id, patch).catch(resync);
+    },
+    deleteGroup: (id) => {
+      set((s) => ({ groups: s.groups.filter((g) => g.id !== id) }));
+      backend()?.deleteGroup(id).catch(resync);
+    },
+
+    updateSettings: (patch) => {
+      set((s) => ({ settings: { ...s.settings, ...patch } }));
+      backend()?.updateSettings(patch).catch(resync);
+    },
+
+    importBundle: (bundle) => {
+      const orgIdMap = new Map<string, string>();
+      const deptIdMap = new Map<string, string>();
+
+      const newOrgs = bundle.organizations.map((o) => {
+        const id = uid();
+        orgIdMap.set(o.id, id);
+        return { ...o, id };
+      });
+      const newDepartments = bundle.departments.map((d) => {
+        const id = uid();
+        deptIdMap.set(d.id, id);
+        return { ...d, id, organizationId: orgIdMap.get(d.organizationId) ?? d.organizationId };
+      });
+      const newPersonas = bundle.personas
+        .filter((p) => p.kind !== 'user')
+        .map((p) => ({
+          ...p,
+          id: uid(),
+          organizationId: p.organizationId ? orgIdMap.get(p.organizationId) : undefined,
+          departmentId: p.departmentId ? deptIdMap.get(p.departmentId) : undefined,
+        }));
+
+      set((s) => ({
+        organizations: [...s.organizations, ...newOrgs],
+        departments: [...s.departments, ...newDepartments],
+        personas: [...s.personas, ...newPersonas],
+      }));
+
+      const client = backend();
+      if (client) {
+        // Ids are client-generated and honoured by the server, so cross-links
+        // stay consistent regardless of insert order.
+        const posts = [
+          ...newOrgs.map((o) => client.createOrganization(o)),
+          ...newDepartments.map((d) => client.createDepartment(d)),
+          ...newPersonas.map((p) => client.createPersona(p)),
+        ];
+        Promise.all(posts).catch(resync);
+      }
+      return newPersonas.length;
+    },
+
+    hydrate: async () => {
+      const url = useConnection.getState().backendUrl;
+      if (!url) return;
+      try {
+        const snap: WorkspaceSnapshot = await workspaceClient(url).fetchAll();
+        // Ignore a stale response if the source changed while we were fetching.
+        if (useConnection.getState().backendUrl !== url) return;
+        set(snap);
+      } catch {
+        // Backend not up yet (or unreachable). useBackendStatus polls liveness
+        // and re-hydrates when it comes online, so we don't loop here.
+      }
+    },
+  };
+});
+
+// Persist the offline workspace, and only the offline one: while a backend is
+// connected the store mirrors the SSOT and must not overwrite the mock copy.
+useWorkspace.subscribe((state) => {
+  if (!useConnection.getState().backendUrl) {
+    saveMock({
+      organizations: state.organizations,
+      departments: state.departments,
+      personas: state.personas,
+      groups: state.groups,
+      settings: state.settings,
+    });
+  }
+});
+
+// React to data-source switches: pull the SSOT when connecting to a backend,
+// restore the offline copy when going back to the mock.
+useConnection.subscribe((conn, prev) => {
+  if (conn.backendUrl === prev.backendUrl) return;
+  if (conn.backendUrl) {
+    void useWorkspace.getState().hydrate();
+  } else {
+    useWorkspace.setState(loadMock());
+  }
+});
+
+// On startup with a backend already configured, pull the SSOT once.
+if (useConnection.getState().backendUrl) {
+  void useWorkspace.getState().hydrate();
+}

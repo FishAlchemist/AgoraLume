@@ -34,6 +34,20 @@ fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Resolves the id for a resource being created. The client may supply its own
+/// id in the POST body (so it can insert optimistically and stay in sync with
+/// the server without a round-trip); we honour it when it's non-empty and not
+/// already taken, and otherwise mint a fresh one.
+fn resolve_id<'a>(proposed: String, existing: impl Iterator<Item = &'a str>) -> String {
+    if proposed.is_empty() {
+        return new_id();
+    }
+    if existing.into_iter().any(|id| id == proposed) {
+        return new_id();
+    }
+    proposed
+}
+
 /// Merges a partial JSON `patch` onto a serializable resource, mirroring the
 /// client's `{ ...existing, ...patch }`: keys present in the patch overwrite,
 /// absent keys are left untouched. Returns the updated, re-validated resource,
@@ -70,7 +84,7 @@ impl Workspace {
     // --- Organizations ------------------------------------------------------
 
     pub fn create_organization(&mut self, mut org: Organization) -> Organization {
-        org.id = new_id();
+        org.id = resolve_id(org.id, self.organizations.iter().map(|o| o.id.as_str()));
         self.organizations.push(org.clone());
         org
     }
@@ -114,7 +128,7 @@ impl Workspace {
     // --- Departments --------------------------------------------------------
 
     pub fn create_department(&mut self, mut dept: Department) -> Department {
-        dept.id = new_id();
+        dept.id = resolve_id(dept.id, self.departments.iter().map(|d| d.id.as_str()));
         self.departments.push(dept.clone());
         dept
     }
@@ -143,7 +157,7 @@ impl Workspace {
     // --- Personas -----------------------------------------------------------
 
     pub fn create_persona(&mut self, mut persona: Persona) -> Persona {
-        persona.id = new_id();
+        persona.id = resolve_id(persona.id, self.personas.iter().map(|p| p.id.as_str()));
         self.personas.push(persona.clone());
         persona
     }
@@ -192,7 +206,7 @@ impl Workspace {
     // --- Groups -------------------------------------------------------------
 
     pub fn create_group(&mut self, mut group: Group) -> Group {
-        group.id = new_id();
+        group.id = resolve_id(group.id, self.groups.iter().map(|g| g.id.as_str()));
         self.groups.push(group.clone());
         group
     }
