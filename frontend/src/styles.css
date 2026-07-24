@@ -1,0 +1,45 @@
+/* Modern-Japanese / anime UI: cool, crisp, high-contrast, over Mantine. */
+
+:root {
+  --agora-bg-light:
+    radial-gradient(1100px 600px at 10% -10%, #dbe4ff 0%, transparent 55%),
+    radial-gradient(900px 600px at 115% 5%, #d0f0ff 0%, transparent 50%),
+    linear-gradient(160deg, #f6f8fc 0%, #eef2fb 55%, #eaf6ff 100%);
+  --agora-bg-dark:
+    radial-gradient(1100px 600px at 10% -10%, #17213f 0%, transparent 55%),
+    radial-gradient(900px 600px at 115% 5%, #0f2a3a 0%, transparent 50%),
+    linear-gradient(160deg, #0a0f1e 0%, #0c1226 55%, #0a1622 100%);
+}
+
+body {
+  background: var(--agora-bg-light);
+  background-attachment: fixed;
+  min-height: 100dvh;
+}
+
+[data-mantine-color-scheme="dark"] body {
+  background: var(--agora-bg-dark);
+  background-attachment: fixed;
+}
+
+/* Frosted-glass header & sidebar so the gradient shows through. */
+.mantine-AppShell-header,
+.mantine-AppShell-navbar {
+  /* biome-ignore lint/complexity/noImportantStyles: overrides Mantine's component-level background for the glass effect. */
+  background: color-mix(in srgb, var(--mantine-color-body) 58%, transparent) !important;
+  backdrop-filter: blur(16px) saturate(1.3);
+  -webkit-backdrop-filter: blur(16px) saturate(1.3);
+  /* biome-ignore lint/complexity/noImportantStyles: overrides Mantine's component-level border color. */
+  border-color: color-mix(in srgb, var(--mantine-color-default-border) 50%, transparent) !important;
+}
+
+.mantine-AppShell-main {
+  /* biome-ignore lint/complexity/noImportantStyles: let the body gradient show through Mantine's opaque main. */
+  background: transparent !important;
+}
+
+/* Slim, cool-tinted scrollbars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--mantine-color-indigo-4) 55%, transparent) transparent;
+}

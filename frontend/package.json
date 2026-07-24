@@ -8,7 +8,14 @@
   "keywords": [],
   "author": "",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "check": "biome check .",
+    "check:fix": "biome check --write ."
   },
   "devEngines": {
     "packageManager": {
@@ -16,5 +23,26 @@
       "version": "^11.17.0",
       "onFail": "download"
     }
+  },
+  "dependencies": {
+    "@mantine/core": "^9.4.2",
+    "@mantine/hooks": "^9.4.2",
+    "@tabler/icons-react": "^3.45.0",
+    "@tanstack/react-query": "^5.101.4",
+    "i18next": "^26.3.6",
+    "i18next-browser-languagedetector": "^8.2.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-i18next": "^17.0.10",
+    "react-router-dom": "^7.18.1",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.5",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5"
   }
 }
