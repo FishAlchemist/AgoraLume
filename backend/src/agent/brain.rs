@@ -76,11 +76,15 @@ pub struct AgentPersona {
     pub variables: HashMap<String, String>,
 }
 
-/// One entry in the global member directory an agent can consult by name. Unlike
-/// the group roster (who is in *this* room, injected into every prompt), the
-/// directory covers *every* persona in the workspace and is queried on demand
-/// through the `lookup_member` tool — so the prompt stays small while the agent
-/// can still look anyone up by their globally-unique name.
+/// One entry in the workspace member directory injected into an agent's prompt.
+/// Unlike the group roster (who is in *this* room), the directory covers *every*
+/// persona in the workspace, so an agent can refer — by their globally-unique
+/// name — to anyone it isn't sharing the room with, including the user. It rides
+/// in the prompt's `<directory>` section rather than a callable tool: a live tool
+/// loop needs a follow-up model turn, which some providers (e.g. Gemini, whose
+/// function calls carry a `thought_signature` rig 0.40 can't round-trip) reject —
+/// so the whole decision would fail. Static context keeps every decision a single
+/// successful completion.
 #[derive(Clone, Debug)]
 pub struct MemberInfo {
     pub name: String,
@@ -90,20 +94,16 @@ pub struct MemberInfo {
 }
 
 /// The fully-assembled prompt handed to a brain — the self-managed context, in
-/// the form a model consumes. `system` carries the persona (with variables);
-/// `conversation` carries the clean transcript plus injected environment events.
-/// `persona_name` and `last_line` are conveniences so a non-LLM brain need not
-/// re-parse the text.
+/// the form a model consumes. `system` carries the persona (with variables, the
+/// group members, and the wider workspace `<directory>`); `conversation` carries
+/// the clean transcript plus injected environment events. `persona_name` and
+/// `last_line` are conveniences so a non-LLM brain need not re-parse the text.
 #[derive(Clone, Debug)]
 pub struct AgentPrompt {
     pub system: String,
     pub conversation: String,
     pub persona_name: String,
     pub last_line: Option<String>,
-    /// Every persona in the workspace, so a brain can offer a `lookup_member`
-    /// tool that resolves a name to its blurb on demand. Empty for brains/tests
-    /// that don't use it; the mock ignores it.
-    pub directory: Vec<MemberInfo>,
 }
 
 /// A brain's output: the decision plus optional telemetry. Keeping usage

@@ -9,6 +9,7 @@
 //! to different streams (§ `agent_loop_arch.md`). Soft events fold in at member
 //! boundaries; a hard event preempts the turn, discarding the in-flight agent.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,7 +139,8 @@ async fn run_turn(
 
         // The roster (who's in the room, incl. the user) is fixed for the round;
         // every agent this sweep is told the same membership. The directory (every
-        // persona in the workspace) backs the on-demand `lookup_member` tool.
+        // persona in the workspace) is injected so an agent can refer to people
+        // outside the room by their globally-unique name.
         let roster = state.workspace().group_roster(group_id).unwrap_or_default();
         let directory = build_directory(state);
         // A single wall-clock reading for the round, with the server's timezone
@@ -328,8 +330,8 @@ fn build_persona(state: &AppState, id: &str) -> Option<AgentPersona> {
     })
 }
 
-/// Every persona in the workspace, as the on-demand `lookup_member` directory.
-/// Cloned so the brain can hold it past the workspace lock.
+/// Every persona in the workspace, as the member directory injected into each
+/// prompt. Cloned so the brain can hold it past the workspace lock.
 fn build_directory(state: &AppState) -> Vec<MemberInfo> {
     state
         .workspace()
@@ -347,6 +349,21 @@ fn build_directory(state: &AppState) -> Vec<MemberInfo> {
 /// offset (e.g. `2026-07-25T15:30:00+08:00`), so agents can reason about "now".
 fn local_now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+/// Writes one "- Name (marker): blurb" bullet, dropping the blurb clause when the
+/// member has none. Shared by the `<group_members>` and `<directory>` sections so
+/// both render members identically.
+fn write_member_line(out: &mut String, name: &str, marker: &str, blurb: Option<&str>) {
+    use std::fmt::Write as _;
+    match blurb.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(blurb) => {
+            let _ = writeln!(out, "- {name}{marker}: {blurb}");
+        }
+        None => {
+            let _ = writeln!(out, "- {name}{marker}");
+        }
+    }
 }
 
 /// Renders the persona, clean transcript, and injected events into the prompt a
@@ -387,16 +404,27 @@ fn assemble_prompt(
         system.push_str("\n<group_members>\n");
         for member in roster {
             let you = if member.is_self { " (you)" } else { "" };
-            match member.blurb.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
-                Some(blurb) => {
-                    let _ = writeln!(system, "- {}{you}: {blurb}", member.name);
-                }
-                None => {
-                    let _ = writeln!(system, "- {}{you}", member.name);
-                }
-            }
+            write_member_line(&mut system, &member.name, you, member.blurb.as_deref());
         }
         system.push_str("</group_members>\n");
+    }
+    // Everyone else in the workspace the agent may refer to by their unique name,
+    // even though they aren't in this room. People already in <group_members> are
+    // skipped so they aren't listed twice. This replaces a callable lookup tool:
+    // as static context it keeps the decision a single completion (a tool loop's
+    // follow-up turn 400s on providers like Gemini that require a per-call
+    // `thought_signature` rig 0.40 can't round-trip).
+    let present: HashSet<String> =
+        roster.iter().map(|m| m.name.trim().to_ascii_lowercase()).collect();
+    let mut others =
+        directory.iter().filter(|m| !present.contains(&m.name.trim().to_ascii_lowercase())).peekable();
+    if others.peek().is_some() {
+        system.push_str("\n<directory>\n");
+        for member in others {
+            let you = if member.is_user { " (you)" } else { "" };
+            write_member_line(&mut system, &member.name, you, member.blurb.as_deref());
+        }
+        system.push_str("</directory>\n");
     }
     // The live transcript and any environment events, each in its own element.
     let mut conversation = String::new();
@@ -422,7 +450,6 @@ fn assemble_prompt(
         conversation,
         persona_name: persona.name.clone(),
         last_line: transcript.last().map(|line| line.text.clone()),
-        directory: directory.to_vec(),
     }
 }
 
@@ -619,6 +646,32 @@ mod tests {
         assert!(prompt.system.contains("You (you): Your own voice."));
         assert!(prompt.system.contains("Nox: Dry strategist."));
         assert!(prompt.system.contains("- Sol\n"));
+    }
+
+    #[test]
+    fn directory_lists_workspace_members_outside_the_room() {
+        let persona = AgentPersona {
+            name: "Aria".into(),
+            system_prompt: "You are Aria.".into(),
+            variables: std::collections::HashMap::new(),
+        };
+        // Aria is in the room; the directory also carries the user and someone
+        // not present.
+        let roster = vec![RosterMember { name: "Aria".into(), blurb: None, is_self: false }];
+        let directory = vec![
+            MemberInfo { name: "Aria".into(), blurb: None, is_user: false },
+            MemberInfo { name: "You".into(), blurb: Some("Your own voice.".into()), is_user: true },
+            MemberInfo { name: "Nox".into(), blurb: Some("Dry strategist.".into()), is_user: false },
+        ];
+        let prompt = assemble_prompt(&persona, &roster, &directory, &[], &[], "");
+
+        assert!(prompt.system.contains("<directory>"));
+        // People not in the room are listed, the user flagged.
+        assert!(prompt.system.contains("You (you): Your own voice."));
+        assert!(prompt.system.contains("Nox: Dry strategist."));
+        // Someone already in <group_members> isn't repeated in <directory>.
+        let directory_section = prompt.system.split("<directory>").nth(1).unwrap();
+        assert!(!directory_section.contains("Aria"));
     }
 
     #[test]
