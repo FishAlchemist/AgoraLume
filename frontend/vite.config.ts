@@ -34,11 +34,21 @@ export default defineConfig(({ mode }) => {
   // Port Vite exposes; an explicit value is honoured strictly (a clash fails
   // loudly instead of hopping to another port). Unset uses Vite's default.
   const devPort = env.VITE_DEV_PORT ? Number(env.VITE_DEV_PORT) : undefined;
+  // Extra hostnames the dev server answers to, beyond localhost — needed when
+  // exposing it through a tunnel (e.g. Cloudflare's *.trycloudflare.com).
+  // Comma-separated; a leading dot matches subdomains. Kept in the gitignored
+  // frontend/.env so personal tunnel hosts aren't tracked. Unset = Vite default.
+  const allowedHosts = (env.VITE_ALLOWED_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean);
 
   return {
     plugins: [react()],
     server: {
       port: devPort,
+      // Only override when configured, so the default stays Vite's own list.
+      ...(allowedHosts.length > 0 ? { allowedHosts } : {}),
       strictPort: devPort !== undefined,
       // changeOrigin rewrites the Host header to the target; SSE (/groups/:id/
       // stream) streams straight through since the proxy doesn't buffer plain
