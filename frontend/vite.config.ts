@@ -1,5 +1,5 @@
 import react from '@vitejs/plugin-react';
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 
 // Static SPA build. Output in dist/ is plain HTML/JS/CSS and can be hosted
 // anywhere; at runtime it talks to a backend chosen by VITE_API_BASE_URL, the
@@ -9,8 +9,7 @@ import { defineConfig } from 'vite';
 // hot reload: `pnpm dev:proxy` serves the SPA in same-origin mode and forwards
 // the backend's top-level route prefixes to it, so the whole app is reachable
 // on Vite's one port. Client routes live under the URL hash (HashRouter), so
-// proxying these real paths never shadows SPA navigation. Override the backend
-// with VITE_PROXY_TARGET (default the local backend on 8080).
+// proxying these real paths never shadows SPA navigation.
 const API_PREFIXES = [
   '/health',
   '/meta',
@@ -22,20 +21,31 @@ const API_PREFIXES = [
   '/settings',
 ];
 
-// This config runs under Node; declare the one global we read so the app's
+// This config runs under Node; declare the globals we read so the app's
 // browser-only tsconfig type-checks it without pulling in @types/node.
-declare const process: { env: Record<string, string | undefined> };
+declare const process: { env: Record<string, string | undefined>; cwd(): string };
 
-const proxyTarget = process.env.VITE_PROXY_TARGET ?? 'http://127.0.0.1:8080';
+export default defineConfig(({ mode }) => {
+  // Merge .env files and real env vars, so the proxy/port settings work whether
+  // they live in frontend/.env or the shell.
+  const env = loadEnv(mode, process.cwd(), '');
+  // Backend the dev server proxies API routes to (default the local backend).
+  const proxyTarget = env.VITE_PROXY_TARGET || 'http://127.0.0.1:8080';
+  // Port Vite exposes; an explicit value is honoured strictly (a clash fails
+  // loudly instead of hopping to another port). Unset uses Vite's default.
+  const devPort = env.VITE_DEV_PORT ? Number(env.VITE_DEV_PORT) : undefined;
 
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    // changeOrigin rewrites the Host header to the target; SSE (/groups/:id/
-    // stream) streams straight through since the proxy doesn't buffer plain
-    // HTTP responses.
-    proxy: Object.fromEntries(
-      API_PREFIXES.map((path) => [path, { target: proxyTarget, changeOrigin: true }]),
-    ),
-  },
+  return {
+    plugins: [react()],
+    server: {
+      port: devPort,
+      strictPort: devPort !== undefined,
+      // changeOrigin rewrites the Host header to the target; SSE (/groups/:id/
+      // stream) streams straight through since the proxy doesn't buffer plain
+      // HTTP responses.
+      proxy: Object.fromEntries(
+        API_PREFIXES.map((path) => [path, { target: proxyTarget, changeOrigin: true }]),
+      ),
+    },
+  };
 });
