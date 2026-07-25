@@ -2,13 +2,60 @@
 
 use std::net::SocketAddr;
 
+use crate::models::Cost;
+
+/// Token pricing used to turn usage into an estimated cost. Rates are per
+/// 1,000,000 tokens, in `currency`. A rough operator-supplied estimate — models
+/// and providers differ — so the UI always labels the result "for reference".
+#[derive(Clone, Debug)]
+pub struct Pricing {
+    /// Price per 1M fresh (non-cached) input tokens.
+    pub input_per_m: f64,
+    /// Price per 1M cached input tokens. Usually cheaper than fresh input;
+    /// defaults to the fresh input rate when not set (a conservative estimate
+    /// that shows no cache saving until a discounted rate is provided).
+    pub cached_input_per_m: f64,
+    /// Price per 1M output tokens.
+    pub output_per_m: f64,
+    /// Currency label the rates are quoted in.
+    pub currency: String,
+}
+
+impl Pricing {
+    /// Estimates the cost of accumulated usage. Fresh input = prompt tokens not
+    /// served from cache; the split lets the panel show what the cache saved.
+    pub fn estimate(
+        &self,
+        prompt_tokens: u64,
+        cached_prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> Cost {
+        let per_million = |tokens: u64, rate: f64| (tokens as f64) / 1_000_000.0 * rate;
+        let fresh_input = prompt_tokens.saturating_sub(cached_prompt_tokens);
+        let input = per_million(fresh_input, self.input_per_m);
+        let cached_input = per_million(cached_prompt_tokens, self.cached_input_per_m);
+        let output = per_million(completion_tokens, self.output_per_m);
+        Cost {
+            currency: self.currency.clone(),
+            input,
+            cached_input,
+            output,
+            total: input + cached_input + output,
+        }
+    }
+}
+
 pub struct Config {
     /// Address the HTTP server binds to.
     pub bind: SocketAddr,
-    /// Where runtime state will live once persistence exists. Reserved for now —
-    /// this build keeps everything in memory — but honoured so deployment
-    /// configs can be wired up ahead of time.
+    /// Directory for on-disk persistence (`workspace.json` + `messages/`), read
+    /// from `AGORALUME_DATA_DIR`. Only used when `persist` is on.
     pub data_dir: String,
+    /// Whether to persist the workspace and chat logs to `data_dir` so they
+    /// survive a restart. Read from `AGORALUME_PERSIST`; when unset it defaults
+    /// to `llm` — a real-model run keeps its data, a throwaway mock run doesn't.
+    /// Persistence and the LLM are independent facts, so either can be forced.
+    pub persist: bool,
     /// Whether to leave mock mode and drive agents with a real LLM. Off by
     /// default so a plain run never spends API budget; set `AGORALUME_LLM` to
     /// opt in. When on, the `llm_*` fields below configure the OpenAI-compatible
@@ -26,6 +73,9 @@ pub struct Config {
     /// Upper bound on tokens per reply. Read from `AGORALUME_LLM_MAX_TOKENS`;
     /// defaults to 512 — enough for a chat turn without runaway cost.
     pub llm_max_tokens: u64,
+    /// Optional token pricing for the estimated-cost readout. When unset, the
+    /// debug panel shows token counts only. Rates are per 1,000,000 tokens.
+    pub pricing: Option<Pricing>,
     /// Explicit path to the built frontend to serve. Normally left unset — the
     /// bundle ships the SPA in a `web/` directory next to the executable, which
     /// is discovered automatically. Set `AGORALUME_WEB_DIR` to override.
@@ -61,6 +111,10 @@ impl Config {
             .parse()
             .unwrap_or_else(|_| panic!("invalid AGORALUME_BIND `{bind}` (want host:port)"));
         let data_dir = std::env::var("AGORALUME_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+        let llm = env_flag("AGORALUME_LLM");
+        // Default persistence to whether a real model is driving: a mock run is
+        // throwaway, an LLM run is worth keeping. Either can override explicitly.
+        let persist = env_flag_opt("AGORALUME_PERSIST").unwrap_or(llm);
         let web_dir = std::env::var("AGORALUME_WEB_DIR").ok();
         // Default on, so double-clicking the bundle "just works"; only an
         // explicit unset-like value opts out.
@@ -76,15 +130,40 @@ impl Config {
         Self {
             bind,
             data_dir,
-            llm: env_flag("AGORALUME_LLM"),
+            persist,
+            llm,
             llm_base_url: env_nonempty("AGORALUME_LLM_BASE_URL"),
             llm_model: env_nonempty("AGORALUME_LLM_MODEL"),
             llm_api_key: env_nonempty("AGORALUME_LLM_API_KEY"),
             llm_max_tokens,
+            pricing: read_pricing(),
             web_dir,
             open_browser,
         }
     }
+}
+
+/// Builds the optional [`Pricing`] from the environment. Present when either the
+/// input or output rate is set; the cached-input rate defaults to the input rate
+/// so cost is never under-reported before a discounted cache rate is supplied.
+fn read_pricing() -> Option<Pricing> {
+    let input = env_f64("AGORALUME_LLM_PRICE_INPUT");
+    let output = env_f64("AGORALUME_LLM_PRICE_OUTPUT");
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    let input_per_m = input.unwrap_or(0.0);
+    Some(Pricing {
+        input_per_m,
+        cached_input_per_m: env_f64("AGORALUME_LLM_PRICE_CACHED_INPUT").unwrap_or(input_per_m),
+        output_per_m: output.unwrap_or(0.0),
+        currency: env_nonempty("AGORALUME_LLM_PRICE_CURRENCY").unwrap_or_else(|| "USD".to_string()),
+    })
+}
+
+/// Reads a floating-point environment variable, treating blank as unset.
+fn env_f64(name: &str) -> Option<f64> {
+    env_nonempty(name).and_then(|v| v.parse().ok())
 }
 
 /// Reads an environment variable, treating blank/whitespace as unset.
@@ -95,7 +174,14 @@ fn env_nonempty(name: &str) -> Option<String> {
 /// Reads a boolean environment flag. Absent or an unset-like value is false;
 /// `1`/`true`/`yes`/`on` (any case) is true.
 fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
+    env_flag_opt(name).unwrap_or(false)
+}
+
+/// Reads a tri-state boolean flag: `None` when unset, else `Some(true)` for
+/// `1`/`true`/`yes`/`on` and `Some(false)` for anything else. Lets a caller tell
+/// "left at its default" apart from an explicit off.
+fn env_flag_opt(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }

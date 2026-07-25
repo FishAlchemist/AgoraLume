@@ -9,11 +9,13 @@
 //! Ollama / llama.cpp server equally.
 
 use async_trait::async_trait;
+use rig_core::completion::Usage;
 use rig_core::providers::openai;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::brain::{AgentBrain, AgentPrompt, Respond};
+use crate::agent::brain::{AgentBrain, AgentPrompt, Decision, Respond};
+use crate::models::TokenUsage;
 
 /// The `respond` tool's arguments, as the model returns them. Kept separate from
 /// [`Respond`] so the wire schema the model sees stays decoupled from the
@@ -67,11 +69,29 @@ fn to_respond(args: RespondArgs) -> Respond {
 /// How the agent is told to use the `respond` schema. Appended *after* the
 /// persona's own system prompt, so character comes first and mechanics second.
 const GUIDANCE: &str = "\
-You are one participant in a group text chat. Read the conversation and decide \
-your single next action using the response schema. Speak only when you have \
-something worth adding; otherwise choose `read` to stay silent. Moods are \
-UI-only flavour and are never shown to other participants as text. Keep any \
+You are one participant in a group text chat. The context above is given in \
+XML-tagged sections (<persona>, <context>, <group_members>) and the message \
+below carries the live <conversation> and any <environment> events. Read them \
+and decide your single next action using the response schema. Speak only when \
+you have something worth adding; otherwise choose `read` to stay silent. Moods \
+are UI-only flavour and are never shown to other participants as text. Keep any \
 reply to one short chat message.";
+
+/// Maps rig's completion usage onto our wire [`TokenUsage`]. `total_tokens`
+/// falls back to input+output when the provider reports only the two parts.
+fn to_token_usage(usage: Usage) -> TokenUsage {
+    let total = if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage.input_tokens + usage.output_tokens
+    };
+    TokenUsage {
+        prompt_tokens: usage.input_tokens,
+        completion_tokens: usage.output_tokens,
+        total_tokens: total,
+        cached_prompt_tokens: usage.cached_input_tokens,
+    }
+}
 
 /// An [`AgentBrain`] that drives decisions with an OpenAI-compatible chat model
 /// via rig-core. Endpoint, model, and key all come from config.
@@ -102,7 +122,7 @@ impl LlmBrain {
 
 #[async_trait]
 impl AgentBrain for LlmBrain {
-    async fn decide(&self, prompt: &AgentPrompt) -> Respond {
+    async fn decide(&self, prompt: &AgentPrompt) -> Decision {
         // The persona (system) becomes the extractor preamble; the clean
         // transcript is the text to reason over. Built per turn because the
         // preamble is persona-specific.
@@ -114,8 +134,14 @@ impl AgentBrain for LlmBrain {
             .max_tokens(self.max_tokens)
             .build();
 
-        match extractor.extract(prompt.conversation.clone()).await {
-            Ok(args) => to_respond(args),
+        // `extract_with_usage` returns the token usage alongside the parsed
+        // arguments (accumulated across any retries), which is what feeds the
+        // debug/cost panel.
+        match extractor.extract_with_usage(prompt.conversation.clone()).await {
+            Ok(response) => Decision {
+                respond: to_respond(response.data),
+                usage: Some(to_token_usage(response.usage)),
+            },
             Err(e) => {
                 // A model or transport failure must not take down the turn: the
                 // agent simply stays silent this round.
@@ -124,7 +150,7 @@ impl AgentBrain for LlmBrain {
                     error = %e,
                     "LLM decide failed; treating as read (silent)"
                 );
-                Respond::read()
+                Respond::read().into()
             }
         }
     }

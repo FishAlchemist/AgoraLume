@@ -10,11 +10,25 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::models::{Department, Group, Organization, Persona, PersonaKind, Settings};
+
+/// A serializable snapshot of the whole workspace — the on-disk persistence
+/// format. Kept distinct from [`Workspace`] so the live type stays free to hold
+/// non-persisted state later without changing the saved shape. camelCase to
+/// match the wire types it is composed of.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSnapshot {
+    pub organizations: Vec<Organization>,
+    pub departments: Vec<Department>,
+    pub personas: Vec<Persona>,
+    pub groups: Vec<Group>,
+    pub settings: Settings,
+}
 
 /// The id of the default user identity, matching the frontend seed.
 const DEFAULT_USER_PERSONA_ID: &str = "user-me";
@@ -27,6 +41,16 @@ pub struct Workspace {
     pub personas: Vec<Persona>,
     pub groups: Vec<Group>,
     pub settings: Settings,
+}
+
+/// One member of a group, as an agent sees it: a name, an optional blurb, and
+/// whether this is the human "you". Used to give each agent a roster of who is
+/// in the room (including the user).
+#[derive(Clone, Debug)]
+pub struct RosterMember {
+    pub name: String,
+    pub blurb: Option<String>,
+    pub is_self: bool,
 }
 
 /// A newly minted id for a created resource.
@@ -78,6 +102,28 @@ impl Workspace {
             personas: seed_personas(),
             groups: seed_groups(),
             settings: seed_settings(),
+        }
+    }
+
+    /// Rebuilds a workspace from a persisted snapshot (loaded from disk).
+    pub fn from_snapshot(snapshot: WorkspaceSnapshot) -> Self {
+        Self {
+            organizations: snapshot.organizations,
+            departments: snapshot.departments,
+            personas: snapshot.personas,
+            groups: snapshot.groups,
+            settings: snapshot.settings,
+        }
+    }
+
+    /// A serializable copy of the workspace, for writing to disk.
+    pub fn to_snapshot(&self) -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            organizations: self.organizations.clone(),
+            departments: self.departments.clone(),
+            personas: self.personas.clone(),
+            groups: self.groups.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -234,6 +280,39 @@ impl Workspace {
     }
 
     // --- Turn helpers -------------------------------------------------------
+
+    /// The people in a group — the user identity ("you") first, then everyone
+    /// listed — with the name and blurb an agent needs to know who it's talking
+    /// to. Returns `None` for an unknown group.
+    pub fn group_roster(&self, group_id: &str) -> Option<Vec<RosterMember>> {
+        let group = self.groups.iter().find(|g| g.id == group_id)?;
+        let mut members = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+
+        // The user identity leads, flagged so the prompt can mark it "(you)".
+        if let Some(me) = self.personas.iter().find(|p| p.id == group.self_persona_id) {
+            seen.insert(me.id.as_str());
+            members.push(RosterMember {
+                name: me.name.clone(),
+                blurb: me.blurb.clone(),
+                is_self: true,
+            });
+        }
+        // Then the listed members, in order, skipping the self if it recurs.
+        for pid in &group.persona_ids {
+            if !seen.insert(pid.as_str()) {
+                continue;
+            }
+            if let Some(p) = self.personas.iter().find(|p| &p.id == pid) {
+                members.push(RosterMember {
+                    name: p.name.clone(),
+                    blurb: p.blurb.clone(),
+                    is_self: false,
+                });
+            }
+        }
+        Some(members)
+    }
 
     /// The user identity that authors outgoing messages in a group, plus the AI
     /// personas that read and may reply. Returns `None` for an unknown group.

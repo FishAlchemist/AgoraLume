@@ -12,6 +12,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
+use crate::models::TokenUsage;
+
 /// One of the four mutually-exclusive things an agent may do on its turn — the
 /// entire surface of the `respond` tool. The orchestrator routes each variant to
 /// the two streams (Context / UI View); see `agent::turn`.
@@ -87,6 +89,23 @@ pub struct AgentPrompt {
     pub last_line: Option<String>,
 }
 
+/// A brain's output: the decision plus optional telemetry. Keeping usage
+/// alongside the decision lets the orchestrator record token cost without the
+/// brain reaching into app state — it stays a pure prompt-in/decision-out
+/// function. The mock and providers that report nothing leave `usage` `None`.
+#[derive(Clone, Debug)]
+pub struct Decision {
+    pub respond: Respond,
+    pub usage: Option<TokenUsage>,
+}
+
+impl From<Respond> for Decision {
+    /// A decision with no usage telemetry — for the mock and test brains.
+    fn from(respond: Respond) -> Self {
+        Self { respond, usage: None }
+    }
+}
+
 /// The single inference seam. A real implementation sends the prompt to an LLM
 /// and parses its `respond` tool call; the mock applies deterministic rules.
 /// Implementations must be cancel-safe: dropping the returned future aborts the
@@ -94,5 +113,5 @@ pub struct AgentPrompt {
 /// is left half-written.
 #[async_trait]
 pub trait AgentBrain: Send + Sync {
-    async fn decide(&self, prompt: &AgentPrompt) -> Respond;
+    async fn decide(&self, prompt: &AgentPrompt) -> Decision;
 }

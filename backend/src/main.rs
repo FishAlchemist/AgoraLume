@@ -11,6 +11,7 @@
 mod agent;
 mod config;
 mod models;
+mod persist;
 mod routes;
 mod state;
 mod workspace;
@@ -26,6 +27,7 @@ use tracing_subscriber::EnvFilter;
 use crate::agent::llm::LlmBrain;
 use crate::agent::turn::AgentRuntime;
 use crate::config::Config;
+use crate::persist::Persistence;
 use crate::state::AppState;
 
 #[tokio::main]
@@ -84,7 +86,17 @@ async fn main() {
     } else {
         AgentRuntime::mock()
     };
-    let state = Arc::new(AppState::with_runtime(runtime));
+
+    // Persistence is optional: on, the workspace and chat logs live under the
+    // data dir and survive a restart; off, everything is in-memory.
+    let mut state = if config.persist {
+        AppState::with_persistence(runtime, Persistence::new(&config.data_dir))
+    } else {
+        AppState::with_runtime(runtime)
+    };
+    // Token pricing (if configured) drives the debug panel's estimated cost.
+    state.set_pricing(config.pricing.clone());
+    let state = Arc::new(state);
     let app = routes::router(state);
 
     // Bundle mode: if a built frontend sits next to us, serve it from the same
@@ -133,11 +145,13 @@ async fn main() {
 
     // Reflect the actual reply source: a real model, or the rule-based mock.
     let replies = if config.llm { "LLM-backed replies" } else { "simulated replies (mock)" };
+    let store = if config.persist { "persisted store" } else { "in-memory store" };
     tracing::info!(
         %url,
         data_dir = %config.data_dir,
+        persist = config.persist,
         serving_web = web_dir.is_some(),
-        "AgoraLume backend listening (in-memory store; {replies})"
+        "AgoraLume backend listening ({store}; {replies})"
     );
 
     // Only pop a browser when we're actually the site (bundle mode) and the

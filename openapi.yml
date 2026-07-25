@@ -7,6 +7,22 @@ info:
     identifier: AGPL-3.0-only
   version: 0.1.0
 paths:
+  /debug/usage:
+    get:
+      tags:
+      - service
+      summary: |-
+        Cumulative LLM usage since startup — the global "total usage" readout:
+        request count, token breakdown, cache-hit ratio, and an estimated cost when
+        pricing is configured (always an estimate, for reference only).
+      operationId: debug_usage
+      responses:
+        '200':
+          description: Cumulative LLM usage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugUsage'
   /departments:
     get:
       tags:
@@ -189,6 +205,31 @@ paths:
                 $ref: '#/components/schemas/Group'
         '404':
           description: ''
+  /groups/{id}/debug/traces:
+    get:
+      tags:
+      - chat
+      summary: |-
+        Recent agent traces for a group — the exact prompt each character received
+        and what it decided — for hydrating the debug panel. Live updates then arrive
+        as `debug` SSE frames on the group stream.
+      operationId: debug_traces
+      parameters:
+      - name: id
+        in: path
+        description: Group id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Recent agent traces, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AgentTrace'
   /groups/{id}/events:
     post:
       tags:
@@ -275,7 +316,8 @@ paths:
       - chat
       summary: |-
         Server-Sent Events for a group: default `message` events (AI replies and
-        moods) and named `read` events (read receipts).
+        moods), named `read` events (read receipts), and named `activity` events
+        (the agent loop turning busy/idle).
       operationId: stream
       parameters:
       - name: id
@@ -286,7 +328,7 @@ paths:
           type: string
       responses:
         '200':
-          description: 'text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt'
+          description: 'text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace'
   /health:
     get:
       tags:
@@ -535,6 +577,131 @@ paths:
           description: ''
 components:
   schemas:
+    AgentTrace:
+      type: object
+      description: |-
+        A debug record of one agent inference: exactly the system + context the
+        character's model received, what it decided, and the tokens it cost. Streamed
+        live as a `debug` SSE frame and available in bulk for panel hydration.
+      required:
+      - ts
+      - groupId
+      - personaId
+      - personaName
+      - system
+      - conversation
+      - action
+      properties:
+        action:
+          type: string
+          description: 'The chosen action: `speak` | `speakWithMood` | `mood` | `read`.'
+        conversation:
+          type: string
+          description: The conversation/context text the agent read (the "public" messages).
+        groupId:
+          type: string
+        message:
+          type:
+          - string
+          - 'null'
+          description: The spoken line, when it spoke.
+        mood:
+          type:
+          - string
+          - 'null'
+          description: The mood, when it showed one.
+        personaId:
+          type: string
+        personaName:
+          type: string
+        system:
+          type: string
+          description: The full system prompt the agent got (persona + variables + roster).
+        ts:
+          type: integer
+          format: int64
+        usage:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TokenUsage'
+            description: Tokens this inference cost; absent for the mock brain.
+    Cost:
+      type: object
+      description: |-
+        An estimated cost breakdown for the accumulated usage. Always an estimate:
+        rates are operator-supplied and providers/models differ, so the UI labels it
+        "for reference only".
+      required:
+      - currency
+      - input
+      - cachedInput
+      - output
+      - total
+      properties:
+        cachedInput:
+          type: number
+          format: double
+          description: Cost of cached input tokens.
+        currency:
+          type: string
+          description: Currency label the rates are in (e.g. `USD`).
+        input:
+          type: number
+          format: double
+          description: Cost of fresh (non-cached) input tokens.
+        output:
+          type: number
+          format: double
+          description: Cost of output tokens.
+        total:
+          type: number
+          format: double
+          description: Sum of the above.
+    DebugUsage:
+      type: object
+      description: |-
+        Cumulative LLM usage across the whole server since startup — the global
+        "total usage" view. `GET /debug/usage`.
+      required:
+      - requests
+      - promptTokens
+      - completionTokens
+      - totalTokens
+      - cachedPromptTokens
+      - cacheHitRatio
+      properties:
+        cacheHitRatio:
+          type: number
+          format: double
+          description: |-
+            Cached prompt tokens ÷ prompt tokens, in `0.0..=1.0`; `0` before any
+            usage is seen. How much the cache is saving.
+        cachedPromptTokens:
+          type: integer
+          format: int64
+          minimum: 0
+        completionTokens:
+          type: integer
+          format: int64
+          minimum: 0
+        estimatedCost:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Cost'
+            description: Present only when pricing is configured. An estimate.
+        promptTokens:
+          type: integer
+          format: int64
+          minimum: 0
+        requests:
+          type: integer
+          format: int64
+          description: Number of agent inferences (LLM requests in LLM mode).
+          minimum: 0
+        totalTokens:
+          type: integer
+          format: int64
+          minimum: 0
     Department:
       type: object
       description: |-
@@ -829,6 +996,42 @@ components:
           type: string
         uiLanguage:
           type: string
+    TokenUsage:
+      type: object
+      description: |-
+        Token usage for one LLM inference. Zero across the board when the provider
+        reports nothing; entirely absent (on the trace) for the rule-based mock,
+        which makes no LLM call.
+      required:
+      - promptTokens
+      - completionTokens
+      - totalTokens
+      - cachedPromptTokens
+      properties:
+        cachedPromptTokens:
+          type: integer
+          format: int64
+          description: |-
+            Of the prompt tokens, how many were served from the provider's cache —
+            billed cheaper. The basis for the cache-hit ratio and cache savings.
+          minimum: 0
+        completionTokens:
+          type: integer
+          format: int64
+          description: Output ("completion") tokens billed for this call.
+          minimum: 0
+        promptTokens:
+          type: integer
+          format: int64
+          description: Input ("prompt") tokens billed for this call.
+          minimum: 0
+        totalTokens:
+          type: integer
+          format: int64
+          description: |-
+            Total tokens the provider reported (or input+output when it only gives
+            the two).
+          minimum: 0
 tags:
 - name: service
   description: Liveness and server mode

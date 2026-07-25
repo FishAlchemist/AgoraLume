@@ -16,15 +16,17 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::agent::event::Event as AgentEvent;
-use crate::models::{Message, ServerMeta};
+use crate::models::{AgentTrace, DebugUsage, Message, ServerMeta};
 use crate::state::{AppState, StreamEvent};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(health))
         .routes(routes!(meta))
+        .routes(routes!(debug_usage))
         .routes(routes!(list_messages, send_message))
         .routes(routes!(post_event))
+        .routes(routes!(debug_traces))
         .routes(routes!(stream))
 }
 
@@ -40,16 +42,56 @@ async fn health() -> &'static str {
 #[utoipa::path(get, path = "/meta", tag = "service",
     responses((status = 200, description = "Server capabilities", body = ServerMeta)))]
 async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
-    // Reflect the actual runtime: mock mode is the rule-based, in-memory data
-    // layer; leaving it (AGORALUME_LLM) means a real LLM drives the agents.
-    // Persistence is not toggleable yet, so it is always off in this build.
-    let mock = state.runtime.mock;
+    // Liveness and mode are independent facts. `llm` = a real model drives the
+    // agents (else the rule-based mock); `persistent` = state is written to disk.
+    // "Mock" is the precise combination of neither: no LLM and no persistence.
+    let llm = !state.runtime.mock;
+    let persistent = state.persistent();
     Json(ServerMeta {
-        mock,
-        llm: !mock,
-        persistent: false,
+        mock: !llm && !persistent,
+        llm,
+        persistent,
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+/// Cumulative LLM usage since startup — the global "total usage" readout:
+/// request count, token breakdown, cache-hit ratio, and an estimated cost when
+/// pricing is configured (always an estimate, for reference only).
+#[utoipa::path(get, path = "/debug/usage", tag = "service",
+    responses((status = 200, description = "Cumulative LLM usage", body = DebugUsage)))]
+async fn debug_usage(State(state): State<Arc<AppState>>) -> Json<DebugUsage> {
+    let totals = state.debug_totals();
+    let cache_hit_ratio = if totals.prompt_tokens > 0 {
+        totals.cached_prompt_tokens as f64 / totals.prompt_tokens as f64
+    } else {
+        0.0
+    };
+    let estimated_cost = state.pricing().map(|pricing| {
+        pricing.estimate(totals.prompt_tokens, totals.cached_prompt_tokens, totals.completion_tokens)
+    });
+    Json(DebugUsage {
+        requests: totals.requests,
+        prompt_tokens: totals.prompt_tokens,
+        completion_tokens: totals.completion_tokens,
+        total_tokens: totals.total_tokens,
+        cached_prompt_tokens: totals.cached_prompt_tokens,
+        cache_hit_ratio,
+        estimated_cost,
+    })
+}
+
+/// Recent agent traces for a group — the exact prompt each character received
+/// and what it decided — for hydrating the debug panel. Live updates then arrive
+/// as `debug` SSE frames on the group stream.
+#[utoipa::path(get, path = "/groups/{id}/debug/traces", tag = "chat",
+    params(("id" = String, Path, description = "Group id")),
+    responses((status = 200, description = "Recent agent traces, oldest first", body = Vec<AgentTrace>)))]
+async fn debug_traces(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<Vec<AgentTrace>> {
+    Json(state.debug_traces(&id))
 }
 
 /// The full message history for a group, oldest first.
@@ -158,7 +200,7 @@ struct ActivityFrame {
 #[utoipa::path(get, path = "/groups/{id}/stream", tag = "chat",
     params(("id" = String, Path, description = "Group id")),
     responses((status = 200,
-        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`")))]
+        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace")))]
 async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     let receiver = state.channel(&id).subscribe();
     let events = BroadcastStream::new(receiver).filter_map(to_sse_event);
@@ -177,6 +219,7 @@ fn to_sse_event(
         StreamEvent::Activity(active) => {
             Event::default().event("activity").json_data(ActivityFrame { active }).ok()?
         }
+        StreamEvent::Debug(trace) => Event::default().event("debug").json_data(trace).ok()?,
     };
     Some(Ok(event))
 }

@@ -64,6 +64,7 @@ async fn create_org(
     Json(body): Json<Organization>,
 ) -> (StatusCode, Json<Organization>) {
     let org = s.workspace().create_organization(body);
+    s.persist_workspace();
     (StatusCode::CREATED, Json(org))
 }
 
@@ -76,10 +77,11 @@ async fn update_org(
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Organization>, StatusCode> {
-    s.workspace()
-        .update_organization(&id, patch)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    let updated = s.workspace().update_organization(&id, patch);
+    if updated.is_some() {
+        s.persist_workspace();
+    }
+    updated.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 #[utoipa::path(delete, path = "/organizations/{id}", tag = "organizations",
@@ -87,6 +89,7 @@ async fn update_org(
     responses((status = 204, description = "Deleted (cascades to its departments)"), (status = 404)))]
 async fn delete_org(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
     if s.workspace().delete_organization(&id) {
+        s.persist_workspace();
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -125,6 +128,7 @@ async fn create_dept(
     Json(body): Json<Department>,
 ) -> (StatusCode, Json<Department>) {
     let dept = s.workspace().create_department(body);
+    s.persist_workspace();
     (StatusCode::CREATED, Json(dept))
 }
 
@@ -137,10 +141,11 @@ async fn update_dept(
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Department>, StatusCode> {
-    s.workspace()
-        .update_department(&id, patch)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    let updated = s.workspace().update_department(&id, patch);
+    if updated.is_some() {
+        s.persist_workspace();
+    }
+    updated.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 #[utoipa::path(delete, path = "/departments/{id}", tag = "departments",
@@ -148,6 +153,7 @@ async fn update_dept(
     responses((status = 204), (status = 404)))]
 async fn delete_dept(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
     if s.workspace().delete_department(&id) {
+        s.persist_workspace();
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -186,6 +192,7 @@ async fn create_persona(
     Json(body): Json<Persona>,
 ) -> (StatusCode, Json<Persona>) {
     let persona = s.workspace().create_persona(body);
+    s.persist_workspace();
     (StatusCode::CREATED, Json(persona))
 }
 
@@ -198,10 +205,11 @@ async fn update_persona(
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Persona>, StatusCode> {
-    s.workspace()
-        .update_persona(&id, patch)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    let updated = s.workspace().update_persona(&id, patch);
+    if updated.is_some() {
+        s.persist_workspace();
+    }
+    updated.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 /// Deletes a persona. Refuses (409) to remove the last remaining user identity,
@@ -218,6 +226,8 @@ async fn delete_persona(State(s): State<Arc<AppState>>, Path(id): Path<String>) 
         return StatusCode::NOT_FOUND;
     }
     if ws.delete_persona(&id) {
+        drop(ws);
+        s.persist_workspace();
         StatusCode::NO_CONTENT
     } else {
         // Found but refused: it's the last remaining user identity.
@@ -257,6 +267,7 @@ async fn create_group(
     Json(body): Json<Group>,
 ) -> (StatusCode, Json<Group>) {
     let group = s.workspace().create_group(body);
+    s.persist_workspace();
     (StatusCode::CREATED, Json(group))
 }
 
@@ -269,10 +280,11 @@ async fn update_group(
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Group>, StatusCode> {
-    s.workspace()
-        .update_group(&id, patch)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    let updated = s.workspace().update_group(&id, patch);
+    if updated.is_some() {
+        s.persist_workspace();
+    }
+    updated.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 #[utoipa::path(delete, path = "/groups/{id}", tag = "groups",
@@ -280,6 +292,7 @@ async fn update_group(
     responses((status = 204), (status = 404)))]
 async fn delete_group(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
     if s.workspace().delete_group(&id) {
+        s.persist_workspace();
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -301,8 +314,9 @@ async fn update_settings(
     State(s): State<Arc<AppState>>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Settings>, StatusCode> {
-    s.workspace()
-        .update_settings(patch)
-        .map(Json)
-        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)
+    let updated = s.workspace().update_settings(patch);
+    if updated.is_some() {
+        s.persist_workspace();
+    }
+    updated.map(Json).ok_or(StatusCode::UNPROCESSABLE_ENTITY)
 }

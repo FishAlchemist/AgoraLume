@@ -14,11 +14,12 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::agent::brain::{Action, AgentBrain, AgentPersona, AgentPrompt, Respond};
+use crate::agent::brain::{Action, AgentBrain, AgentPersona, AgentPrompt, Decision, Respond};
 use crate::agent::event::{Event, Salience, appraise};
 use crate::agent::mock::RuleBrain;
-use crate::models::{Message, now_ms};
+use crate::models::{AgentTrace, Message, now_ms};
 use crate::state::AppState;
+use crate::workspace::RosterMember;
 
 /// Tunables for the loop. The bounded compute per triggering message — the "not
 /// stuck, not runaway, not wasteful" guarantee — lives in `max_rounds`.
@@ -133,6 +134,10 @@ async fn run_turn(
         let mut order = member_ids;
         shuffle(&mut order, &mut rng);
 
+        // The roster (who's in the room, incl. the user) is fixed for the round;
+        // every agent this sweep is told the same membership.
+        let roster = state.workspace().group_roster(group_id).unwrap_or_default();
+
         let mut spoke_this_round = false;
 
         // Phase 3: serial pipeline — each agent decides on the updated context.
@@ -144,7 +149,7 @@ async fn run_turn(
 
             // Assemble the prompt — the orchestrator owns context, so a brain is
             // just prompt-in/decision-out (the LLM boundary).
-            let prompt = assemble_prompt(&persona, &transcript, &injected_events);
+            let prompt = assemble_prompt(&persona, &roster, &transcript, &injected_events);
             tracing::trace!(
                 target: "agent::prompt",
                 persona = %persona_id,
@@ -160,7 +165,7 @@ async fn run_turn(
             // The single inference, watched for interrupts. `&mut fut` is only
             // dropped on a hard interrupt (discard); a soft event loops back and
             // re-polls it, so the in-flight agent keeps running.
-            let respond = {
+            let decision = {
                 let mut fut = std::pin::pin!(runtime.brain.decide(&prompt));
                 loop {
                     tokio::select! {
@@ -179,13 +184,34 @@ async fn run_turn(
                                 Salience::Ignore => {}
                             }
                         }
-                        resp = &mut fut => break resp,
+                        decided = &mut fut => break decided,
                     }
                 }
             };
 
-            // Phase 4: route the decision to the two streams.
+            let Decision { respond, usage } = decision;
             let Respond { action, message, mood } = respond;
+
+            // Record exactly what this agent saw and decided (plus token cost),
+            // for the debug panel. Cloned because the routing below consumes the
+            // message/mood.
+            state.record_trace(
+                group_id,
+                AgentTrace {
+                    ts: now_ms(),
+                    group_id: group_id.to_string(),
+                    persona_id: persona_id.clone(),
+                    persona_name: persona.name.clone(),
+                    system: prompt.system.clone(),
+                    conversation: prompt.conversation.clone(),
+                    action: action_label(action).to_string(),
+                    message: message.clone(),
+                    mood: mood.clone(),
+                    usage,
+                },
+            );
+
+            // Phase 4: route the decision to the two streams.
             match action {
                 Action::Speak => {
                     if let Some(text) = message {
@@ -227,6 +253,17 @@ async fn run_turn(
     }
 
     TurnOutcome::Done
+}
+
+/// The wire label for an action, as the debug trace reports it (matching the
+/// TypeScript action names).
+fn action_label(action: Action) -> &'static str {
+    match action {
+        Action::Speak => "speak",
+        Action::SpeakWithMood => "speakWithMood",
+        Action::Mood => "mood",
+        Action::Read => "read",
+    }
 }
 
 /// Emits a spoken line to the group (Context Stream + UI View).
@@ -288,34 +325,59 @@ fn build_persona(state: &AppState, id: &str) -> Option<AgentPersona> {
 /// is here, so swapping in an LLM brain needs no other change.
 fn assemble_prompt(
     persona: &AgentPersona,
+    roster: &[RosterMember],
     transcript: &[ContextLine],
     events: &[String],
 ) -> AgentPrompt {
     use std::fmt::Write as _;
 
+    // Every section is wrapped in an XML-style element so the model can tell
+    // exactly where each kind of data begins and ends (persona vs. inherited
+    // variables vs. roster vs. the live conversation).
     let mut system = String::new();
     if !persona.system_prompt.is_empty() {
-        system.push_str(persona.system_prompt.trim());
-        system.push('\n');
+        let _ = writeln!(system, "<persona>\n{}\n</persona>", persona.system_prompt.trim());
     }
     if !persona.variables.is_empty() {
         // Sorted for a stable, reproducible prompt.
         let mut vars: Vec<(&String, &String)> = persona.variables.iter().collect();
         vars.sort_by(|a, b| a.0.cmp(b.0));
-        system.push_str("\nContext:\n");
+        system.push_str("\n<context>\n");
         for (key, value) in vars {
             let _ = writeln!(system, "- {key}: {value}");
         }
+        system.push_str("</context>\n");
     }
+    // Who is in the room, so the agent can address people by name and knows the
+    // user is present. The self ("you") is the human this agent talks to.
+    if !roster.is_empty() {
+        system.push_str("\n<group_members>\n");
+        for member in roster {
+            let you = if member.is_self { " (you)" } else { "" };
+            match member.blurb.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                Some(blurb) => {
+                    let _ = writeln!(system, "- {}{you}: {blurb}", member.name);
+                }
+                None => {
+                    let _ = writeln!(system, "- {}{you}", member.name);
+                }
+            }
+        }
+        system.push_str("</group_members>\n");
+    }
+    // The live transcript and any environment events, each in its own element.
     let mut conversation = String::new();
+    conversation.push_str("<conversation>\n");
     for line in transcript {
         let _ = writeln!(conversation, "{}: {}", line.name, line.text);
     }
+    conversation.push_str("</conversation>\n");
     if !events.is_empty() {
-        conversation.push_str("\n[Environment]\n");
+        conversation.push_str("\n<environment>\n");
         for event in events {
             let _ = writeln!(conversation, "- {event}");
         }
+        conversation.push_str("</environment>\n");
     }
 
     AgentPrompt {
@@ -369,7 +431,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    use crate::agent::brain::AgentPrompt;
+    use crate::agent::brain::{AgentPrompt, Decision};
     use crate::agent::mock::RuleBrain;
     use crate::state::StreamEvent;
 
@@ -403,9 +465,9 @@ mod tests {
     }
     #[async_trait]
     impl AgentBrain for CountingReadBrain {
-        async fn decide(&self, _prompt: &AgentPrompt) -> Respond {
+        async fn decide(&self, _prompt: &AgentPrompt) -> Decision {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Respond::read()
+            Respond::read().into()
         }
     }
 
@@ -415,9 +477,9 @@ mod tests {
     }
     #[async_trait]
     impl AgentBrain for RecordingBrain {
-        async fn decide(&self, prompt: &AgentPrompt) -> Respond {
+        async fn decide(&self, prompt: &AgentPrompt) -> Decision {
             self.seen.lock().unwrap().push(prompt.clone());
-            Respond::read()
+            Respond::read().into()
         }
     }
 
@@ -429,10 +491,10 @@ mod tests {
     }
     #[async_trait]
     impl AgentBrain for GatedBrain {
-        async fn decide(&self, _prompt: &AgentPrompt) -> Respond {
+        async fn decide(&self, _prompt: &AgentPrompt) -> Decision {
             self.entered.notify_one();
             self.release.notified().await;
-            Respond::speak("late")
+            Respond::speak("late").into()
         }
     }
 
@@ -479,7 +541,7 @@ mod tests {
             match event {
                 StreamEvent::Message(_) => messages += 1,
                 StreamEvent::Read(_) => reads += 1,
-                StreamEvent::Activity(_) => {}
+                StreamEvent::Activity(_) | StreamEvent::Debug(_) => {}
             }
         }
         assert_eq!(messages, 0);
@@ -498,6 +560,27 @@ mod tests {
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0].text, "hello there");
         assert_eq!(transcript[0].name, "Aria");
+    }
+
+    #[test]
+    fn roster_lists_members_and_marks_the_user() {
+        let persona = AgentPersona {
+            name: "Aria".into(),
+            system_prompt: "You are Aria.".into(),
+            variables: std::collections::HashMap::new(),
+        };
+        let roster = vec![
+            RosterMember { name: "You".into(), blurb: Some("Your own voice.".into()), is_self: true },
+            RosterMember { name: "Nox".into(), blurb: Some("Dry strategist.".into()), is_self: false },
+            RosterMember { name: "Sol".into(), blurb: None, is_self: false },
+        ];
+        let prompt = assemble_prompt(&persona, &roster, &[], &[]);
+        // The user is present and flagged; blurbs render when set, and a member
+        // without one still appears.
+        assert!(prompt.system.contains("<group_members>"));
+        assert!(prompt.system.contains("You (you): Your own voice."));
+        assert!(prompt.system.contains("Nox: Dry strategist."));
+        assert!(prompt.system.contains("- Sol\n"));
     }
 
     #[tokio::test]

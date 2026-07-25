@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 
-use crate::agent::brain::{AgentBrain, AgentPrompt, Respond};
+use crate::agent::brain::{AgentBrain, AgentPrompt, Decision, Respond};
 use crate::models::now_ms;
 
 const MOODS: [&str; 4] = ["🙂 pleased", "🤔 thinking", "✨ inspired", "😆 amused"];
@@ -40,7 +40,7 @@ impl Default for RuleBrain {
 
 #[async_trait]
 impl AgentBrain for RuleBrain {
-    async fn decide(&self, prompt: &AgentPrompt) -> Respond {
+    async fn decide(&self, prompt: &AgentPrompt) -> Decision {
         let name = prompt.persona_name.to_lowercase();
         let last = prompt.last_line.as_deref().unwrap_or("");
         let addressed = !name.is_empty() && last.to_lowercase().contains(&name);
@@ -50,9 +50,10 @@ impl AgentBrain for RuleBrain {
         let roll = mix(self.seed, &prompt.persona_name, step);
         let mood = MOODS[(roll as usize + prompt.persona_name.len()) % MOODS.len()].to_string();
 
+        // The mock makes no LLM call, so it reports no token usage.
         if addressed {
             // Being named warrants a reply with a mood.
-            return Respond::speak_with_mood(reply_line(last), mood);
+            return Respond::speak_with_mood(reply_line(last), mood).into();
         }
 
         match roll % 3 {
@@ -61,6 +62,7 @@ impl AgentBrain for RuleBrain {
             // Read-but-don't-reply.
             _ => Respond::read(),
         }
+        .into()
     }
 }
 

@@ -6,14 +6,16 @@
 //! in-memory store is provisional — a database will replace it without changing
 //! the API — just as the simulated turn will give way to a real LLM.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::event::Event;
 use crate::agent::turn::{AgentRuntime, coordinator_loop};
-use crate::models::{Message, ReadReceipt};
+use crate::config::Pricing;
+use crate::models::{AgentTrace, Message, ReadReceipt};
+use crate::persist::Persistence;
 use crate::workspace::Workspace;
 
 /// How many pending commands a group's coordinator buffers before senders back
@@ -23,6 +25,10 @@ const COMMAND_CAPACITY: usize = 64;
 /// How many live events a group's channel buffers for slow subscribers before
 /// they start lagging. Generous — turns are tiny and infrequent.
 const CHANNEL_CAPACITY: usize = 256;
+
+/// How many recent agent traces to keep per group for the debug panel. Old
+/// traces fall off the front; the running usage totals are unaffected.
+const DEBUG_TRACE_CAP: usize = 50;
 
 /// A live event pushed to a group's SSE subscribers.
 #[derive(Clone, Debug)]
@@ -35,6 +41,34 @@ pub enum StreamEvent {
     /// Delivered as a named `activity` SSE event; drives the composer lock so a
     /// user message can never interleave with an in-flight turn.
     Activity(bool),
+    /// A debug trace of one agent inference (the prompt it saw + its decision +
+    /// token usage). Delivered as a named `debug` SSE event; drives the debug
+    /// panel. Never affects the chat itself.
+    Debug(AgentTrace),
+}
+
+/// Cumulative LLM usage since startup, plus recent per-group traces — the data
+/// behind the debug/usage panel.
+#[derive(Default)]
+struct DebugState {
+    requests: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cached_prompt_tokens: u64,
+    /// Recent traces per group, oldest first, capped at [`DEBUG_TRACE_CAP`].
+    traces: HashMap<String, VecDeque<AgentTrace>>,
+}
+
+/// A snapshot of the cumulative usage counters, for building the `/debug/usage`
+/// response outside the lock.
+#[derive(Clone, Copy, Default)]
+pub struct DebugTotals {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_prompt_tokens: u64,
 }
 
 pub struct AppState {
@@ -46,20 +80,157 @@ pub struct AppState {
     /// One command channel per group, feeding its coordinator task. Created
     /// lazily on first dispatch so idle groups run nothing.
     coordinators: Mutex<HashMap<String, mpsc::Sender<Event>>>,
+    /// The on-disk store when persistence is enabled, else `None` (pure
+    /// in-memory). Workspace mutations and message mutations write through it.
+    persistence: Option<Persistence>,
+    /// Group ids whose message log has been loaded from disk. Persisted logs
+    /// load lazily on first touch; this marks the ones already pulled in so a
+    /// second access doesn't re-read (and clobber in-memory) the file.
+    loaded_groups: Mutex<HashSet<String>>,
+    /// LLM usage counters and recent traces for the debug panel.
+    debug: Mutex<DebugState>,
+    /// Token pricing for the estimated-cost readout, or `None` to show tokens
+    /// only. Set once at startup from config.
+    pricing: Option<Pricing>,
 }
 
 impl AppState {
-    /// Builds the seeded workspace with a specific runtime. `main` passes the
-    /// runtime the config selected; tests inject a scripted brain, a shared
-    /// memory store, or deterministic loop config.
+    /// Builds the app state with a specific runtime and no persistence — a pure
+    /// in-memory run. Tests use this to inject a scripted brain or deterministic
+    /// loop config.
     pub fn with_runtime(runtime: AgentRuntime) -> Self {
+        Self::build(runtime, None)
+    }
+
+    /// Builds the app state backed by on-disk persistence: the workspace is
+    /// loaded from `workspace.json` (or seeded on first run) and message logs
+    /// load lazily per group. `main` uses this when persistence is enabled.
+    pub fn with_persistence(runtime: AgentRuntime, persistence: Persistence) -> Self {
+        Self::build(runtime, Some(persistence))
+    }
+
+    fn build(runtime: AgentRuntime, persistence: Option<Persistence>) -> Self {
+        // A persisted run starts from disk (or a fresh seed the first time);
+        // an in-memory run seeds every time.
+        let workspace = persistence
+            .as_ref()
+            .and_then(Persistence::load_workspace)
+            .map_or_else(Workspace::seeded, Workspace::from_snapshot);
+        // The demo history only makes sense for a throwaway in-memory run; a
+        // persisted server starts each group empty and fills it from disk on
+        // first access, so nothing is seeded over the saved logs.
+        let messages = if persistence.is_some() { HashMap::new() } else { seed_messages() };
         Self {
-            workspace: Mutex::new(Workspace::seeded()),
-            messages: Mutex::new(seed_messages()),
+            workspace: Mutex::new(workspace),
+            messages: Mutex::new(messages),
             channels: Mutex::new(HashMap::new()),
             runtime,
             coordinators: Mutex::new(HashMap::new()),
+            persistence,
+            loaded_groups: Mutex::new(HashSet::new()),
+            debug: Mutex::new(DebugState::default()),
+            pricing: None,
         }
+    }
+
+    /// Sets the token pricing used for the estimated-cost readout. Called once
+    /// at startup, before the state is shared, so it takes `&mut self`.
+    pub fn set_pricing(&mut self, pricing: Option<Pricing>) {
+        self.pricing = pricing;
+    }
+
+    /// The configured token pricing, if any.
+    pub fn pricing(&self) -> Option<&Pricing> {
+        self.pricing.as_ref()
+    }
+
+    /// Whether state is persisted to disk (survives a restart). Surfaced through
+    /// `/meta`.
+    pub fn persistent(&self) -> bool {
+        self.persistence.is_some()
+    }
+
+    /// Records a debug trace of one agent inference: accumulate its usage into
+    /// the running totals, keep it in the group's recent-trace ring, and stream
+    /// it to any open debug panels. Every inference is one request.
+    pub fn record_trace(&self, group_id: &str, trace: AgentTrace) {
+        {
+            let mut debug = self.debug.lock().unwrap();
+            debug.requests += 1;
+            if let Some(usage) = &trace.usage {
+                debug.prompt_tokens += usage.prompt_tokens;
+                debug.completion_tokens += usage.completion_tokens;
+                debug.total_tokens += usage.total_tokens;
+                debug.cached_prompt_tokens += usage.cached_prompt_tokens;
+            }
+            let ring = debug.traces.entry(group_id.to_string()).or_default();
+            ring.push_back(trace.clone());
+            while ring.len() > DEBUG_TRACE_CAP {
+                ring.pop_front();
+            }
+        }
+        let _ = self.channel(group_id).send(StreamEvent::Debug(trace));
+    }
+
+    /// A snapshot of the cumulative usage counters.
+    pub fn debug_totals(&self) -> DebugTotals {
+        let debug = self.debug.lock().unwrap();
+        DebugTotals {
+            requests: debug.requests,
+            prompt_tokens: debug.prompt_tokens,
+            completion_tokens: debug.completion_tokens,
+            total_tokens: debug.total_tokens,
+            cached_prompt_tokens: debug.cached_prompt_tokens,
+        }
+    }
+
+    /// The recent traces for a group, oldest first.
+    pub fn debug_traces(&self, group_id: &str) -> Vec<AgentTrace> {
+        self.debug
+            .lock()
+            .unwrap()
+            .traces
+            .get(group_id)
+            .map(|ring| ring.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Loads a group's message log from disk the first time it is touched, so
+    /// persisted history is read on demand rather than all at once. A no-op when
+    /// persistence is off or the group is already loaded.
+    fn ensure_loaded(&self, group_id: &str) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        // Lock order: `loaded_groups` before `messages`. This is the only place
+        // that holds both, so no other path can deadlock against it.
+        let mut loaded = self.loaded_groups.lock().unwrap();
+        if loaded.contains(group_id) {
+            return;
+        }
+        let disk = persistence.load_messages(group_id);
+        self.messages.lock().unwrap().entry(group_id.to_string()).or_insert(disk);
+        loaded.insert(group_id.to_string());
+    }
+
+    /// Persists the whole workspace after a mutation. No-op without persistence.
+    /// Called by the workspace CRUD handlers once their change is applied.
+    pub fn persist_workspace(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let snapshot = self.workspace().to_snapshot();
+        persistence.save_workspace(&snapshot);
+    }
+
+    /// Persists a single group's message log after a mutation. No-op without
+    /// persistence.
+    fn persist_messages(&self, group_id: &str) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let snapshot = self.messages.lock().unwrap().get(group_id).cloned().unwrap_or_default();
+        persistence.save_messages(group_id, &snapshot);
     }
 
     /// Hands an event to a group's coordinator, spawning the coordinator task on
@@ -95,6 +266,7 @@ impl AppState {
 
     /// A snapshot copy of a group's message log (empty if never used).
     pub fn list(&self, group_id: &str) -> Vec<Message> {
+        self.ensure_loaded(group_id);
         self.messages
             .lock()
             .unwrap()
@@ -118,12 +290,14 @@ impl AppState {
     /// own message: the client already shows it from the POST response, so
     /// re-broadcasting would duplicate it.
     pub fn store(&self, group_id: &str, message: Message) {
+        self.ensure_loaded(group_id);
         self.messages
             .lock()
             .unwrap()
             .entry(group_id.to_string())
             .or_default()
             .push(message);
+        self.persist_messages(group_id);
     }
 
     /// Broadcasts whether the group's coordinator is actively running a turn.
@@ -144,6 +318,7 @@ impl AppState {
     /// Records that one AI persona processed a message and notifies subscribers.
     /// De-duplicated: a repeated read for the same persona is a no-op.
     pub fn mark_read(&self, group_id: &str, message_id: &str, persona_id: &str) {
+        self.ensure_loaded(group_id);
         {
             let mut store = self.messages.lock().unwrap();
             let Some(list) = store.get_mut(group_id) else {
@@ -160,6 +335,7 @@ impl AppState {
             }
             readers.push(persona_id.to_string());
         }
+        self.persist_messages(group_id);
         let _ = self.channel(group_id).send(StreamEvent::Read(ReadReceipt {
             group_id: group_id.to_string(),
             message_id: message_id.to_string(),

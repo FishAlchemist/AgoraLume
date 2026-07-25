@@ -222,3 +222,85 @@ pub struct ReadReceipt {
     pub message_id: String,
     pub persona_id: String,
 }
+
+/// Token usage for one LLM inference. Zero across the board when the provider
+/// reports nothing; entirely absent (on the trace) for the rule-based mock,
+/// which makes no LLM call.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    /// Input ("prompt") tokens billed for this call.
+    pub prompt_tokens: u64,
+    /// Output ("completion") tokens billed for this call.
+    pub completion_tokens: u64,
+    /// Total tokens the provider reported (or input+output when it only gives
+    /// the two).
+    pub total_tokens: u64,
+    /// Of the prompt tokens, how many were served from the provider's cache —
+    /// billed cheaper. The basis for the cache-hit ratio and cache savings.
+    pub cached_prompt_tokens: u64,
+}
+
+/// A debug record of one agent inference: exactly the system + context the
+/// character's model received, what it decided, and the tokens it cost. Streamed
+/// live as a `debug` SSE frame and available in bulk for panel hydration.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTrace {
+    pub ts: i64,
+    pub group_id: String,
+    pub persona_id: String,
+    pub persona_name: String,
+    /// The full system prompt the agent got (persona + variables + roster).
+    pub system: String,
+    /// The conversation/context text the agent read (the "public" messages).
+    pub conversation: String,
+    /// The chosen action: `speak` | `speakWithMood` | `mood` | `read`.
+    pub action: String,
+    /// The spoken line, when it spoke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The mood, when it showed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mood: Option<String>,
+    /// Tokens this inference cost; absent for the mock brain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+}
+
+/// An estimated cost breakdown for the accumulated usage. Always an estimate:
+/// rates are operator-supplied and providers/models differ, so the UI labels it
+/// "for reference only".
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Cost {
+    /// Currency label the rates are in (e.g. `USD`).
+    pub currency: String,
+    /// Cost of fresh (non-cached) input tokens.
+    pub input: f64,
+    /// Cost of cached input tokens.
+    pub cached_input: f64,
+    /// Cost of output tokens.
+    pub output: f64,
+    /// Sum of the above.
+    pub total: f64,
+}
+
+/// Cumulative LLM usage across the whole server since startup — the global
+/// "total usage" view. `GET /debug/usage`.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugUsage {
+    /// Number of agent inferences (LLM requests in LLM mode).
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_prompt_tokens: u64,
+    /// Cached prompt tokens ÷ prompt tokens, in `0.0..=1.0`; `0` before any
+    /// usage is seen. How much the cache is saving.
+    pub cache_hit_ratio: f64,
+    /// Present only when pricing is configured. An estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<Cost>,
+}
