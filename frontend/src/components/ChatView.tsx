@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
 import { useConnection } from '../store/connection';
+import { useReadOnly } from '../store/readonly';
 import { useWorkspace } from '../store/workspace';
 import type { Group, Message, Persona } from '../types';
 import { Composer } from './Composer';
@@ -62,6 +63,7 @@ function compareMessages(a: Message, b: Message): number {
 export function ChatView({ group, personas }: Props) {
   const { t } = useTranslation();
   const fontSize = useWorkspace((s) => s.settings.chatFontSize ?? 15);
+  const readOnly = useReadOnly((s) => s.readOnly);
   // Re-bind history + streams when the active data source changes.
   const backendUrl = useConnection((s) => s.backendUrl);
 
@@ -194,11 +196,17 @@ export function ChatView({ group, personas }: Props) {
         )}
       </ScrollArea>
       <Box p="md" style={{ borderTop: '1px solid var(--mantine-color-default-border)' }}>
-        <Composer
-          onSend={handleSend}
-          disabled={locked || busy}
-          placeholder={locked ? t('chat.locked') : busy ? t('chat.waiting') : undefined}
-        />
+        {readOnly ? (
+          <Text size="sm" c="dimmed" ta="center">
+            {t('readonly.chatNotice')}
+          </Text>
+        ) : (
+          <Composer
+            onSend={handleSend}
+            disabled={locked || busy}
+            placeholder={locked ? t('chat.locked') : busy ? t('chat.waiting') : undefined}
+          />
+        )}
       </Box>
     </Stack>
   );

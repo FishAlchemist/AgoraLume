@@ -26,6 +26,7 @@ import { useTranslation } from 'react-i18next';
 import { OrgTag } from '../components/OrgTag';
 import { PersonaAvatar } from '../components/PersonaAvatar';
 import { buildBundle, downloadBundle, parseBundle, slugify } from '../lib/transfer';
+import { useReadOnly } from '../store/readonly';
 import { useUi } from '../store/ui';
 import { useWorkspace } from '../store/workspace';
 import type { Persona } from '../types';
@@ -42,6 +43,7 @@ export function PersonasPage() {
   const departments = useWorkspace((s) => s.departments);
   const deletePersona = useWorkspace((s) => s.deletePersona);
   const importBundle = useWorkspace((s) => s.importBundle);
+  const readOnly = useReadOnly((s) => s.readOnly);
   const openCard = useUi((s) => s.openCard);
   const openEditor = useUi((s) => s.openEditor);
   const askConfirm = useUi((s) => s.askConfirm);
@@ -110,13 +112,15 @@ export function PersonasPage() {
           </Text>
         </Stack>
         <Group gap="xs">
-          <FileButton accept="application/json,.json" onChange={(f) => void handleImport(f)}>
-            {(props) => (
-              <Button {...props} variant="default" leftSection={<IconUpload size={16} />}>
-                {t('transfer.import')}
-              </Button>
-            )}
-          </FileButton>
+          {!readOnly && (
+            <FileButton accept="application/json,.json" onChange={(f) => void handleImport(f)}>
+              {(props) => (
+                <Button {...props} variant="default" leftSection={<IconUpload size={16} />}>
+                  {t('transfer.import')}
+                </Button>
+              )}
+            </FileButton>
+          )}
           <Menu position="bottom-end" withinPortal>
             <Menu.Target>
               <Button
@@ -157,9 +161,11 @@ export function PersonasPage() {
               )}
             </Menu.Dropdown>
           </Menu>
-          <Button leftSection={<IconPlus size={16} />} onClick={() => openEditor(null, 'ai')}>
-            {t('personas.add')}
-          </Button>
+          {!readOnly && (
+            <Button leftSection={<IconPlus size={16} />} onClick={() => openEditor(null, 'ai')}>
+              {t('personas.add')}
+            </Button>
+          )}
         </Group>
       </Group>
 
@@ -222,27 +228,29 @@ export function PersonasPage() {
                       </Group>
                     </Stack>
                   </Group>
-                  <Group gap={2} wrap="nowrap">
-                    <Tooltip label={t('common.edit')}>
-                      <ActionIcon
-                        variant="subtle"
-                        onClick={() => openEditor(persona.id)}
-                        aria-label={t('common.edit')}
-                      >
-                        <IconPencil size={16} />
-                      </ActionIcon>
-                    </Tooltip>
-                    <Tooltip label={t('common.delete')}>
-                      <ActionIcon
-                        variant="subtle"
-                        color="red"
-                        onClick={() => handleDelete(persona)}
-                        aria-label={t('common.delete')}
-                      >
-                        <IconTrash size={16} />
-                      </ActionIcon>
-                    </Tooltip>
-                  </Group>
+                  {!readOnly && (
+                    <Group gap={2} wrap="nowrap">
+                      <Tooltip label={t('common.edit')}>
+                        <ActionIcon
+                          variant="subtle"
+                          onClick={() => openEditor(persona.id)}
+                          aria-label={t('common.edit')}
+                        >
+                          <IconPencil size={16} />
+                        </ActionIcon>
+                      </Tooltip>
+                      <Tooltip label={t('common.delete')}>
+                        <ActionIcon
+                          variant="subtle"
+                          color="red"
+                          onClick={() => handleDelete(persona)}
+                          aria-label={t('common.delete')}
+                        >
+                          <IconTrash size={16} />
+                        </ActionIcon>
+                      </Tooltip>
+                    </Group>
+                  )}
                 </Group>
 
                 {persona.blurb && (

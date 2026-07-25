@@ -19,6 +19,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { DepartmentFormModal } from '../components/DepartmentFormModal';
 import { OrganizationFormModal } from '../components/OrganizationFormModal';
+import { useReadOnly } from '../store/readonly';
 import { useUi } from '../store/ui';
 import { useWorkspace } from '../store/workspace';
 import type { Department, Organization } from '../types';
@@ -35,6 +36,7 @@ export function OrganizationsPage() {
   const personas = useWorkspace((s) => s.personas);
   const deleteOrganization = useWorkspace((s) => s.deleteOrganization);
   const deleteDepartment = useWorkspace((s) => s.deleteDepartment);
+  const readOnly = useReadOnly((s) => s.readOnly);
   const askConfirm = useUi((s) => s.askConfirm);
 
   const [orgOpened, orgHandlers] = useDisclosure(false);
@@ -75,9 +77,11 @@ export function OrganizationsPage() {
             {t('organizations.subtitle')}
           </Text>
         </Stack>
-        <Button leftSection={<IconPlus size={16} />} onClick={openCreateOrg}>
-          {t('organizations.add')}
-        </Button>
+        {!readOnly && (
+          <Button leftSection={<IconPlus size={16} />} onClick={openCreateOrg}>
+            {t('organizations.add')}
+          </Button>
+        )}
       </Group>
 
       {organizations.length === 0 ? (
@@ -100,27 +104,29 @@ export function OrganizationsPage() {
                       {org.name}
                     </Text>
                   </Group>
-                  <Group gap={2} wrap="nowrap">
-                    <Tooltip label={t('common.edit')}>
-                      <ActionIcon
-                        variant="subtle"
-                        onClick={() => openEditOrg(org)}
-                        aria-label={t('common.edit')}
-                      >
-                        <IconPencil size={16} />
-                      </ActionIcon>
-                    </Tooltip>
-                    <Tooltip label={t('common.delete')}>
-                      <ActionIcon
-                        variant="subtle"
-                        color="red"
-                        onClick={() => handleDeleteOrg(org)}
-                        aria-label={t('common.delete')}
-                      >
-                        <IconTrash size={16} />
-                      </ActionIcon>
-                    </Tooltip>
-                  </Group>
+                  {!readOnly && (
+                    <Group gap={2} wrap="nowrap">
+                      <Tooltip label={t('common.edit')}>
+                        <ActionIcon
+                          variant="subtle"
+                          onClick={() => openEditOrg(org)}
+                          aria-label={t('common.edit')}
+                        >
+                          <IconPencil size={16} />
+                        </ActionIcon>
+                      </Tooltip>
+                      <Tooltip label={t('common.delete')}>
+                        <ActionIcon
+                          variant="subtle"
+                          color="red"
+                          onClick={() => handleDeleteOrg(org)}
+                          aria-label={t('common.delete')}
+                        >
+                          <IconTrash size={16} />
+                        </ActionIcon>
+                      </Tooltip>
+                    </Group>
+                  )}
                 </Group>
 
                 {org.blurb && (
@@ -145,14 +151,16 @@ export function OrganizationsPage() {
                   <Text size="xs" c="dimmed" tt="uppercase" fw={700}>
                     {t('departments.title')}
                   </Text>
-                  <Button
-                    size="compact-xs"
-                    variant="light"
-                    leftSection={<IconPlus size={12} />}
-                    onClick={() => setDeptModal({ organizationId: org.id })}
-                  >
-                    {t('departments.add')}
-                  </Button>
+                  {!readOnly && (
+                    <Button
+                      size="compact-xs"
+                      variant="light"
+                      leftSection={<IconPlus size={12} />}
+                      onClick={() => setDeptModal({ organizationId: org.id })}
+                    >
+                      {t('departments.add')}
+                    </Button>
+                  )}
                 </Group>
 
                 {orgDepartments.length === 0 ? (
@@ -177,27 +185,29 @@ export function OrganizationsPage() {
                               · {t('common.members', { count: deptMembers })}
                             </Text>
                           </Group>
-                          <Group gap={0} wrap="nowrap">
-                            <ActionIcon
-                              size="sm"
-                              variant="subtle"
-                              onClick={() =>
-                                setDeptModal({ organizationId: org.id, department: dept })
-                              }
-                              aria-label={t('common.edit')}
-                            >
-                              <IconPencil size={14} />
-                            </ActionIcon>
-                            <ActionIcon
-                              size="sm"
-                              variant="subtle"
-                              color="red"
-                              onClick={() => handleDeleteDept(dept)}
-                              aria-label={t('common.delete')}
-                            >
-                              <IconTrash size={14} />
-                            </ActionIcon>
-                          </Group>
+                          {!readOnly && (
+                            <Group gap={0} wrap="nowrap">
+                              <ActionIcon
+                                size="sm"
+                                variant="subtle"
+                                onClick={() =>
+                                  setDeptModal({ organizationId: org.id, department: dept })
+                                }
+                                aria-label={t('common.edit')}
+                              >
+                                <IconPencil size={14} />
+                              </ActionIcon>
+                              <ActionIcon
+                                size="sm"
+                                variant="subtle"
+                                color="red"
+                                onClick={() => handleDeleteDept(dept)}
+                                aria-label={t('common.delete')}
+                              >
+                                <IconTrash size={14} />
+                              </ActionIcon>
+                            </Group>
+                          )}
                         </Group>
                       );
                     })}

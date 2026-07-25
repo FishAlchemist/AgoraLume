@@ -24,6 +24,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { buildGroupBundle, downloadBundle, parseGroupBundle } from '../lib/transfer';
+import { useReadOnly } from '../store/readonly';
 import { useWorkspace } from '../store/workspace';
 import { GroupFormModal } from './GroupFormModal';
 
@@ -40,6 +41,7 @@ export function AppNav({ onNavigate }: Props) {
   const organizations = useWorkspace((s) => s.organizations);
   const departments = useWorkspace((s) => s.departments);
   const importGroupBundle = useWorkspace((s) => s.importGroupBundle);
+  const readOnly = useReadOnly((s) => s.readOnly);
   const [createOpened, createHandlers] = useDisclosure(false);
   const [notice, setNotice] = useState<{ error: boolean; text: string } | null>(null);
 
@@ -125,23 +127,25 @@ export function AppNav({ onNavigate }: Props) {
                 {t('groups.title')}
               </Text>
               <Group gap={2} wrap="nowrap">
-                <FileButton
-                  accept="application/json,.json"
-                  onChange={(f) => void handleImportGroups(f)}
-                >
-                  {(props) => (
-                    <Tooltip label={t('transfer.importGroups')}>
-                      <ActionIcon
-                        {...props}
-                        size="sm"
-                        variant="subtle"
-                        aria-label={t('transfer.importGroups')}
-                      >
-                        <IconUpload size={16} />
-                      </ActionIcon>
-                    </Tooltip>
-                  )}
-                </FileButton>
+                {!readOnly && (
+                  <FileButton
+                    accept="application/json,.json"
+                    onChange={(f) => void handleImportGroups(f)}
+                  >
+                    {(props) => (
+                      <Tooltip label={t('transfer.importGroups')}>
+                        <ActionIcon
+                          {...props}
+                          size="sm"
+                          variant="subtle"
+                          aria-label={t('transfer.importGroups')}
+                        >
+                          <IconUpload size={16} />
+                        </ActionIcon>
+                      </Tooltip>
+                    )}
+                  </FileButton>
+                )}
                 {groups.length > 0 && (
                   <Tooltip label={t('transfer.exportGroups')}>
                     <ActionIcon
@@ -154,16 +158,18 @@ export function AppNav({ onNavigate }: Props) {
                     </ActionIcon>
                   </Tooltip>
                 )}
-                <Tooltip label={t('groups.add')}>
-                  <ActionIcon
-                    size="sm"
-                    variant="subtle"
-                    onClick={createHandlers.open}
-                    aria-label={t('groups.add')}
-                  >
-                    <IconPlus size={16} />
-                  </ActionIcon>
-                </Tooltip>
+                {!readOnly && (
+                  <Tooltip label={t('groups.add')}>
+                    <ActionIcon
+                      size="sm"
+                      variant="subtle"
+                      onClick={createHandlers.open}
+                      aria-label={t('groups.add')}
+                    >
+                      <IconPlus size={16} />
+                    </ActionIcon>
+                  </Tooltip>
+                )}
               </Group>
             </Group>
             {notice && (

@@ -15,6 +15,7 @@ interface Props {
   value?: string;
   onChange: (next: string | undefined) => void;
   preview: Pick<Persona, 'name' | 'emoji' | 'gradient' | 'color'>;
+  disabled?: boolean;
 }
 
 const ERROR_KEY: Record<AvatarError, string> = {
@@ -24,7 +25,7 @@ const ERROR_KEY: Record<AvatarError, string> = {
 };
 
 /** Uploads, size-limits, and downscales a persona avatar to a compact image. */
-export function AvatarUpload({ value, onChange, preview }: Props) {
+export function AvatarUpload({ value, onChange, preview, disabled }: Props) {
   const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -60,7 +61,7 @@ export function AvatarUpload({ value, onChange, preview }: Props) {
       <PersonaAvatar persona={previewPersona} size={72} />
       <Stack gap={6}>
         <Group gap="xs">
-          <FileButton accept="image/*" onChange={(f) => void handleFile(f)}>
+          <FileButton accept="image/*" onChange={(f) => void handleFile(f)} disabled={disabled}>
             {(props) => (
               <Button
                 {...props}
@@ -68,6 +69,7 @@ export function AvatarUpload({ value, onChange, preview }: Props) {
                 variant="light"
                 leftSection={<IconUpload size={14} />}
                 loading={busy}
+                disabled={disabled}
               >
                 {t('avatar.upload')}
               </Button>
@@ -79,6 +81,7 @@ export function AvatarUpload({ value, onChange, preview }: Props) {
               variant="subtle"
               color="red"
               leftSection={<IconTrash size={14} />}
+              disabled={disabled}
               onClick={() => {
                 onChange(undefined);
                 setError(null);

@@ -56,6 +56,15 @@ export const en = {
     readSilent: 'Read, no reply',
     readUnread: 'Not read yet',
   },
+  readonly: {
+    badge: 'Read-only',
+    badgeTooltip: 'Read-only mode is on — turn it off in Settings.',
+    chatNotice: "Read-only mode — you're viewing this conversation, not participating.",
+    settingsTitle: 'Read-only mode',
+    settingsHint:
+      'View conversations, personas, and settings without sending messages or changing anything. Stored per device (like the theme and backend connection), so it never affects other people using this site.',
+    settingsLabel: 'Enable read-only mode',
+  },
   groups: {
     title: 'Groups',
     add: 'New group',

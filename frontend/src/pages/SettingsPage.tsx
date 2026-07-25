@@ -6,6 +6,7 @@ import {
   SegmentedControl,
   Select,
   Stack,
+  Switch,
   Text,
   TextInput,
   Title,
@@ -16,6 +17,7 @@ import { useTranslation } from 'react-i18next';
 import { DataSourceBadge } from '../components/DataSourceBadge';
 import { UI_LANGUAGES } from '../i18n';
 import { useConnection } from '../store/connection';
+import { useReadOnly } from '../store/readonly';
 import { useWorkspace } from '../store/workspace';
 import type { UiLanguage } from '../types';
 
@@ -30,6 +32,8 @@ export function SettingsPage() {
   const { t } = useTranslation();
   const settings = useWorkspace((s) => s.settings);
   const updateSettings = useWorkspace((s) => s.updateSettings);
+  const readOnly = useReadOnly((s) => s.readOnly);
+  const setReadOnly = useReadOnly((s) => s.setReadOnly);
   const { colorScheme, setColorScheme } = useMantineColorScheme();
 
   return (
@@ -38,12 +42,20 @@ export function SettingsPage() {
         {t('settings.title')}
       </Title>
       <Stack gap="lg">
+        <Switch
+          checked={readOnly}
+          onChange={(e) => setReadOnly(e.currentTarget.checked)}
+          label={t('readonly.settingsLabel')}
+          description={t('readonly.settingsHint')}
+        />
+
         <Select
           label={t('settings.uiLanguage')}
           description={t('settings.uiLanguageHint')}
           value={settings.uiLanguage}
           onChange={(v) => v && updateSettings({ uiLanguage: v as UiLanguage })}
           allowDeselect={false}
+          disabled={readOnly}
           data={UI_LANGUAGES}
         />
 
@@ -52,6 +64,7 @@ export function SettingsPage() {
           description={t('settings.nativeLanguageHint', { token: '{{user_language}}' })}
           value={settings.nativeLanguage}
           onChange={(e) => updateSettings({ nativeLanguage: e.currentTarget.value })}
+          disabled={readOnly}
           placeholder="繁體中文"
         />
 
@@ -75,6 +88,7 @@ export function SettingsPage() {
           <SegmentedControl
             value={String(settings.chatFontSize ?? 15)}
             onChange={(v) => updateSettings({ chatFontSize: Number(v) })}
+            disabled={readOnly}
             data={FONT_SIZES.map((f) => ({ value: f.value, label: t(f.labelKey) }))}
           />
           <Paper withBorder radius="md" p="sm" mt={4}>

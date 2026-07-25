@@ -58,6 +58,15 @@ export const zhHant: TranslationSchema = {
     readSilent: '已讀不回',
     readUnread: '未讀',
   },
+  readonly: {
+    badge: '唯讀',
+    badgeTooltip: '唯讀模式已開啟——可到設定關閉。',
+    chatNotice: '唯讀模式——你正在檢視這段對話，並未參與。',
+    settingsTitle: '唯讀模式',
+    settingsHint:
+      '檢視對話、角色與設定，但無法送出訊息或做任何變更。此設定儲存在本機（和佈景、後端連線一樣），不會影響其他使用這個網站的人。',
+    settingsLabel: '啟用唯讀模式',
+  },
   groups: {
     title: '群組',
     add: '新增群組',

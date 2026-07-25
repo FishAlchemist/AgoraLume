@@ -5,15 +5,17 @@ interface Props {
   label?: string;
   value: string;
   onChange: (value: string) => void;
+  disabled?: boolean;
 }
 
 /** Accent-color picker rendering a swatch beside each palette name. */
-export function ColorSelect({ label, value, onChange }: Props) {
+export function ColorSelect({ label, value, onChange, disabled }: Props) {
   return (
     <Select
       label={label}
       value={value}
       onChange={(v) => v && onChange(v)}
+      disabled={disabled}
       data={ACCENT_COLORS.map((c) => ({ value: c, label: c }))}
       allowDeselect={false}
       leftSection={<ColorSwatch color={`var(--mantine-color-${value}-6)`} size={16} />}

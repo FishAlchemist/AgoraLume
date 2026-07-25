@@ -14,6 +14,7 @@ import { IconDownload, IconPencil } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { resolveSystemPrompt, resolveVariables } from '../lib/prompt';
 import { buildBundle, downloadBundle, slugify } from '../lib/transfer';
+import { useReadOnly } from '../store/readonly';
 import { useUi } from '../store/ui';
 import { useWorkspace } from '../store/workspace';
 import { OrgTag } from './OrgTag';
@@ -25,6 +26,7 @@ export function PersonaCard() {
   const cardPersonaId = useUi((s) => s.cardPersonaId);
   const closeCard = useUi((s) => s.closeCard);
   const openEditor = useUi((s) => s.openEditor);
+  const readOnly = useReadOnly((s) => s.readOnly);
   const personas = useWorkspace((s) => s.personas);
   const organizations = useWorkspace((s) => s.organizations);
   const departments = useWorkspace((s) => s.departments);
@@ -127,9 +129,11 @@ export function PersonaCard() {
                 {t('transfer.exportOne')}
               </Button>
             )}
-            <Button leftSection={<IconPencil size={16} />} onClick={handleEdit}>
-              {t('common.edit')}
-            </Button>
+            {!readOnly && (
+              <Button leftSection={<IconPencil size={16} />} onClick={handleEdit}>
+                {t('common.edit')}
+              </Button>
+            )}
           </Group>
         </Stack>
       )}

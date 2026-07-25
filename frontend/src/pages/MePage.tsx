@@ -15,6 +15,7 @@ import { useTranslation } from 'react-i18next';
 import { AvatarUpload } from '../components/AvatarUpload';
 import { ColorSelect } from '../components/ColorSelect';
 import { isNameTaken, MAX_PERSONA_BLURB_LEN, MAX_PERSONA_NAME_LEN } from '../lib/persona';
+import { useReadOnly } from '../store/readonly';
 import { useWorkspace } from '../store/workspace';
 import type { Persona } from '../types';
 
@@ -70,6 +71,7 @@ export function MePage() {
   const { t } = useTranslation();
   const personas = useWorkspace((s) => s.personas);
   const updatePersona = useWorkspace((s) => s.updatePersona);
+  const readOnly = useReadOnly((s) => s.readOnly);
 
   const me = personas.find((p) => p.kind === 'user');
 
@@ -86,7 +88,8 @@ export function MePage() {
     setDraft((d) => ({ ...d, [key]: value }));
 
   const nameErr = isNameTaken(personas, draft.name, me?.id) ? t('personas.nameTaken') : undefined;
-  const canSave = Boolean(me) && draft.name.trim().length > 0 && !nameErr && isDirty(draft, me);
+  const canSave =
+    !readOnly && Boolean(me) && draft.name.trim().length > 0 && !nameErr && isDirty(draft, me);
 
   const handleSave = () => {
     if (me && canSave) updatePersona(me.id, toPatch(draft));
@@ -119,6 +122,7 @@ export function MePage() {
           <AvatarUpload
             value={draft.avatarUrl || undefined}
             onChange={(v) => set('avatarUrl', v ?? '')}
+            disabled={readOnly}
             preview={{
               name: draft.name,
               color: draft.color,
@@ -133,6 +137,7 @@ export function MePage() {
             onChange={(e) => set('name', e.currentTarget.value)}
             error={nameErr}
             maxLength={MAX_PERSONA_NAME_LEN}
+            disabled={readOnly}
             data-autofocus
           />
 
@@ -141,12 +146,14 @@ export function MePage() {
               label={t('common.color')}
               value={draft.color}
               onChange={(v) => set('color', v)}
+              disabled={readOnly}
             />
             <TextInput
               label={t('personas.emoji')}
               value={draft.emoji}
               onChange={(e) => set('emoji', e.currentTarget.value)}
               maxLength={4}
+              disabled={readOnly}
             />
           </Group>
 
@@ -155,6 +162,7 @@ export function MePage() {
             value={draft.blurb}
             onChange={(e) => set('blurb', e.currentTarget.value)}
             maxLength={MAX_PERSONA_BLURB_LEN}
+            disabled={readOnly}
             autosize
             minRows={2}
             maxRows={5}

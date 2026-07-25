@@ -8,6 +8,7 @@ import { ChatView } from '../components/ChatView';
 import { DebugPanel } from '../components/DebugPanel';
 import { GroupFormModal } from '../components/GroupFormModal';
 import { buildGroupBundle, downloadBundle, slugify } from '../lib/transfer';
+import { useReadOnly } from '../store/readonly';
 import { useUi } from '../store/ui';
 import { useWorkspace } from '../store/workspace';
 import type { Persona } from '../types';
@@ -21,6 +22,7 @@ export function ChatPage() {
   const organizations = useWorkspace((s) => s.organizations);
   const departments = useWorkspace((s) => s.departments);
   const deleteGroup = useWorkspace((s) => s.deleteGroup);
+  const readOnly = useReadOnly((s) => s.readOnly);
   const openCard = useUi((s) => s.openCard);
   const askConfirm = useUi((s) => s.askConfirm);
   const [editOpened, editHandlers] = useDisclosure(false);
@@ -121,21 +123,29 @@ export function ChatPage() {
               <IconBug size={18} />
             </ActionIcon>
           </Tooltip>
-          <Tooltip label={t('groups.edit')}>
-            <ActionIcon variant="subtle" onClick={editHandlers.open} aria-label={t('groups.edit')}>
-              <IconPencil size={18} />
-            </ActionIcon>
-          </Tooltip>
-          <Tooltip label={t('common.delete')}>
-            <ActionIcon
-              variant="subtle"
-              color="red"
-              onClick={handleDelete}
-              aria-label={t('common.delete')}
-            >
-              <IconTrash size={18} />
-            </ActionIcon>
-          </Tooltip>
+          {!readOnly && (
+            <>
+              <Tooltip label={t('groups.edit')}>
+                <ActionIcon
+                  variant="subtle"
+                  onClick={editHandlers.open}
+                  aria-label={t('groups.edit')}
+                >
+                  <IconPencil size={18} />
+                </ActionIcon>
+              </Tooltip>
+              <Tooltip label={t('common.delete')}>
+                <ActionIcon
+                  variant="subtle"
+                  color="red"
+                  onClick={handleDelete}
+                  aria-label={t('common.delete')}
+                >
+                  <IconTrash size={18} />
+                </ActionIcon>
+              </Tooltip>
+            </>
+          )}
         </Group>
       </Group>
 
