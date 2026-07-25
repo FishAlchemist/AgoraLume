@@ -17,9 +17,17 @@ interface Props {
   repliedBy?: string[];
 }
 
+/** Short clock time (e.g. "15:30") for the message header, in the UI locale. */
+function formatTime(ts: number, locale: string): string {
+  return new Date(ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
+}
+
 export function MessageItem({ message, persona, isSelf, fontSize, aiMembers, repliedBy }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const openCard = useUi((s) => s.openCard);
+  // Short time shown inline; the full local date-time is on hover (title).
+  const time = formatTime(message.ts, i18n.language);
+  const fullTime = new Date(message.ts).toLocaleString(i18n.language);
 
   if (message.kind === 'mood') {
     return (
@@ -59,6 +67,9 @@ export function MessageItem({ message, persona, isSelf, fontSize, aiMembers, rep
                 {t('chat.aiTag')}
               </Badge>
             )}
+            <Text size="xs" c="dimmed" title={fullTime}>
+              {time}
+            </Text>
           </Group>
         )}
         <Paper
@@ -80,8 +91,15 @@ export function MessageItem({ message, persona, isSelf, fontSize, aiMembers, rep
         >
           <Text style={{ whiteSpace: 'pre-wrap', fontSize: `${fontSize}px` }}>{message.text}</Text>
         </Paper>
-        {isSelf && message.kind === 'conversation' && aiMembers.length > 0 && (
-          <ReadReceipts readBy={message.readBy} aiMembers={aiMembers} repliedBy={repliedBy} />
+        {isSelf && (
+          <Group gap={8} pr={6} wrap="nowrap" align="center">
+            <Text size="xs" c="dimmed" title={fullTime}>
+              {time}
+            </Text>
+            {message.kind === 'conversation' && aiMembers.length > 0 && (
+              <ReadReceipts readBy={message.readBy} aiMembers={aiMembers} repliedBy={repliedBy} />
+            )}
+          </Group>
         )}
       </Stack>
       {isSelf && <PersonaAvatar persona={persona} onClick={() => openCard(persona.id)} />}
