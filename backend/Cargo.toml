@@ -23,3 +23,8 @@ utoipa = { version = "5.5.0", features = ["axum_extras", "yaml"] }
 utoipa-axum = "0.2.0"
 uuid = { version = "1.24.0", features = ["v4"] }
 webbrowser = "1.2.1"
+
+[dev-dependencies]
+# `test-util` (not part of tokio's `full`) enables paused-clock tests, so the
+# rate limiter's timing can be asserted without real waits.
+tokio = { version = "1.53.1", features = ["test-util"] }

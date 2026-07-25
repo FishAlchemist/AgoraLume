@@ -73,6 +73,11 @@ pub struct Config {
     /// Upper bound on tokens per reply. Read from `AGORALUME_LLM_MAX_TOKENS`;
     /// defaults to 512 — enough for a chat turn without runaway cost.
     pub llm_max_tokens: u64,
+    /// Server-wide cap on LLM requests per rolling minute, so a free-tier quota
+    /// isn't blown. Read from `AGORALUME_LLM_MAX_RPM`; defaults to 15 (Gemini's
+    /// free `flash-lite` tier). `0` disables throttling — set it higher on a
+    /// paid tier. Agents that would exceed the cap simply wait their turn.
+    pub llm_max_rpm: u64,
     /// Optional token pricing for the estimated-cost readout. When unset, the
     /// debug panel shows token counts only. Rates are per 1,000,000 tokens.
     pub pricing: Option<Pricing>,
@@ -127,6 +132,10 @@ impl Config {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(512);
+        let llm_max_rpm = std::env::var("AGORALUME_LLM_MAX_RPM")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(15);
         Self {
             bind,
             data_dir,
@@ -136,6 +145,7 @@ impl Config {
             llm_model: env_nonempty("AGORALUME_LLM_MODEL"),
             llm_api_key: env_nonempty("AGORALUME_LLM_API_KEY"),
             llm_max_tokens,
+            llm_max_rpm,
             pricing: read_pricing(),
             web_dir,
             open_browser,

@@ -10,4 +10,5 @@ pub mod brain;
 pub mod event;
 pub mod llm;
 pub mod mock;
+pub mod ratelimit;
 pub mod turn;

@@ -26,6 +26,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::brain::{AgentBrain, AgentPrompt, Decision, Respond};
+use crate::agent::ratelimit::RateLimiter;
 use crate::models::TokenUsage;
 
 /// The `respond` tool's arguments, as the model returns them. Kept separate from
@@ -117,24 +118,30 @@ pub struct LlmBrain {
     client: openai::CompletionsClient,
     model: String,
     max_tokens: u64,
+    /// Optional server-wide request throttle, so a free-tier per-minute quota
+    /// (e.g. Gemini's 15 rpm) isn't exceeded. `None` means unlimited.
+    limiter: Option<RateLimiter>,
 }
 
 impl LlmBrain {
     /// Builds the client against an OpenAI-compatible endpoint. `api_key` may be
-    /// empty for local servers that need no auth. Fails only if the client can't
-    /// be constructed.
+    /// empty for local servers that need no auth. `max_rpm` caps outgoing
+    /// requests per rolling minute (0 = unlimited). Fails only if the client
+    /// can't be constructed.
     pub fn new(
         base_url: &str,
         model: impl Into<String>,
         api_key: &str,
         max_tokens: u64,
+        max_rpm: u64,
     ) -> Result<Self, String> {
         let client = openai::CompletionsClient::builder()
             .api_key(api_key)
             .base_url(base_url)
             .build()
             .map_err(|e| format!("failed to build the LLM client: {e}"))?;
-        Ok(Self { client, model: model.into(), max_tokens })
+        let limiter = (max_rpm > 0).then(|| RateLimiter::per_minute(max_rpm as usize));
+        Ok(Self { client, model: model.into(), max_tokens, limiter })
     }
 }
 
@@ -159,6 +166,13 @@ impl AgentBrain for LlmBrain {
             .max_tokens(self.max_tokens)
             .output_schema::<RespondArgs>()
             .build();
+
+        // Throttle before issuing the request so the server stays under the
+        // provider's per-minute quota. Waiting here (rather than after) means a
+        // hard interrupt that drops this future never spends a request slot.
+        if let Some(limiter) = &self.limiter {
+            limiter.acquire().await;
+        }
 
         // Extended details carry the token usage, which feeds the debug/cost panel.
         let result = agent.prompt(prompt.conversation.clone()).extended_details().await;
