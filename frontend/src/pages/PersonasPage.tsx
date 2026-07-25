@@ -1,10 +1,8 @@
 import {
   ActionIcon,
-  Badge,
   Box,
   Button,
   Card,
-  Divider,
   FileButton,
   Group,
   Menu,
@@ -53,7 +51,6 @@ export function PersonasPage() {
   const [notice, setNotice] = useState<{ error: boolean; text: string } | null>(null);
 
   const aiPersonas = personas.filter((p) => p.kind === 'ai');
-  const userPersonas = personas.filter((p) => p.kind === 'user');
 
   const orgFilterActive = orgFilter !== ALL && orgFilter !== UNASSIGNED;
   const selectedOrg = organizations.find((o) => o.id === orgFilter);
@@ -82,9 +79,7 @@ export function PersonasPage() {
 
   const handleDelete = (persona: Persona) => {
     askConfirm({
-      message: t(
-        persona.kind === 'user' ? 'personas.confirmDeleteIdentity' : 'personas.confirmDelete',
-      ),
+      message: t('personas.confirmDelete'),
       confirmLabel: t('common.delete'),
       danger: true,
       onConfirm: () => deletePersona(persona.id),
@@ -265,72 +260,6 @@ export function PersonasPage() {
           })}
         </SimpleGrid>
       )}
-
-      <Divider my="xl" />
-
-      <Group justify="space-between" align="flex-end" mb="md">
-        <Stack gap={2}>
-          <Title order={4}>{t('personas.identitiesTitle')}</Title>
-          <Text c="dimmed" size="sm">
-            {t('personas.identitiesSubtitle')}
-          </Text>
-        </Stack>
-        <Button
-          variant="light"
-          leftSection={<IconPlus size={16} />}
-          onClick={() => openEditor(null, 'user')}
-        >
-          {t('personas.addIdentity')}
-        </Button>
-      </Group>
-
-      <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
-        {userPersonas.map((persona) => (
-          <Card key={persona.id} withBorder radius="lg" padding="md">
-            <Group justify="space-between" wrap="nowrap" align="flex-start">
-              <Group wrap="nowrap" miw={0}>
-                <PersonaAvatar persona={persona} size={48} onClick={() => openCard(persona.id)} />
-                <Stack gap={4} miw={0}>
-                  <Text fw={700} truncate>
-                    {persona.name}
-                  </Text>
-                  <Badge size="xs" variant="light" color={persona.color}>
-                    {t('personas.kindUser')}
-                  </Badge>
-                </Stack>
-              </Group>
-              <Group gap={2} wrap="nowrap">
-                <Tooltip label={t('common.edit')}>
-                  <ActionIcon
-                    variant="subtle"
-                    onClick={() => openEditor(persona.id)}
-                    aria-label={t('common.edit')}
-                  >
-                    <IconPencil size={16} />
-                  </ActionIcon>
-                </Tooltip>
-                {userPersonas.length > 1 && (
-                  <Tooltip label={t('common.delete')}>
-                    <ActionIcon
-                      variant="subtle"
-                      color="red"
-                      onClick={() => handleDelete(persona)}
-                      aria-label={t('common.delete')}
-                    >
-                      <IconTrash size={16} />
-                    </ActionIcon>
-                  </Tooltip>
-                )}
-              </Group>
-            </Group>
-            {persona.blurb && (
-              <Text size="sm" c="dimmed" mt="sm" lineClamp={2}>
-                {persona.blurb}
-              </Text>
-            )}
-          </Card>
-        ))}
-      </SimpleGrid>
     </Box>
   );
 }

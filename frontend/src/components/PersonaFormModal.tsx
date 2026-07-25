@@ -17,7 +17,7 @@ import { useTranslation } from 'react-i18next';
 import { BUILTIN_VARIABLE_NAMES, resolveSystemPrompt } from '../lib/prompt';
 import { entriesToRecord, recordToEntries, type VarEntry } from '../lib/variables';
 import { useWorkspace } from '../store/workspace';
-import type { Persona, PersonaKind } from '../types';
+import type { Department, Persona, PersonaKind } from '../types';
 import { AvatarUpload } from './AvatarUpload';
 import { ColorSelect } from './ColorSelect';
 import { VariablesEditor } from './VariablesEditor';
@@ -47,6 +47,39 @@ interface FormState {
 const NO_ORG = '__none__';
 const NO_DEPT = '__none__';
 
+/** The validation message when another persona (any except `exceptId`) already
+ * uses `name` — matched case-insensitively and trimmed — else undefined. Names
+ * are globally unique. */
+function nameError(
+  personas: Persona[],
+  name: string,
+  exceptId: string | undefined,
+  message: string,
+): string | undefined {
+  const n = name.trim().toLowerCase();
+  if (!n) return undefined;
+  const taken = personas.some((p) => p.id !== exceptId && p.name.trim().toLowerCase() === n);
+  return taken ? message : undefined;
+}
+
+/** Whether `deptId` still belongs to `orgId`, so a department selection survives
+ * an organization change. */
+function keepsDepartment(departments: Department[], deptId: string, orgId: string): boolean {
+  return departments.some((d) => d.id === deptId && d.organizationId === orgId);
+}
+
+/** Runs `onOpen` once each time `opened` transitions false → true — the "re-seed
+ * the form when the modal opens" idiom, as a state adjustment during render. */
+function useOnOpen(opened: boolean, onOpen: () => void) {
+  const [wasOpen, setWasOpen] = useState(false);
+  if (opened && !wasOpen) {
+    setWasOpen(true);
+    onOpen();
+  } else if (!opened && wasOpen) {
+    setWasOpen(false);
+  }
+}
+
 function initialState(persona: Persona | undefined, defaultKind: PersonaKind): FormState {
   return {
     name: persona?.name ?? '',
@@ -67,18 +100,13 @@ export function PersonaFormModal({ opened, onClose, persona, defaultKind = 'ai' 
   const organizations = useWorkspace((s) => s.organizations);
   const departments = useWorkspace((s) => s.departments);
   const settings = useWorkspace((s) => s.settings);
+  const personas = useWorkspace((s) => s.personas);
   const addPersona = useWorkspace((s) => s.addPersona);
   const updatePersona = useWorkspace((s) => s.updatePersona);
 
   // Re-seed the form each time the modal transitions into the open state.
   const [form, setForm] = useState<FormState>(() => initialState(persona, defaultKind));
-  const [wasOpen, setWasOpen] = useState(false);
-  if (opened && !wasOpen) {
-    setForm(initialState(persona, defaultKind));
-    setWasOpen(true);
-  } else if (!opened && wasOpen) {
-    setWasOpen(false);
-  }
+  useOnOpen(opened, () => setForm(initialState(persona, defaultKind)));
 
   const isUser = form.kind === 'user';
 
@@ -90,12 +118,11 @@ export function PersonaFormModal({ opened, onClose, persona, defaultKind = 'ai' 
   const orgDepartments = departments.filter((d) => d.organizationId === form.organizationId);
 
   const changeOrganization = (value: string) =>
-    setForm((f) => {
-      const keepsDept = departments.some(
-        (d) => d.id === f.departmentId && d.organizationId === value,
-      );
-      return { ...f, organizationId: value, departmentId: keepsDept ? f.departmentId : NO_DEPT };
-    });
+    setForm((f) => ({
+      ...f,
+      organizationId: value,
+      departmentId: keepsDepartment(departments, f.departmentId, value) ? f.departmentId : NO_DEPT,
+    }));
 
   const preview = useMemo(() => {
     const draft: Persona = {
@@ -111,7 +138,10 @@ export function PersonaFormModal({ opened, onClose, persona, defaultKind = 'ai' 
     return resolveSystemPrompt(draft, org, department, settings);
   }, [form, org, department, settings, persona?.id]);
 
-  const canSave = form.name.trim().length > 0;
+  // Names are globally unique (the backend enforces it with a 409, and the agent
+  // lookup tool addresses members by name), so flag a collision before saving.
+  const nameErr = nameError(personas, form.name, persona?.id, t('personas.nameTaken'));
+  const canSave = form.name.trim().length > 0 && !nameErr;
 
   const handleSave = () => {
     if (!canSave) return;
@@ -149,6 +179,7 @@ export function PersonaFormModal({ opened, onClose, persona, defaultKind = 'ai' 
           label={t('personas.displayName')}
           value={form.name}
           onChange={(e) => set('name', e.currentTarget.value)}
+          error={nameErr}
           data-autofocus
         />
 

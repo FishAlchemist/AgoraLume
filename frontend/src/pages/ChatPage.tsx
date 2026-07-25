@@ -1,25 +1,12 @@
-import {
-  ActionIcon,
-  Avatar,
-  Badge,
-  Box,
-  Button,
-  Center,
-  Group,
-  Menu,
-  Stack,
-  Text,
-  Tooltip,
-} from '@mantine/core';
+import { ActionIcon, Avatar, Badge, Box, Center, Group, Stack, Text, Tooltip } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
-import { IconBug, IconChevronDown, IconDownload, IconPencil, IconTrash } from '@tabler/icons-react';
+import { IconBug, IconDownload, IconPencil, IconTrash } from '@tabler/icons-react';
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ChatView } from '../components/ChatView';
 import { DebugPanel } from '../components/DebugPanel';
 import { GroupFormModal } from '../components/GroupFormModal';
-import { PersonaAvatar } from '../components/PersonaAvatar';
 import { buildGroupBundle, downloadBundle, slugify } from '../lib/transfer';
 import { useUi } from '../store/ui';
 import { useWorkspace } from '../store/workspace';
@@ -34,7 +21,6 @@ export function ChatPage() {
   const organizations = useWorkspace((s) => s.organizations);
   const departments = useWorkspace((s) => s.departments);
   const deleteGroup = useWorkspace((s) => s.deleteGroup);
-  const updateGroup = useWorkspace((s) => s.updateGroup);
   const openCard = useUi((s) => s.openCard);
   const askConfirm = useUi((s) => s.askConfirm);
   const [editOpened, editHandlers] = useDisclosure(false);
@@ -59,9 +45,6 @@ export function ChatPage() {
   const members = group.personaIds
     .map((id) => personaMap.get(id))
     .filter((p): p is Persona => Boolean(p));
-
-  const userPersonas = personas.filter((p) => p.kind === 'user');
-  const selfPersona = personaMap.get(group.selfPersonaId) ?? userPersonas[0] ?? undefined;
 
   const handleExport = () => {
     downloadBundle(
@@ -119,34 +102,6 @@ export function ChatPage() {
           )}
         </Group>
         <Group gap="xs" wrap="nowrap">
-          {selfPersona && (
-            <Menu position="bottom-end" withinPortal>
-              <Menu.Target>
-                <Button
-                  variant="default"
-                  size="xs"
-                  radius="xl"
-                  px={8}
-                  leftSection={<PersonaAvatar persona={selfPersona} size={20} />}
-                  rightSection={<IconChevronDown size={14} />}
-                >
-                  {selfPersona.name}
-                </Button>
-              </Menu.Target>
-              <Menu.Dropdown>
-                <Menu.Label>{t('chat.speakingAs')}</Menu.Label>
-                {userPersonas.map((p) => (
-                  <Menu.Item
-                    key={p.id}
-                    leftSection={<PersonaAvatar persona={p} size={20} />}
-                    onClick={() => updateGroup(group.id, { selfPersonaId: p.id })}
-                  >
-                    {p.name}
-                  </Menu.Item>
-                ))}
-              </Menu.Dropdown>
-            </Menu>
-          )}
           <Tooltip label={t('transfer.exportGroup')}>
             <ActionIcon
               variant="subtle"

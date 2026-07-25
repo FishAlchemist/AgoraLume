@@ -93,6 +93,10 @@ export interface paths {
   };
   "/personas": {
     get: operations["list_personas"];
+    /**
+     * Creates a persona. Rejects (409) a duplicate name (names are globally unique)
+     * or a second user identity (there is only ever one "you").
+     */
     post: operations["create_persona"];
   };
   "/personas/{id}": {
@@ -102,6 +106,10 @@ export interface paths {
      * since every group still needs a "you".
      */
     delete: operations["delete_persona"];
+    /**
+     * Updates a persona. 404 for an unknown id; 409 for a duplicate name or a change
+     * that would produce a second user identity.
+     */
     patch: operations["update_persona"];
   };
   "/settings": {
@@ -772,6 +780,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Creates a persona. Rejects (409) a duplicate name (names are globally unique)
+   * or a second user identity (there is only ever one "you").
+   */
   create_persona: {
     requestBody: {
       content: {
@@ -783,6 +795,10 @@ export interface operations {
         content: {
           "application/json": components["schemas"]["Persona"];
         };
+      };
+      /** @description Refused: name already in use, or a second user identity */
+      409: {
+        content: never;
       };
     };
   };
@@ -826,6 +842,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Updates a persona. 404 for an unknown id; 409 for a duplicate name or a change
+   * that would produce a second user identity.
+   */
   update_persona: {
     parameters: {
       path: {
@@ -844,6 +864,10 @@ export interface operations {
         };
       };
       404: {
+        content: never;
+      };
+      /** @description Refused: name already in use, or a second user identity */
+      409: {
         content: never;
       };
     };

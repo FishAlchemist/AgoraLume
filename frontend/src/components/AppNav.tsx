@@ -17,6 +17,7 @@ import {
   IconPlus,
   IconSettings,
   IconUpload,
+  IconUser,
   IconUsers,
 } from '@tabler/icons-react';
 import { useState } from 'react';
@@ -83,6 +84,12 @@ export function AppNav({ onNavigate }: Props) {
       label: t('nav.organizations'),
       icon: IconBuildingCommunity,
       match: (p: string) => p.startsWith('/organizations'),
+    },
+    {
+      to: '/me',
+      label: t('nav.me'),
+      icon: IconUser,
+      match: (p: string) => p.startsWith('/me'),
     },
     {
       to: '/settings',

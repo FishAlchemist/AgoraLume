@@ -91,15 +91,6 @@ function seedPersonas(): Persona[] {
       blurb: 'Your own voice.',
     },
     {
-      id: 'alter-ego',
-      name: 'Masked',
-      kind: 'user',
-      color: 'dark',
-      emoji: '🎭',
-      gradient: 'linear-gradient(135deg, #495057, #212529)',
-      blurb: 'An anonymous alter-ego.',
-    },
-    {
       id: 'aria',
       name: 'Aria',
       kind: 'ai',
@@ -182,7 +173,8 @@ function seedData(): WorkspaceData {
 // switching back to mock restores the user's own offline data untouched.
 
 const MOCK_KEY = 'agoralume-workspace';
-const MOCK_VERSION = 2;
+// v3: collapsed to a single user identity (dropped multi-persona "identities").
+const MOCK_VERSION = 3;
 
 function loadMock(): WorkspaceData {
   try {

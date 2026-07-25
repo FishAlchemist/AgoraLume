@@ -10,6 +10,7 @@ import { HeaderControls } from './components/HeaderControls';
 import { PersonaCard } from './components/PersonaCard';
 import { PersonaFormModal } from './components/PersonaFormModal';
 import { ChatPage } from './pages/ChatPage';
+import { MePage } from './pages/MePage';
 import { OrganizationsPage } from './pages/OrganizationsPage';
 import { PersonasPage } from './pages/PersonasPage';
 import { SettingsPage } from './pages/SettingsPage';
@@ -76,6 +77,7 @@ function Shell() {
             <Route path="/g/:groupId" element={<ChatPage />} />
             <Route path="/personas" element={<PersonasPage />} />
             <Route path="/organizations" element={<OrganizationsPage />} />
+            <Route path="/me" element={<MePage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

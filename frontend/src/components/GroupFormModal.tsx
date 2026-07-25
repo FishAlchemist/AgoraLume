@@ -60,8 +60,8 @@ export function GroupFormModal({ opened, onClose, group }: Props) {
   const updateGroup = useWorkspace((s) => s.updateGroup);
 
   const aiPersonas = personas.filter((p) => p.kind === 'ai');
-  const userPersonas = personas.filter((p) => p.kind === 'user');
-  const defaultSelfId = userPersonas[0]?.id ?? '';
+  // There is exactly one user identity; a group's "you" is always that person.
+  const defaultSelfId = personas.find((p) => p.kind === 'user')?.id ?? '';
 
   const [form, setForm] = useState<FormState>(() => initialState(group, defaultSelfId));
   const [orgFilter, setOrgFilter] = useState<string>(ALL);
@@ -210,15 +210,6 @@ export function GroupFormModal({ opened, onClose, group }: Props) {
             hidePickedOptions
           />
         </Stack>
-
-        <Select
-          label={t('groups.identity')}
-          description={t('groups.identityHint')}
-          data={userPersonas.map((p) => ({ value: p.id, label: p.name }))}
-          value={form.selfPersonaId}
-          onChange={(v) => v && setForm((f) => ({ ...f, selfPersonaId: v }))}
-          allowDeselect={false}
-        />
 
         <Group justify="flex-end" mt="xs">
           <Button variant="default" onClick={onClose}>
