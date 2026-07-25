@@ -294,10 +294,12 @@ async fn pace(cfg: &LoopConfig) {
 }
 
 /// One line of the Context Stream — the filtered transcript agents read. Only
-/// spoken lines appear; moods, read receipts and private notes never do.
+/// spoken lines appear; moods, read receipts and private notes never do. `ts` is
+/// the send time (epoch millis) so the assembled prompt can stamp each message.
 struct ContextLine {
     name: String,
     text: String,
+    ts: i64,
 }
 
 /// Builds the Context Stream: the group's log filtered to spoken lines only.
@@ -308,10 +310,10 @@ fn build_transcript(state: &AppState, group_id: &str) -> Vec<ContextLine> {
     messages
         .into_iter()
         .filter_map(|message| match message {
-            Message::Conversation { persona_id, text, .. } => {
+            Message::Conversation { persona_id, text, ts, .. } => {
                 let name =
                     workspace.persona(&persona_id).map_or(persona_id, |p| p.name);
-                Some(ContextLine { name, text })
+                Some(ContextLine { name, text, ts })
             }
             Message::Mood { .. } => None,
         })
@@ -349,6 +351,35 @@ fn build_directory(state: &AppState) -> Vec<MemberInfo> {
 /// offset (e.g. `2026-07-25T15:30:00+08:00`), so agents can reason about "now".
 fn local_now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+/// Formats an epoch-millisecond send time in the same local RFC 3339 form as
+/// [`local_now`], so a message's `time` attribute compares directly against the
+/// `<time>` "now". Falls back to the raw millis if the value is out of range.
+fn format_ts(ts: i64) -> String {
+    use chrono::TimeZone as _;
+    match chrono::Local.timestamp_millis_opt(ts) {
+        chrono::LocalResult::Single(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        _ => ts.to_string(),
+    }
+}
+
+/// Minimal XML escaping so a member's name or message text can't break out of
+/// its `<message>` element — a user could otherwise inject a stray `</message>`
+/// (or `</conversation>`) tag and confuse the framing. Escapes the predefined
+/// XML entities; `"` matters for the `from`/`time` attributes.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Writes one "- Name (marker): blurb" bullet, dropping the blurb clause when the
@@ -434,9 +465,19 @@ fn assemble_prompt(
     if !now.is_empty() {
         let _ = writeln!(conversation, "<time>\n{now}\n</time>\n");
     }
+    // Each message is its own XML element carrying the sender and the send time
+    // (local, with timezone — same format as <time>), so the model can tell the
+    // messages apart, attribute each to a speaker, and reason about when things
+    // were said. Names and text are escaped so a stray tag can't break the frame.
     conversation.push_str("<conversation>\n");
     for line in transcript {
-        let _ = writeln!(conversation, "{}: {}", line.name, line.text);
+        let _ = writeln!(
+            conversation,
+            "<message from=\"{}\" time=\"{}\">{}</message>",
+            xml_escape(&line.name),
+            format_ts(line.ts),
+            xml_escape(&line.text),
+        );
     }
     conversation.push_str("</conversation>\n");
     if !events.is_empty() {
@@ -688,6 +729,29 @@ mod tests {
             assemble_prompt(&persona, &[], &[], &[], &[], "2026-07-25T15:30:00+08:00");
         assert!(prompt.conversation.contains("<time>"));
         assert!(prompt.conversation.contains("2026-07-25T15:30:00+08:00"));
+    }
+
+    #[test]
+    fn transcript_messages_are_xml_isolated_with_a_timestamp() {
+        let persona = AgentPersona {
+            name: "Aria".into(),
+            system_prompt: "You are Aria.".into(),
+            variables: std::collections::HashMap::new(),
+        };
+        // 2026-07-25T00:00:00Z in epoch millis; the exact local rendering depends
+        // on the test host's timezone, so assert the structure, not the offset.
+        let transcript = vec![
+            ContextLine { name: "You".into(), text: "hi <there>".into(), ts: 1_774_396_800_000 },
+        ];
+        let prompt = assemble_prompt(&persona, &[], &[], &transcript, &[], "");
+
+        // Each line is its own element, tagged with the sender and a send time.
+        assert!(prompt.conversation.contains("<message from=\"You\" time=\""));
+        assert!(prompt.conversation.contains("2026-"));
+        assert!(prompt.conversation.contains("</message>"));
+        // Angle brackets in the body are escaped so they can't break the frame.
+        assert!(prompt.conversation.contains("hi &lt;there&gt;"));
+        assert!(!prompt.conversation.contains("hi <there>"));
     }
 
     #[tokio::test]

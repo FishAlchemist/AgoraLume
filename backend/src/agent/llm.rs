@@ -86,7 +86,10 @@ XML-tagged sections: <persona> and <context> are you; <group_members> lists who 
 is in this room; <directory> lists other members of the workspace you may refer \
 to by their exact, globally-unique name (with their short bio) even though they \
 are not here. The message below carries the current <time> (with timezone), the \
-live <conversation>, and any <environment> events. Decide your single next \
+live <conversation>, and any <environment> events. Inside <conversation>, each \
+line is a <message from=\"NAME\" time=\"TIMESTAMP\">…</message> element: `from` \
+is the speaker and `time` is when they sent it (same timezone as <time>), so you \
+can judge what is recent and what is stale. Decide your single next \
 action using the response schema. Speak only when you have something worth \
 adding; otherwise choose `read` to stay silent. Moods are UI-only flavour and \
 are never shown to other participants as text. Keep any reply to one short chat \
