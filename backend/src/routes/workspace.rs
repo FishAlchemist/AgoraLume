@@ -18,6 +18,7 @@ use utoipa_axum::routes;
 
 use crate::models::{Department, Group, Organization, Persona, Settings};
 use crate::state::AppState;
+use crate::workspace::PersonaError;
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
@@ -184,32 +185,50 @@ async fn get_persona(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// Creates a persona. Rejects (409) a duplicate name (names are globally unique)
+/// or a second user identity (there is only ever one "you").
 #[utoipa::path(post, path = "/personas", tag = "personas",
     request_body = Persona,
-    responses((status = 201, body = Persona)))]
+    responses(
+        (status = 201, body = Persona),
+        (status = 409, description = "Refused: name already in use, or a second user identity")))]
 async fn create_persona(
     State(s): State<Arc<AppState>>,
     Json(body): Json<Persona>,
-) -> (StatusCode, Json<Persona>) {
-    let persona = s.workspace().create_persona(body);
-    s.persist_workspace();
-    (StatusCode::CREATED, Json(persona))
+) -> Result<(StatusCode, Json<Persona>), StatusCode> {
+    let created = s.workspace().create_persona(body);
+    match created {
+        Ok(persona) => {
+            s.persist_workspace();
+            Ok((StatusCode::CREATED, Json(persona)))
+        }
+        Err(_) => Err(StatusCode::CONFLICT),
+    }
 }
 
+/// Updates a persona. 404 for an unknown id; 409 for a duplicate name or a change
+/// that would produce a second user identity.
 #[utoipa::path(patch, path = "/personas/{id}", tag = "personas",
     params(("id" = String, Path)),
     request_body = Persona,
-    responses((status = 200, body = Persona), (status = 404)))]
+    responses(
+        (status = 200, body = Persona),
+        (status = 404),
+        (status = 409, description = "Refused: name already in use, or a second user identity")))]
 async fn update_persona(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Persona>, StatusCode> {
     let updated = s.workspace().update_persona(&id, patch);
-    if updated.is_some() {
-        s.persist_workspace();
+    match updated {
+        Ok(persona) => {
+            s.persist_workspace();
+            Ok(Json(persona))
+        }
+        Err(PersonaError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::CONFLICT),
     }
-    updated.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 /// Deletes a persona. Refuses (409) to remove the last remaining user identity,

@@ -465,6 +465,9 @@ paths:
     post:
       tags:
       - personas
+      summary: |-
+        Creates a persona. Rejects (409) a duplicate name (names are globally unique)
+        or a second user identity (there is only ever one "you").
       operationId: create_persona
       requestBody:
         content:
@@ -479,6 +482,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Persona'
+        '409':
+          description: 'Refused: name already in use, or a second user identity'
   /personas/{id}:
     get:
       tags:
@@ -522,6 +527,9 @@ paths:
     patch:
       tags:
       - personas
+      summary: |-
+        Updates a persona. 404 for an unknown id; 409 for a duplicate name or a change
+        that would produce a second user identity.
       operationId: update_persona
       parameters:
       - name: id
@@ -544,6 +552,8 @@ paths:
                 $ref: '#/components/schemas/Persona'
         '404':
           description: ''
+        '409':
+          description: 'Refused: name already in use, or a second user identity'
   /settings:
     get:
       tags:

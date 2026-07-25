@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::agent::brain::{Action, AgentBrain, AgentPersona, AgentPrompt, Decision, Respond};
+use crate::agent::brain::{
+    Action, AgentBrain, AgentPersona, AgentPrompt, Decision, MemberInfo, Respond,
+};
 use crate::agent::event::{Event, Salience, appraise};
 use crate::agent::mock::RuleBrain;
 use crate::models::{AgentTrace, Message, now_ms};
@@ -135,8 +137,13 @@ async fn run_turn(
         shuffle(&mut order, &mut rng);
 
         // The roster (who's in the room, incl. the user) is fixed for the round;
-        // every agent this sweep is told the same membership.
+        // every agent this sweep is told the same membership. The directory (every
+        // persona in the workspace) backs the on-demand `lookup_member` tool.
         let roster = state.workspace().group_roster(group_id).unwrap_or_default();
+        let directory = build_directory(state);
+        // A single wall-clock reading for the round, with the server's timezone
+        // offset, injected so agents can reason about "now".
+        let now = local_now();
 
         let mut spoke_this_round = false;
 
@@ -149,7 +156,8 @@ async fn run_turn(
 
             // Assemble the prompt — the orchestrator owns context, so a brain is
             // just prompt-in/decision-out (the LLM boundary).
-            let prompt = assemble_prompt(&persona, &roster, &transcript, &injected_events);
+            let prompt =
+                assemble_prompt(&persona, &roster, &directory, &transcript, &injected_events, &now);
             tracing::trace!(
                 target: "agent::prompt",
                 persona = %persona_id,
@@ -320,14 +328,39 @@ fn build_persona(state: &AppState, id: &str) -> Option<AgentPersona> {
     })
 }
 
+/// Every persona in the workspace, as the on-demand `lookup_member` directory.
+/// Cloned so the brain can hold it past the workspace lock.
+fn build_directory(state: &AppState) -> Vec<MemberInfo> {
+    state
+        .workspace()
+        .personas
+        .iter()
+        .map(|p| MemberInfo {
+            name: p.name.clone(),
+            blurb: p.blurb.clone(),
+            is_user: p.kind == crate::models::PersonaKind::User,
+        })
+        .collect()
+}
+
+/// The current local time as an RFC 3339 string carrying the server's timezone
+/// offset (e.g. `2026-07-25T15:30:00+08:00`), so agents can reason about "now".
+fn local_now() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
 /// Renders the persona, clean transcript, and injected events into the prompt a
 /// brain consumes. This is the self-managing context: everything a model needs
-/// is here, so swapping in an LLM brain needs no other change.
+/// is here, so swapping in an LLM brain needs no other change. `now` is an
+/// RFC 3339 timestamp with timezone offset (empty to omit the `<time>` section,
+/// e.g. in tests).
 fn assemble_prompt(
     persona: &AgentPersona,
     roster: &[RosterMember],
+    directory: &[MemberInfo],
     transcript: &[ContextLine],
     events: &[String],
+    now: &str,
 ) -> AgentPrompt {
     use std::fmt::Write as _;
 
@@ -367,6 +400,10 @@ fn assemble_prompt(
     }
     // The live transcript and any environment events, each in its own element.
     let mut conversation = String::new();
+    // The current time (with timezone) leads, so the agent grounds "now".
+    if !now.is_empty() {
+        let _ = writeln!(conversation, "<time>\n{now}\n</time>\n");
+    }
     conversation.push_str("<conversation>\n");
     for line in transcript {
         let _ = writeln!(conversation, "{}: {}", line.name, line.text);
@@ -385,6 +422,7 @@ fn assemble_prompt(
         conversation,
         persona_name: persona.name.clone(),
         last_line: transcript.last().map(|line| line.text.clone()),
+        directory: directory.to_vec(),
     }
 }
 
@@ -574,13 +612,27 @@ mod tests {
             RosterMember { name: "Nox".into(), blurb: Some("Dry strategist.".into()), is_self: false },
             RosterMember { name: "Sol".into(), blurb: None, is_self: false },
         ];
-        let prompt = assemble_prompt(&persona, &roster, &[], &[]);
+        let prompt = assemble_prompt(&persona, &roster, &[], &[], &[], "");
         // The user is present and flagged; blurbs render when set, and a member
         // without one still appears.
         assert!(prompt.system.contains("<group_members>"));
         assert!(prompt.system.contains("You (you): Your own voice."));
         assert!(prompt.system.contains("Nox: Dry strategist."));
         assert!(prompt.system.contains("- Sol\n"));
+    }
+
+    #[test]
+    fn injects_local_time_with_timezone() {
+        let persona = AgentPersona {
+            name: "Aria".into(),
+            system_prompt: "You are Aria.".into(),
+            variables: std::collections::HashMap::new(),
+        };
+        // A fixed RFC 3339 timestamp with offset renders in its own section.
+        let prompt =
+            assemble_prompt(&persona, &[], &[], &[], &[], "2026-07-25T15:30:00+08:00");
+        assert!(prompt.conversation.contains("<time>"));
+        assert!(prompt.conversation.contains("2026-07-25T15:30:00+08:00"));
     }
 
     #[tokio::test]

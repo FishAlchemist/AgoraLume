@@ -76,6 +76,19 @@ pub struct AgentPersona {
     pub variables: HashMap<String, String>,
 }
 
+/// One entry in the global member directory an agent can consult by name. Unlike
+/// the group roster (who is in *this* room, injected into every prompt), the
+/// directory covers *every* persona in the workspace and is queried on demand
+/// through the `lookup_member` tool — so the prompt stays small while the agent
+/// can still look anyone up by their globally-unique name.
+#[derive(Clone, Debug)]
+pub struct MemberInfo {
+    pub name: String,
+    pub blurb: Option<String>,
+    /// True for the single human identity ("you").
+    pub is_user: bool,
+}
+
 /// The fully-assembled prompt handed to a brain — the self-managed context, in
 /// the form a model consumes. `system` carries the persona (with variables);
 /// `conversation` carries the clean transcript plus injected environment events.
@@ -87,6 +100,10 @@ pub struct AgentPrompt {
     pub conversation: String,
     pub persona_name: String,
     pub last_line: Option<String>,
+    /// Every persona in the workspace, so a brain can offer a `lookup_member`
+    /// tool that resolves a name to its blurb on demand. Empty for brains/tests
+    /// that don't use it; the mock ignores it.
+    pub directory: Vec<MemberInfo>,
 }
 
 /// A brain's output: the decision plus optional telemetry. Keeping usage

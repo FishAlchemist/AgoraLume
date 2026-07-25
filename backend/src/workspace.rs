@@ -53,6 +53,19 @@ pub struct RosterMember {
     pub is_self: bool,
 }
 
+/// Why a persona create/update was refused. Names are globally unique (so the
+/// lookup tool can address anyone by name) and there is exactly one user
+/// identity, so both are enforced here rather than at the edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonaError {
+    /// No persona with the given id (update only).
+    NotFound,
+    /// Another persona already uses this name.
+    NameTaken,
+    /// Refused to create/produce a second user identity — there is only ever one.
+    UserExists,
+}
+
 /// A newly minted id for a created resource.
 fn new_id() -> String {
     Uuid::new_v4().to_string()
@@ -106,14 +119,59 @@ impl Workspace {
     }
 
     /// Rebuilds a workspace from a persisted snapshot (loaded from disk).
+    /// Older snapshots may carry several user identities; the single-user
+    /// invariant is re-established on load so downstream code can assume one.
     pub fn from_snapshot(snapshot: WorkspaceSnapshot) -> Self {
-        Self {
+        let mut workspace = Self {
             organizations: snapshot.organizations,
             departments: snapshot.departments,
             personas: snapshot.personas,
             groups: snapshot.groups,
             settings: snapshot.settings,
+        };
+        workspace.enforce_single_user();
+        workspace
+    }
+
+    /// Collapses to exactly one user identity: keeps the first user persona,
+    /// drops any others, and repoints group `self_persona_id`s (and membership)
+    /// off the removed identities. Synthesizes the default "you" if none exists.
+    fn enforce_single_user(&mut self) {
+        let users: Vec<String> = self
+            .personas
+            .iter()
+            .filter(|p| p.kind == PersonaKind::User)
+            .map(|p| p.id.clone())
+            .collect();
+        let Some(keep) = users.first().cloned() else {
+            // No user at all (corrupt data): restore the default identity.
+            self.personas.insert(0, default_user_persona());
+            for g in &mut self.groups {
+                g.self_persona_id = DEFAULT_USER_PERSONA_ID.into();
+            }
+            return;
+        };
+        let dropped: HashSet<String> = users.into_iter().skip(1).collect();
+        if dropped.is_empty() {
+            return;
         }
+        self.personas.retain(|p| !dropped.contains(&p.id));
+        for g in &mut self.groups {
+            if dropped.contains(&g.self_persona_id) {
+                g.self_persona_id = keep.clone();
+            }
+            g.persona_ids.retain(|pid| !dropped.contains(pid));
+        }
+    }
+
+    /// True when another persona (any except `except_id`) already uses `name`,
+    /// compared case-insensitively and trimmed. The basis for global name
+    /// uniqueness.
+    fn name_taken(&self, name: &str, except_id: Option<&str>) -> bool {
+        let name = name.trim();
+        self.personas
+            .iter()
+            .any(|p| Some(p.id.as_str()) != except_id && p.name.trim().eq_ignore_ascii_case(name))
     }
 
     /// A serializable copy of the workspace, for writing to disk.
@@ -202,18 +260,39 @@ impl Workspace {
 
     // --- Personas -----------------------------------------------------------
 
-    pub fn create_persona(&mut self, mut persona: Persona) -> Persona {
+    /// Creates a persona. Refuses a second user identity ([`PersonaError::UserExists`])
+    /// and a name already in use ([`PersonaError::NameTaken`]).
+    pub fn create_persona(&mut self, mut persona: Persona) -> Result<Persona, PersonaError> {
+        if persona.kind == PersonaKind::User
+            && self.personas.iter().any(|p| p.kind == PersonaKind::User)
+        {
+            return Err(PersonaError::UserExists);
+        }
+        if self.name_taken(&persona.name, None) {
+            return Err(PersonaError::NameTaken);
+        }
         persona.id = resolve_id(persona.id, self.personas.iter().map(|p| p.id.as_str()));
         self.personas.push(persona.clone());
-        persona
+        Ok(persona)
     }
 
-    pub fn update_persona(&mut self, id: &str, patch: Value) -> Option<Persona> {
-        let persona = self.personas.iter().find(|p| p.id == id)?;
-        let updated = apply_patch(persona, patch)?;
-        let slot = self.personas.iter_mut().find(|p| p.id == id)?;
+    /// Applies a partial update. Rejects an unknown id ([`PersonaError::NotFound`]),
+    /// a name collision ([`PersonaError::NameTaken`]), and any change that would
+    /// yield a second user identity ([`PersonaError::UserExists`]).
+    pub fn update_persona(&mut self, id: &str, patch: Value) -> Result<Persona, PersonaError> {
+        let persona = self.personas.iter().find(|p| p.id == id).ok_or(PersonaError::NotFound)?;
+        let updated = apply_patch(persona, patch).ok_or(PersonaError::NotFound)?;
+        if self.name_taken(&updated.name, Some(id)) {
+            return Err(PersonaError::NameTaken);
+        }
+        if updated.kind == PersonaKind::User
+            && self.personas.iter().any(|p| p.kind == PersonaKind::User && p.id != id)
+        {
+            return Err(PersonaError::UserExists);
+        }
+        let slot = self.personas.iter_mut().find(|p| p.id == id).ok_or(PersonaError::NotFound)?;
         *slot = updated.clone();
-        Some(updated)
+        Ok(updated)
     }
 
     /// Deletes a persona. Keeps at least one user identity around (groups always
@@ -401,36 +480,28 @@ fn seed_departments() -> Vec<Department> {
     ]
 }
 
+/// The single user identity ("you"), created fresh. There is exactly one; a new
+/// install seeds it and a snapshot missing a user restores it.
+fn default_user_persona() -> Persona {
+    Persona {
+        id: DEFAULT_USER_PERSONA_ID.into(),
+        name: "You".into(),
+        kind: PersonaKind::User,
+        color: "gray".into(),
+        avatar_url: None,
+        emoji: Some("🧑".into()),
+        gradient: Some("linear-gradient(135deg, #4dabf7, #4263eb)".into()),
+        blurb: Some("Your own voice.".into()),
+        organization_id: None,
+        department_id: None,
+        system_prompt: None,
+        variables: None,
+    }
+}
+
 fn seed_personas() -> Vec<Persona> {
     vec![
-        Persona {
-            id: DEFAULT_USER_PERSONA_ID.into(),
-            name: "You".into(),
-            kind: PersonaKind::User,
-            color: "gray".into(),
-            avatar_url: None,
-            emoji: Some("🧑".into()),
-            gradient: Some("linear-gradient(135deg, #4dabf7, #4263eb)".into()),
-            blurb: Some("Your own voice.".into()),
-            organization_id: None,
-            department_id: None,
-            system_prompt: None,
-            variables: None,
-        },
-        Persona {
-            id: "alter-ego".into(),
-            name: "Masked".into(),
-            kind: PersonaKind::User,
-            color: "dark".into(),
-            avatar_url: None,
-            emoji: Some("🎭".into()),
-            gradient: Some("linear-gradient(135deg, #495057, #212529)".into()),
-            blurb: Some("An anonymous alter-ego.".into()),
-            organization_id: None,
-            department_id: None,
-            system_prompt: None,
-            variables: None,
-        },
+        default_user_persona(),
         Persona {
             id: "aria".into(),
             name: "Aria".into(),
@@ -504,5 +575,87 @@ fn seed_settings() -> Settings {
         ui_language: "zh-Hant".into(),
         native_language: "繁體中文".into(),
         chat_font_size: 15,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ai(id: &str, name: &str) -> Persona {
+        Persona {
+            id: id.into(),
+            name: name.into(),
+            kind: PersonaKind::Ai,
+            color: "violet".into(),
+            avatar_url: None,
+            emoji: None,
+            gradient: None,
+            blurb: None,
+            organization_id: None,
+            department_id: None,
+            system_prompt: None,
+            variables: None,
+        }
+    }
+
+    #[test]
+    fn create_persona_rejects_duplicate_name_case_insensitively() {
+        let mut ws = Workspace::seeded();
+        // "Aria" is seeded; a differently-cased duplicate is refused.
+        let err = ws.create_persona(ai("clone", "aria")).unwrap_err();
+        assert_eq!(err, PersonaError::NameTaken);
+        // A fresh name is accepted.
+        assert!(ws.create_persona(ai("fresh", "Vega")).is_ok());
+    }
+
+    #[test]
+    fn create_persona_rejects_second_user() {
+        let mut ws = Workspace::seeded();
+        let mut second = ai("me2", "Another Me");
+        second.kind = PersonaKind::User;
+        assert_eq!(ws.create_persona(second).unwrap_err(), PersonaError::UserExists);
+    }
+
+    #[test]
+    fn update_persona_rejects_rename_onto_existing_name() {
+        let mut ws = Workspace::seeded();
+        // Rename Nox → Aria collides with the seeded Aria.
+        let patch = serde_json::json!({ "name": "Aria" });
+        assert_eq!(ws.update_persona("nox", patch).unwrap_err(), PersonaError::NameTaken);
+        // Renaming to a free name works, and keeping your own name is fine.
+        assert!(ws.update_persona("nox", serde_json::json!({ "name": "Nyx" })).is_ok());
+        assert!(ws.update_persona("nyx_missing", serde_json::json!({ "name": "X" })).is_err());
+    }
+
+    #[test]
+    fn snapshot_collapses_extra_user_identities() {
+        // A legacy snapshot with two user identities, one used as a group's self.
+        let mut extra = ai("alter-ego", "Masked");
+        extra.kind = PersonaKind::User;
+        let snapshot = WorkspaceSnapshot {
+            organizations: vec![],
+            departments: vec![],
+            personas: vec![default_user_persona(), extra, ai("aria", "Aria")],
+            groups: vec![Group {
+                id: "g".into(),
+                name: "G".into(),
+                persona_ids: vec!["alter-ego".into(), "aria".into()],
+                self_persona_id: "alter-ego".into(),
+            }],
+            settings: seed_settings(),
+        };
+        let ws = Workspace::from_snapshot(snapshot);
+
+        // Exactly one user identity survives, and it is the default "you".
+        let users: Vec<&Persona> =
+            ws.personas.iter().filter(|p| p.kind == PersonaKind::User).collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].id, DEFAULT_USER_PERSONA_ID);
+        // The group's self and membership are repointed off the dropped identity.
+        let group = &ws.groups[0];
+        assert_eq!(group.self_persona_id, DEFAULT_USER_PERSONA_ID);
+        assert!(!group.persona_ids.iter().any(|id| id == "alter-ego"));
+        assert!(group.persona_ids.iter().any(|id| id == "aria"));
     }
 }
