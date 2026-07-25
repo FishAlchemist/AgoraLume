@@ -141,3 +141,7 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Backend runtime data, if the backend is ever run from this directory
+# (AGORALUME_DATA_DIR defaults to ./data, relative to the process CWD).
+/data/
