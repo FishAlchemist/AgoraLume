@@ -1,7 +1,10 @@
 import type { Message } from '../../types';
 import type {
   ActivityHandler,
+  AgentTrace,
   ChatApi,
+  DebugHandler,
+  DebugUsage,
   MessageHandler,
   ReadHandler,
   ReadReceipt,
@@ -91,6 +94,28 @@ export class HttpChatApi implements ChatApi {
     };
     // Turn activity arrives as a named "activity" SSE event on the same stream.
     source.addEventListener('activity', onActivity);
+    return () => source.close();
+  }
+
+  getUsage(): Promise<DebugUsage> {
+    return this.getJson<DebugUsage>('/debug/usage');
+  }
+
+  listTraces(groupId: string): Promise<AgentTrace[]> {
+    return this.getJson<AgentTrace[]>(`/groups/${groupId}/debug/traces`);
+  }
+
+  subscribeDebug(groupId: string, handler: DebugHandler): () => void {
+    const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
+    const onDebug = (event: MessageEvent<string>) => {
+      try {
+        handler(JSON.parse(event.data) as AgentTrace);
+      } catch {
+        // Ignore malformed events.
+      }
+    };
+    // Debug traces arrive as a named "debug" SSE event on the same stream.
+    source.addEventListener('debug', onDebug);
     return () => source.close();
   }
 }

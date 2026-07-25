@@ -1,6 +1,15 @@
 import { useWorkspace } from '../../store/workspace';
 import type { Message } from '../../types';
-import type { ActivityHandler, ChatApi, MessageHandler, ReadHandler, ServerMeta } from './types';
+import type {
+  ActivityHandler,
+  AgentTrace,
+  ChatApi,
+  DebugHandler,
+  DebugUsage,
+  MessageHandler,
+  ReadHandler,
+  ServerMeta,
+} from './types';
 
 let seq = 0;
 const nextId = () => `m${Date.now()}-${seq++}`;
@@ -71,6 +80,27 @@ export class MockChatApi implements ChatApi {
     set.add(handler);
     this.activitySubs.set(groupId, set);
     return () => set.delete(handler);
+  }
+
+  // The in-browser mock makes no LLM calls, so there is nothing to report: zero
+  // usage, no traces, and a debug subscription that never fires.
+  async getUsage(): Promise<DebugUsage> {
+    return {
+      requests: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      cachedPromptTokens: 0,
+      cacheHitRatio: 0,
+    };
+  }
+
+  async listTraces(): Promise<AgentTrace[]> {
+    return [];
+  }
+
+  subscribeDebug(_groupId: string, _handler: DebugHandler): () => void {
+    return () => {};
   }
 
   private setActive(groupId: string, active: boolean): void {

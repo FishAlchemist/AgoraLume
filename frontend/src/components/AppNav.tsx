@@ -1,6 +1,7 @@
 import {
   ActionIcon,
   Divider,
+  FileButton,
   Group,
   NavLink,
   ScrollArea,
@@ -11,13 +12,17 @@ import {
 import { useDisclosure } from '@mantine/hooks';
 import {
   IconBuildingCommunity,
+  IconDownload,
   IconMessageCircle,
   IconPlus,
   IconSettings,
+  IconUpload,
   IconUsers,
 } from '@tabler/icons-react';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
+import { buildGroupBundle, downloadBundle, parseGroupBundle } from '../lib/transfer';
 import { useWorkspace } from '../store/workspace';
 import { GroupFormModal } from './GroupFormModal';
 
@@ -30,11 +35,34 @@ export function AppNav({ onNavigate }: Props) {
   const navigate = useNavigate();
   const location = useLocation();
   const groups = useWorkspace((s) => s.groups);
+  const personas = useWorkspace((s) => s.personas);
+  const organizations = useWorkspace((s) => s.organizations);
+  const departments = useWorkspace((s) => s.departments);
+  const importGroupBundle = useWorkspace((s) => s.importGroupBundle);
   const [createOpened, createHandlers] = useDisclosure(false);
+  const [notice, setNotice] = useState<{ error: boolean; text: string } | null>(null);
 
   const go = (to: string) => {
     navigate(to);
     onNavigate?.();
+  };
+
+  const exportAllGroups = () => {
+    downloadBundle(
+      buildGroupBundle(groups, personas, organizations, departments),
+      'agoralume-groups.agora.json',
+    );
+  };
+
+  const handleImportGroups = async (file: File | null) => {
+    if (!file) return;
+    setNotice(null);
+    try {
+      const count = importGroupBundle(parseGroupBundle(await file.text()));
+      setNotice({ error: false, text: t('transfer.importedGroups', { count }) });
+    } catch {
+      setNotice({ error: true, text: t('transfer.importFailed') });
+    }
   };
 
   const sections = [
@@ -85,21 +113,57 @@ export function AppNav({ onNavigate }: Props) {
         {onChat && (
           <>
             <Divider />
-            <Group justify="space-between" px="xs">
+            <Group justify="space-between" px="xs" wrap="nowrap">
               <Text size="xs" c="dimmed" tt="uppercase" fw={700}>
                 {t('groups.title')}
               </Text>
-              <Tooltip label={t('groups.add')}>
-                <ActionIcon
-                  size="sm"
-                  variant="subtle"
-                  onClick={createHandlers.open}
-                  aria-label={t('groups.add')}
+              <Group gap={2} wrap="nowrap">
+                <FileButton
+                  accept="application/json,.json"
+                  onChange={(f) => void handleImportGroups(f)}
                 >
-                  <IconPlus size={16} />
-                </ActionIcon>
-              </Tooltip>
+                  {(props) => (
+                    <Tooltip label={t('transfer.importGroups')}>
+                      <ActionIcon
+                        {...props}
+                        size="sm"
+                        variant="subtle"
+                        aria-label={t('transfer.importGroups')}
+                      >
+                        <IconUpload size={16} />
+                      </ActionIcon>
+                    </Tooltip>
+                  )}
+                </FileButton>
+                {groups.length > 0 && (
+                  <Tooltip label={t('transfer.exportGroups')}>
+                    <ActionIcon
+                      size="sm"
+                      variant="subtle"
+                      onClick={exportAllGroups}
+                      aria-label={t('transfer.exportGroups')}
+                    >
+                      <IconDownload size={16} />
+                    </ActionIcon>
+                  </Tooltip>
+                )}
+                <Tooltip label={t('groups.add')}>
+                  <ActionIcon
+                    size="sm"
+                    variant="subtle"
+                    onClick={createHandlers.open}
+                    aria-label={t('groups.add')}
+                  >
+                    <IconPlus size={16} />
+                  </ActionIcon>
+                </Tooltip>
+              </Group>
             </Group>
+            {notice && (
+              <Text size="xs" c={notice.error ? 'red' : 'teal'} px="xs">
+                {notice.text}
+              </Text>
+            )}
             <ScrollArea flex={1}>
               <Stack gap={2}>
                 {groups.length === 0 ? (

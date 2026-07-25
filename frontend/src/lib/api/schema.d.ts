@@ -10,6 +10,14 @@ type XOR<T, U> = (T | U) extends object ? (Without<T, U> & U) | (Without<U, T> &
 type OneOf<T extends any[]> = T extends [infer Only] ? Only : T extends [infer A, infer B, ...infer Rest] ? OneOf<[XOR<A, B>, ...Rest]> : never;
 
 export interface paths {
+  "/debug/usage": {
+    /**
+     * Cumulative LLM usage since startup — the global "total usage" readout:
+     * request count, token breakdown, cache-hit ratio, and an estimated cost when
+     * pricing is configured (always an estimate, for reference only).
+     */
+    get: operations["debug_usage"];
+  };
   "/departments": {
     get: operations["list_depts"];
     post: operations["create_dept"];
@@ -27,6 +35,14 @@ export interface paths {
     get: operations["get_group"];
     delete: operations["delete_group"];
     patch: operations["update_group"];
+  };
+  "/groups/{id}/debug/traces": {
+    /**
+     * Recent agent traces for a group — the exact prompt each character received
+     * and what it decided — for hydrating the debug panel. Live updates then arrive
+     * as `debug` SSE frames on the group stream.
+     */
+    get: operations["debug_traces"];
   };
   "/groups/{id}/events": {
     /**
@@ -50,7 +66,8 @@ export interface paths {
   "/groups/{id}/stream": {
     /**
      * Server-Sent Events for a group: default `message` events (AI replies and
-     * moods) and named `read` events (read receipts).
+     * moods), named `read` events (read receipts), and named `activity` events
+     * (the agent loop turning busy/idle).
      */
     get: operations["stream"];
   };
@@ -97,6 +114,84 @@ export type webhooks = Record<string, never>;
 
 export interface components {
   schemas: {
+    /**
+     * @description A debug record of one agent inference: exactly the system + context the
+     * character's model received, what it decided, and the tokens it cost. Streamed
+     * live as a `debug` SSE frame and available in bulk for panel hydration.
+     */
+    AgentTrace: {
+      /** @description The chosen action: `speak` | `speakWithMood` | `mood` | `read`. */
+      action: string;
+      /** @description The conversation/context text the agent read (the "public" messages). */
+      conversation: string;
+      groupId: string;
+      /** @description The spoken line, when it spoke. */
+      message?: string | null;
+      /** @description The mood, when it showed one. */
+      mood?: string | null;
+      personaId: string;
+      personaName: string;
+      /** @description The full system prompt the agent got (persona + variables + roster). */
+      system: string;
+      /** Format: int64 */
+      ts: number;
+      usage?: null | components["schemas"]["TokenUsage"];
+    };
+    /**
+     * @description An estimated cost breakdown for the accumulated usage. Always an estimate:
+     * rates are operator-supplied and providers/models differ, so the UI labels it
+     * "for reference only".
+     */
+    Cost: {
+      /**
+       * Format: double
+       * @description Cost of cached input tokens.
+       */
+      cachedInput: number;
+      /** @description Currency label the rates are in (e.g. `USD`). */
+      currency: string;
+      /**
+       * Format: double
+       * @description Cost of fresh (non-cached) input tokens.
+       */
+      input: number;
+      /**
+       * Format: double
+       * @description Cost of output tokens.
+       */
+      output: number;
+      /**
+       * Format: double
+       * @description Sum of the above.
+       */
+      total: number;
+    };
+    /**
+     * @description Cumulative LLM usage across the whole server since startup — the global
+     * "total usage" view. `GET /debug/usage`.
+     */
+    DebugUsage: {
+      /**
+       * Format: double
+       * @description Cached prompt tokens ÷ prompt tokens, in `0.0..=1.0`; `0` before any
+       * usage is seen. How much the cache is saving.
+       */
+      cacheHitRatio: number;
+      /** Format: int64 */
+      cachedPromptTokens: number;
+      /** Format: int64 */
+      completionTokens: number;
+      estimatedCost?: null | components["schemas"]["Cost"];
+      /** Format: int64 */
+      promptTokens: number;
+      /**
+       * Format: int64
+       * @description Number of agent inferences (LLM requests in LLM mode).
+       */
+      requests: number;
+      /** Format: int64 */
+      totalTokens: number;
+    };
     /**
      * @description A sub-unit inside an organization; its variables sit between the org's and
      * the persona's in the inheritance chain.
@@ -237,6 +332,35 @@ export interface components {
       nativeLanguage: string;
       uiLanguage: string;
     };
+    /**
+     * @description Token usage for one LLM inference. Zero across the board when the provider
+     * reports nothing; entirely absent (on the trace) for the rule-based mock,
+     * which makes no LLM call.
+     */
+    TokenUsage: {
+      /**
+       * Format: int64
+       * @description Of the prompt tokens, how many were served from the provider's cache —
+       * billed cheaper. The basis for the cache-hit ratio and cache savings.
+       */
+      cachedPromptTokens: number;
+      /**
+       * Format: int64
+       * @description Output ("completion") tokens billed for this call.
+       */
+      completionTokens: number;
+      /**
+       * Format: int64
+       * @description Input ("prompt") tokens billed for this call.
+       */
+      promptTokens: number;
+      /**
+       * Format: int64
+       * @description Total tokens the provider reported (or input+output when it only gives
+       * the two).
+       */
+      totalTokens: number;
+    };
   };
   responses: never;
   parameters: never;
@@ -251,6 +375,21 @@ export type external = Record<string, never>;
 
 export interface operations {
 
+  /**
+   * Cumulative LLM usage since startup — the global "total usage" readout:
+   * request count, token breakdown, cache-hit ratio, and an estimated cost when
+   * pricing is configured (always an estimate, for reference only).
+   */
+  debug_usage: {
+    responses: {
+      /** @description Cumulative LLM usage */
+      200: {
+        content: {
+          "application/json": components["schemas"]["DebugUsage"];
+        };
+      };
+    };
+  };
   list_depts: {
     responses: {
       200: {
@@ -406,6 +545,27 @@ export interface operations {
     };
   };
   /**
+   * Recent agent traces for a group — the exact prompt each character received
+   * and what it decided — for hydrating the debug panel. Live updates then arrive
+   * as `debug` SSE frames on the group stream.
+   */
+  debug_traces: {
+    parameters: {
+      path: {
+        /** @description Group id */
+        id: string;
+      };
+    };
+    responses: {
+      /** @description Recent agent traces, oldest first */
+      200: {
+        content: {
+          "application/json": components["schemas"]["AgentTrace"][];
+        };
+      };
+    };
+  };
+  /**
    * Posts an environment event into a group — rain, time passing, an emergency —
    * letting the world outside the chat influence the agents. Accepted and queued
    * for the group's coordinator; its effect (reactions, moods) arrives on the
@@ -483,7 +643,8 @@ export interface operations {
   };
   /**
    * Server-Sent Events for a group: default `message` events (AI replies and
-   * moods) and named `read` events (read receipts).
+   * moods), named `read` events (read receipts), and named `activity` events
+   * (the agent loop turning busy/idle).
    */
   stream: {
     parameters: {
@@ -493,7 +654,7 @@ export interface operations {
       };
     };
     responses: {
-      /** @description text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt */
+      /** @description text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace */
       200: {
         content: never;
       };

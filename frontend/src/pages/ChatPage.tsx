@@ -12,13 +12,15 @@ import {
   Tooltip,
 } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
-import { IconChevronDown, IconPencil, IconTrash } from '@tabler/icons-react';
+import { IconBug, IconChevronDown, IconDownload, IconPencil, IconTrash } from '@tabler/icons-react';
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ChatView } from '../components/ChatView';
+import { DebugPanel } from '../components/DebugPanel';
 import { GroupFormModal } from '../components/GroupFormModal';
 import { PersonaAvatar } from '../components/PersonaAvatar';
+import { buildGroupBundle, downloadBundle, slugify } from '../lib/transfer';
 import { useUi } from '../store/ui';
 import { useWorkspace } from '../store/workspace';
 import type { Persona } from '../types';
@@ -29,11 +31,14 @@ export function ChatPage() {
   const { groupId } = useParams();
   const groups = useWorkspace((s) => s.groups);
   const personas = useWorkspace((s) => s.personas);
+  const organizations = useWorkspace((s) => s.organizations);
+  const departments = useWorkspace((s) => s.departments);
   const deleteGroup = useWorkspace((s) => s.deleteGroup);
   const updateGroup = useWorkspace((s) => s.updateGroup);
   const openCard = useUi((s) => s.openCard);
   const askConfirm = useUi((s) => s.askConfirm);
   const [editOpened, editHandlers] = useDisclosure(false);
+  const [debugOpen, debugHandlers] = useDisclosure(false);
 
   const group = groups.find((g) => g.id === groupId);
 
@@ -57,6 +62,13 @@ export function ChatPage() {
 
   const userPersonas = personas.filter((p) => p.kind === 'user');
   const selfPersona = personaMap.get(group.selfPersonaId) ?? userPersonas[0] ?? undefined;
+
+  const handleExport = () => {
+    downloadBundle(
+      buildGroupBundle([group], personas, organizations, departments),
+      `${slugify(group.name)}.group.agora.json`,
+    );
+  };
 
   const handleDelete = () => {
     askConfirm({
@@ -135,6 +147,25 @@ export function ChatPage() {
               </Menu.Dropdown>
             </Menu>
           )}
+          <Tooltip label={t('transfer.exportGroup')}>
+            <ActionIcon
+              variant="subtle"
+              onClick={handleExport}
+              aria-label={t('transfer.exportGroup')}
+            >
+              <IconDownload size={18} />
+            </ActionIcon>
+          </Tooltip>
+          <Tooltip label={t('debug.toggle')}>
+            <ActionIcon
+              variant={debugOpen ? 'light' : 'subtle'}
+              color={debugOpen ? 'blue' : 'gray'}
+              onClick={debugHandlers.toggle}
+              aria-label={t('debug.toggle')}
+            >
+              <IconBug size={18} />
+            </ActionIcon>
+          </Tooltip>
           <Tooltip label={t('groups.edit')}>
             <ActionIcon variant="subtle" onClick={editHandlers.open} aria-label={t('groups.edit')}>
               <IconPencil size={18} />
@@ -154,7 +185,12 @@ export function ChatPage() {
       </Group>
 
       <Box flex={1} mih={0}>
-        <ChatView key={group.id} group={group} personas={personaMap} />
+        <Stack h="100%" gap={0}>
+          {debugOpen && <DebugPanel groupId={group.id} personas={personaMap} />}
+          <Box flex={1} mih={0}>
+            <ChatView key={group.id} group={group} personas={personaMap} />
+          </Box>
+        </Stack>
       </Box>
 
       <GroupFormModal opened={editOpened} onClose={editHandlers.close} group={group} />

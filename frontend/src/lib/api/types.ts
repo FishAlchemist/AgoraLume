@@ -15,6 +15,55 @@ export type ReadHandler = (receipt: ReadReceipt) => void;
 /** Turn activity: `true` when the agent loop starts a turn, `false` when idle. */
 export type ActivityHandler = (active: boolean) => void;
 
+/** Token usage for one LLM inference; absent for the mock brain. */
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  /** Prompt tokens served from the provider cache — the basis for cache savings. */
+  cachedPromptTokens: number;
+}
+
+/**
+ * A debug record of one agent inference: the exact system + context the
+ * character's model received, what it decided, and the tokens it cost.
+ */
+export interface AgentTrace {
+  ts: number;
+  groupId: string;
+  personaId: string;
+  personaName: string;
+  system: string;
+  conversation: string;
+  action: string;
+  message?: string;
+  mood?: string;
+  usage?: TokenUsage | null;
+}
+
+export type DebugHandler = (trace: AgentTrace) => void;
+
+/** An estimated cost breakdown; only present when the backend has pricing. */
+export interface Cost {
+  currency: string;
+  input: number;
+  cachedInput: number;
+  output: number;
+  total: number;
+}
+
+/** Cumulative LLM usage since the backend started — the "total usage" readout. */
+export interface DebugUsage {
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedPromptTokens: number;
+  /** Cached ÷ prompt tokens, `0..1`. */
+  cacheHitRatio: number;
+  estimatedCost?: Cost | null;
+}
+
 /**
  * What the data source offers. `mock` means no LLM and no persistence (the
  * in-memory build) — distinct from whether the backend is reachable. The
@@ -75,4 +124,20 @@ export interface ChatApi {
    * unsubscribe function.
    */
   subscribeActivity(groupId: string, handler: ActivityHandler): () => void;
+
+  /** Cumulative LLM usage since the backend started (the debug panel's totals). */
+  getUsage(): Promise<DebugUsage>;
+
+  /**
+   * Recent agent traces for a group — for hydrating the debug panel on open.
+   * Live updates then arrive via {@link subscribeDebug}.
+   */
+  listTraces(groupId: string): Promise<AgentTrace[]>;
+
+  /**
+   * Subscribes to live debug traces for a group: one per agent inference, with
+   * the prompt it saw, its decision, and token usage. Returns an unsubscribe
+   * function. A no-op on the in-browser mock (which makes no LLM calls).
+   */
+  subscribeDebug(groupId: string, handler: DebugHandler): () => void;
 }

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { type WorkspaceSnapshot, workspaceClient } from '../lib/api/workspace';
-import type { PersonaBundle } from '../lib/transfer';
+import type { GroupBundle, PersonaBundle } from '../lib/transfer';
 import type { Department, Group, Organization, Persona, Settings } from '../types';
 import { DEFAULT_USER_PERSONA_ID } from '../types';
 import { useConnection } from './connection';
@@ -36,8 +36,11 @@ interface WorkspaceState extends WorkspaceData {
 
   updateSettings: (patch: Partial<Settings>) => void;
 
-  /** Merges a backup bundle in with fresh ids; returns personas imported. */
+  /** Merges a persona backup bundle in with fresh ids; returns personas imported. */
   importBundle: (bundle: PersonaBundle) => number;
+
+  /** Merges a group backup bundle in with fresh ids; returns groups imported. */
+  importGroupBundle: (bundle: GroupBundle) => number;
 
   /** Re-reads the whole workspace from the connected backend (SSOT). */
   hydrate: () => Promise<void>;
@@ -376,6 +379,69 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
         Promise.all(posts).catch(resync);
       }
       return newPersonas.length;
+    },
+
+    importGroupBundle: (bundle) => {
+      const state = get();
+      const orgIdMap = new Map<string, string>();
+      const deptIdMap = new Map<string, string>();
+      const personaIdMap = new Map<string, string>();
+
+      const newOrgs = bundle.organizations.map((o) => {
+        const id = uid();
+        orgIdMap.set(o.id, id);
+        return { ...o, id };
+      });
+      const newDepartments = bundle.departments.map((d) => {
+        const id = uid();
+        deptIdMap.set(d.id, id);
+        return { ...d, id, organizationId: orgIdMap.get(d.organizationId) ?? d.organizationId };
+      });
+      const newPersonas = bundle.personas
+        .filter((p) => p.kind !== 'user')
+        .map((p) => {
+          const id = uid();
+          personaIdMap.set(p.id, id);
+          return {
+            ...p,
+            id,
+            organizationId: p.organizationId ? orgIdMap.get(p.organizationId) : undefined,
+            departmentId: p.departmentId ? deptIdMap.get(p.departmentId) : undefined,
+          };
+        });
+      // The imported group's "you" is remapped to an existing local identity —
+      // user identities are never carried in a bundle.
+      const fallbackSelf =
+        state.personas.find((p) => p.kind === 'user')?.id ?? DEFAULT_USER_PERSONA_ID;
+      const newGroups = bundle.groups.map((g) => ({
+        ...g,
+        id: uid(),
+        personaIds: g.personaIds
+          .map((pid) => personaIdMap.get(pid))
+          .filter((id): id is string => Boolean(id)),
+        selfPersonaId: fallbackSelf,
+      }));
+
+      set((s) => ({
+        organizations: [...s.organizations, ...newOrgs],
+        departments: [...s.departments, ...newDepartments],
+        personas: [...s.personas, ...newPersonas],
+        groups: [...s.groups, ...newGroups],
+      }));
+
+      const client = backend();
+      if (client) {
+        // Client-generated ids are honoured by the server, so cross-links stay
+        // consistent regardless of insert order.
+        const posts = [
+          ...newOrgs.map((o) => client.createOrganization(o)),
+          ...newDepartments.map((d) => client.createDepartment(d)),
+          ...newPersonas.map((p) => client.createPersona(p)),
+          ...newGroups.map((g) => client.createGroup(g)),
+        ];
+        Promise.all(posts).catch(resync);
+      }
+      return newGroups.length;
     },
 
     hydrate: async () => {
