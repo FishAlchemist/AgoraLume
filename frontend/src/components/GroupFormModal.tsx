@@ -146,7 +146,13 @@ export function GroupFormModal({ opened, onClose, group }: Props) {
         <TextInput
           label={t('groups.name')}
           value={form.name}
-          onChange={(e) => setForm((f) => ({ ...f, name: e.currentTarget.value }))}
+          // Capture the value before the updater runs: React nulls the event's
+          // currentTarget after the handler returns, and the functional update
+          // can run deferred — reading e.currentTarget there would throw.
+          onChange={(e) => {
+            const name = e.currentTarget.value;
+            setForm((f) => ({ ...f, name }));
+          }}
           data-autofocus
         />
 
