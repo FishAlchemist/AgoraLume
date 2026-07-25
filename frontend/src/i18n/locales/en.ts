@@ -110,7 +110,7 @@ export const en = {
   me: {
     title: 'Me',
     subtitle: 'Your own identity — how you appear in every chat.',
-    noBlurb: 'No bio yet.',
+    you: 'You',
     missing: 'No user identity found.',
   },
   avatar: {

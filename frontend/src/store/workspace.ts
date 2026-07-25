@@ -83,7 +83,7 @@ function seedPersonas(): Persona[] {
   return [
     {
       id: DEFAULT_USER_PERSONA_ID,
-      name: 'You',
+      name: 'Alex',
       kind: 'user',
       color: 'gray',
       emoji: '🧑',

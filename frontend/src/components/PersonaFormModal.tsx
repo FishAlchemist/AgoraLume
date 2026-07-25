@@ -14,6 +14,7 @@ import {
 } from '@mantine/core';
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { isNameTaken, MAX_PERSONA_BLURB_LEN, MAX_PERSONA_NAME_LEN } from '../lib/persona';
 import { BUILTIN_VARIABLE_NAMES, resolveSystemPrompt } from '../lib/prompt';
 import { entriesToRecord, recordToEntries, type VarEntry } from '../lib/variables';
 import { useWorkspace } from '../store/workspace';
@@ -46,21 +47,6 @@ interface FormState {
 
 const NO_ORG = '__none__';
 const NO_DEPT = '__none__';
-
-/** The validation message when another persona (any except `exceptId`) already
- * uses `name` — matched case-insensitively and trimmed — else undefined. Names
- * are globally unique. */
-function nameError(
-  personas: Persona[],
-  name: string,
-  exceptId: string | undefined,
-  message: string,
-): string | undefined {
-  const n = name.trim().toLowerCase();
-  if (!n) return undefined;
-  const taken = personas.some((p) => p.id !== exceptId && p.name.trim().toLowerCase() === n);
-  return taken ? message : undefined;
-}
 
 /** Whether `deptId` still belongs to `orgId`, so a department selection survives
  * an organization change. */
@@ -138,9 +124,11 @@ export function PersonaFormModal({ opened, onClose, persona, defaultKind = 'ai' 
     return resolveSystemPrompt(draft, org, department, settings);
   }, [form, org, department, settings, persona?.id]);
 
-  // Names are globally unique (the backend enforces it with a 409, and the agent
-  // lookup tool addresses members by name), so flag a collision before saving.
-  const nameErr = nameError(personas, form.name, persona?.id, t('personas.nameTaken'));
+  // Names are globally unique (the backend enforces it with a 409, and agents
+  // address members by name), so flag a collision before saving.
+  const nameErr = isNameTaken(personas, form.name, persona?.id)
+    ? t('personas.nameTaken')
+    : undefined;
   const canSave = form.name.trim().length > 0 && !nameErr;
 
   const handleSave = () => {
@@ -180,6 +168,7 @@ export function PersonaFormModal({ opened, onClose, persona, defaultKind = 'ai' 
           value={form.name}
           onChange={(e) => set('name', e.currentTarget.value)}
           error={nameErr}
+          maxLength={MAX_PERSONA_NAME_LEN}
           data-autofocus
         />
 
@@ -238,6 +227,7 @@ export function PersonaFormModal({ opened, onClose, persona, defaultKind = 'ai' 
           label={t('personas.blurb')}
           value={form.blurb}
           onChange={(e) => set('blurb', e.currentTarget.value)}
+          maxLength={MAX_PERSONA_BLURB_LEN}
         />
 
         {!isUser && (

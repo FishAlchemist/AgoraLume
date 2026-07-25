@@ -111,7 +111,7 @@ export const zhHant: TranslationSchema = {
   me: {
     title: '個人資訊',
     subtitle: '你自己的身分——在每個聊天中呈現的樣子。',
-    noBlurb: '尚未填寫簡介。',
+    you: '你',
     missing: '找不到使用者身分。',
   },
   avatar: {
