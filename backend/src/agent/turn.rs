@@ -403,8 +403,10 @@ fn assemble_prompt(
     if !roster.is_empty() {
         system.push_str("\n<group_members>\n");
         for member in roster {
-            let you = if member.is_self { " (you)" } else { "" };
-            write_member_line(&mut system, &member.name, you, member.blurb.as_deref());
+            // The human is flagged "(the user)" — never "you", which would read as
+            // the agent itself; "you"/"你" is reserved for the user-facing UI.
+            let marker = if member.is_self { " (the user)" } else { "" };
+            write_member_line(&mut system, &member.name, marker, member.blurb.as_deref());
         }
         system.push_str("</group_members>\n");
     }
@@ -421,8 +423,8 @@ fn assemble_prompt(
     if others.peek().is_some() {
         system.push_str("\n<directory>\n");
         for member in others {
-            let you = if member.is_user { " (you)" } else { "" };
-            write_member_line(&mut system, &member.name, you, member.blurb.as_deref());
+            let marker = if member.is_user { " (the user)" } else { "" };
+            write_member_line(&mut system, &member.name, marker, member.blurb.as_deref());
         }
         system.push_str("</directory>\n");
     }
@@ -640,10 +642,10 @@ mod tests {
             RosterMember { name: "Sol".into(), blurb: None, is_self: false },
         ];
         let prompt = assemble_prompt(&persona, &roster, &[], &[], &[], "");
-        // The user is present and flagged; blurbs render when set, and a member
-        // without one still appears.
+        // The user is present and flagged "(the user)"; blurbs render when set,
+        // and a member without one still appears.
         assert!(prompt.system.contains("<group_members>"));
-        assert!(prompt.system.contains("You (you): Your own voice."));
+        assert!(prompt.system.contains("You (the user): Your own voice."));
         assert!(prompt.system.contains("Nox: Dry strategist."));
         assert!(prompt.system.contains("- Sol\n"));
     }
@@ -666,8 +668,8 @@ mod tests {
         let prompt = assemble_prompt(&persona, &roster, &directory, &[], &[], "");
 
         assert!(prompt.system.contains("<directory>"));
-        // People not in the room are listed, the user flagged.
-        assert!(prompt.system.contains("You (you): Your own voice."));
+        // People not in the room are listed, the user flagged "(the user)".
+        assert!(prompt.system.contains("You (the user): Your own voice."));
         assert!(prompt.system.contains("Nox: Dry strategist."));
         // Someone already in <group_members> isn't repeated in <directory>.
         let directory_section = prompt.system.split("<directory>").nth(1).unwrap();

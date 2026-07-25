@@ -480,12 +480,14 @@ fn seed_departments() -> Vec<Department> {
     ]
 }
 
-/// The single user identity ("you"), created fresh. There is exactly one; a new
-/// install seeds it and a snapshot missing a user restores it.
+/// The single user identity, created fresh. There is exactly one; a new install
+/// seeds it and a snapshot missing a user restores it. Its name defaults to a
+/// plain given name (the user renames it on their profile page) rather than
+/// "You" — the "you"/"你" wording is a UI affordance, not the stored name.
 fn default_user_persona() -> Persona {
     Persona {
         id: DEFAULT_USER_PERSONA_ID.into(),
-        name: "You".into(),
+        name: "Alex".into(),
         kind: PersonaKind::User,
         color: "gray".into(),
         avatar_url: None,
