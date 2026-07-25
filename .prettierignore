@@ -1,0 +1,19 @@
+# Dependencies and build output
+node_modules/
+**/node_modules/
+backend/target/
+frontend/dist/
+dist-bundle/
+
+# Local runtime data
+backend/data/
+
+# Generated — validated by the `contract` CI job, not hand-formatted
+openapi.yml
+frontend/src/lib/api/schema.d.ts
+
+# Lockfile — owned by the package manager
+frontend/pnpm-lock.yaml
+
+# Vendored skill packages — managed via skills-lock.json, not ours to reformat
+.claude/

@@ -1,7 +1,7 @@
 # Multi-Agent Conversation Loop
 
 The engine that drives multiple AI personas talking in a single **text chatroom**.
-It lives in `backend/src/agent/`. This document describes the *shape and intent* of
+It lives in `backend/src/agent/`. This document describes the _shape and intent_ of
 the design; the code is the source of truth for every type, field, and constant.
 
 > It is a text chatroom, not a face-to-face conversation. Moods are a UI concern
@@ -9,7 +9,7 @@ the design; the code is the source of truth for every type, field, and constant.
 
 The loop has three parts:
 
-- **Global Loop** — per user message or environment event, run one *turn*.
+- **Global Loop** — per user message or environment event, run one _turn_.
 - **Agent Local Loop** — within a turn, each agent decides once.
 - **Event & Salience** — one appraisal deciding how any incoming event interrupts.
 
@@ -21,16 +21,16 @@ Code map: `brain.rs` (the seam), `event.rs` (events + salience), `mock.rs`
 
 ## Design decisions
 
-These are the *why* behind the mechanism — the part not recoverable from the code.
+These are the _why_ behind the mechanism — the part not recoverable from the code.
 
-| # | Topic | Decision |
-|---|-------|----------|
-| 1 | **Termination** | A hard round budget. One message/event triggers a turn; a turn scans at most `max_rounds` rounds (default **1**). A round continues only if at least one agent spoke *and* `round < max_rounds`; a fully-silent round ends the turn. Upper bound `max_rounds × N` inferences — no infinite chatter, no "stuck" appearance, no runaway cost. |
-| 2 | **Serial, not parallel** | No parallelism and no pre-computed priority queue. Members are **shuffled** each round and called **one by one**; each agent reads the context already updated by earlier speakers, so it converges naturally without re-runs. |
-| 3 | **Willingness is free** | "Whether to speak" and "what to say" are the *same* single inference. There is no separate willingness pass — exactly one inference per agent per slot. |
-| 4 | **Hard interrupt discards** | A preempted agent's output is dropped entirely; nothing is committed to context. A half-formed answer is neither known in full nor clean, so it is not kept. |
-| 5 | **One salience entry point** | A single `appraise(event) → Hard \| Soft \| Ignore`. Message conflict and environment-event interruption are the same judgement. |
-| 6 | **Moods are UI-only** | Other agents' context never contains moods — deliberate, because this is a text chatroom. |
+| #   | Topic                        | Decision                                                                                                                                                                                                                                                                                                                                    |
+| --- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Termination**              | A hard round budget. One message/event triggers a turn; a turn scans at most `max_rounds` rounds (default **1**). A round continues only if at least one agent spoke _and_ `round < max_rounds`; a fully-silent round ends the turn. Upper bound `max_rounds × N` inferences — no infinite chatter, no "stuck" appearance, no runaway cost. |
+| 2   | **Serial, not parallel**     | No parallelism and no pre-computed priority queue. Members are **shuffled** each round and called **one by one**; each agent reads the context already updated by earlier speakers, so it converges naturally without re-runs.                                                                                                              |
+| 3   | **Willingness is free**      | "Whether to speak" and "what to say" are the _same_ single inference. There is no separate willingness pass — exactly one inference per agent per slot.                                                                                                                                                                                     |
+| 4   | **Hard interrupt discards**  | A preempted agent's output is dropped entirely; nothing is committed to context. A half-formed answer is neither known in full nor clean, so it is not kept.                                                                                                                                                                                |
+| 5   | **One salience entry point** | A single `appraise(event) → Hard \| Soft \| Ignore`. Message conflict and environment-event interruption are the same judgement.                                                                                                                                                                                                            |
+| 6   | **Moods are UI-only**        | Other agents' context never contains moods — deliberate, because this is a text chatroom.                                                                                                                                                                                                                                                   |
 
 ---
 
@@ -69,12 +69,12 @@ Each agent runs **once** per slot and expresses exactly one of four actions.
 
 The four actions and where each lands:
 
-| Action | Context Stream | UI View |
-|--------|:--------------:|:-------:|
-| `speak` | message | bubble |
-| `speak_with_mood` | message | bubble + mood |
-| `mood` | — | mood only |
-| `read` | — | — |
+| Action            | Context Stream |    UI View    |
+| ----------------- | :------------: | :-----------: |
+| `speak`           |    message     |    bubble     |
+| `speak_with_mood` |    message     | bubble + mood |
+| `mood`            |       —        |   mood only   |
+| `read`            |       —        |       —       |
 
 The `respond` tool is the entire brain output surface. Its exact fields are the
 `Respond` type in `brain.rs`; do not restate them here.
@@ -93,7 +93,7 @@ event (rain, time passing, an emergency):
   the context at the next agent boundary, balancing throughput and realism.
 - **Ignore** — not salient; dropped.
 
-Interrupt correctness is subtle: a soft event must *not* drop the running future,
+Interrupt correctness is subtle: a soft event must _not_ drop the running future,
 only a hard one does. The exact race lives in `turn.rs::run_turn`; the invariant is
 covered by unit tests.
 
@@ -103,7 +103,7 @@ covered by unit tests.
 
 Information is deliberately segregated:
 
-- **Context Stream** — server-internal, `message`-only. *Not* a network stream: it
+- **Context Stream** — server-internal, `message`-only. _Not_ a network stream: it
   is the filtered history used to build each agent's prompt. Moods and read receipts
   are excluded, keeping context maximally clean.
 - **UI View Stream** — the outward SSE feed (`message` + mood), rendering bubbles
@@ -118,7 +118,7 @@ Information is deliberately segregated:
 
 ## Testing without an LLM
 
-The whole loop is orchestration *except* the single inference in step 3, so the
+The whole loop is orchestration _except_ the single inference in step 3, so the
 entire loop is deterministically testable behind two injection seams:
 
 1. **`AgentBrain`** — the only seam a real LLM replaces. The bundled `RuleBrain`

@@ -1,0 +1,137 @@
+name: CI
+
+# Runs every quality gate we use by hand: the backend's clippy + tests, the
+# frontend's Biome + type-check/build, a prose formatting check, and a
+# contract-drift check that the committed openapi.yml and generated types
+# still match the backend.
+#
+# Only first-party actions are used — GitHub's own actions/* and pnpm's own
+# action-setup; Rust is installed with the pre-bundled rustup (rust-lang's
+# official installer) rather than a community toolchain action. Each action is
+# pinned to a full commit SHA so a retagged or compromised release can't
+# silently enter CI; the trailing comment records the version each SHA is.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch/PR cancels the older, still-running CI.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (clippy + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # rustup ships preinstalled on the runner; install/select stable + clippy
+      # explicitly so the toolchain is deterministic rather than whatever the
+      # image happens to carry.
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            backend/target/
+          key: ${{ runner.os }}-cargo-backend-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-backend-
+      # -D warnings turns every lint into an error, matching our "keep clippy
+      # clean, refactor rather than #[allow]" discipline.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+
+  frontend:
+    name: Frontend (biome + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.17.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Biome check
+        run: pnpm check
+      # build = tsc --noEmit && vite build, so this is both the type gate and
+      # the production build.
+      - name: Type-check and build
+        run: pnpm build
+
+  format:
+    name: Format (prettier — markdown + yaml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      # Prettier covers what Biome doesn't: Markdown and YAML. The version is
+      # pinned so CI can't drift onto a formatting change (or a bad release)
+      # from an unpinned `npx prettier`.
+      - name: Prettier check
+        run: npx --yes prettier@3.9.6 --check "**/*.{md,yml,yaml}"
+
+  contract:
+    name: Contract (openapi drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            backend/target/
+          key: ${{ runner.os }}-cargo-contract-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-contract-
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.17.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install frontend deps
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      # Regenerate the spec from the backend and the TS types from the spec,
+      # then fail if either differs from what's committed — the contract must
+      # be regenerated in the same change that alters it.
+      - name: Regenerate contract
+        working-directory: frontend
+        run: pnpm gen:api
+      - name: Check for drift
+        run: |
+          if ! git diff --exit-code -- openapi.yml frontend/src/lib/api/schema.d.ts; then
+            echo "::error::openapi.yml or schema.d.ts is out of date. Run 'pnpm gen:api' in frontend/ and commit the result."
+            exit 1
+          fi

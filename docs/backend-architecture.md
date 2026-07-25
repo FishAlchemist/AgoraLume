@@ -13,12 +13,12 @@ Rust source. This document does not restate them.
 - **The API is production-grade; only the data behind it is provisional.** This
   build uses an in-memory store and a simulated (non-LLM) agent brain. Swapping in
   a database or a real LLM does not change the API surface. "Mock/simulated" applies
-  to the *data layer*, never the API.
+  to the _data layer_, never the API.
 
 ## Tech stack
 
 - **axum** — HTTP routing and extractors.
-- **utoipa** + **utoipa-axum** — OpenAPI is generated *from the code* (route macros
+- **utoipa** + **utoipa-axum** — OpenAPI is generated _from the code_ (route macros
   and `ToSchema` derives). `cargo run -- --dump-openapi` writes `openapi.yml`, which
   the frontend's type generation consumes. Never hand-edit `openapi.yml`.
 - **tokio** — async runtime; `broadcast` for SSE fan-out, `mpsc` for per-group
@@ -30,15 +30,15 @@ Rust source. This document does not restate them.
 
 Each file owns one concern; follow the link into the code for detail.
 
-| Module | Owns |
-|--------|------|
-| `main.rs` | Process entry, tracing, `--dump-openapi` one-shot, server bind. |
-| `config.rs` | Environment-driven configuration (bind address, data dir, LLM). Loads a `.env` beside the executable (or the working dir in dev) at startup, so a bundle is configured with a file rather than shell exports; real env vars still win. |
-| `models.rs` | Wire types: `Message` (conversation / mood), `ReadReceipt`, `ServerMeta`. |
-| `workspace.rs` | The SSOT: personas, groups, memberships; persona/variable resolution with org→dept→persona inheritance. |
-| `state.rs` | In-memory `AppState`: workspace, per-group message logs, per-group SSE broadcast channels, per-group coordinators, and the agent runtime. |
-| `routes/` | HTTP surface. `chat.rs` holds the endpoints; `mod.rs` composes the router and the OpenAPI document. |
-| `agent/` | The multi-agent conversation engine — see [agent-loop.md](./agent-loop.md). |
+| Module         | Owns                                                                                                                                                                                                                                   |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.rs`      | Process entry, tracing, `--dump-openapi` one-shot, server bind.                                                                                                                                                                        |
+| `config.rs`    | Environment-driven configuration (bind address, data dir, LLM). Loads a `.env` beside the executable (or the working dir in dev) at startup, so a bundle is configured with a file rather than shell exports; real env vars still win. |
+| `models.rs`    | Wire types: `Message` (conversation / mood), `ReadReceipt`, `ServerMeta`.                                                                                                                                                              |
+| `workspace.rs` | The SSOT: personas, groups, memberships; persona/variable resolution with org→dept→persona inheritance.                                                                                                                                |
+| `state.rs`     | In-memory `AppState`: workspace, per-group message logs, per-group SSE broadcast channels, per-group coordinators, and the agent runtime.                                                                                              |
+| `routes/`      | HTTP surface. `chat.rs` holds the endpoints; `mod.rs` composes the router and the OpenAPI document.                                                                                                                                    |
+| `agent/`       | The multi-agent conversation engine — see [agent-loop.md](./agent-loop.md).                                                                                                                                                            |
 
 ## Data flow
 
@@ -82,7 +82,7 @@ Key properties:
 
 ## The one seam that matters
 
-Everything above is production orchestration. The *only* component a real LLM
+Everything above is production orchestration. The _only_ component a real LLM
 replaces is the `AgentBrain` trait (`agent/brain.rs`): a pure prompt → decision
 function. The orchestrator owns all context assembly, so swapping the bundled rule
 brain (`agent/mock.rs`) for the LLM brain (`agent/llm.rs`) changes nothing else.
