@@ -203,7 +203,14 @@ struct ActivityFrame {
         description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace")))]
 async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     let receiver = state.channel(&id).subscribe();
-    let events = BroadcastStream::new(receiver).filter_map(to_sse_event);
+    let live = BroadcastStream::new(receiver).filter_map(to_sse_event);
+    // Emit a comment the instant the client subscribes. Without an initial byte
+    // the response body stays empty until the first keep-alive (~15s), and a
+    // buffering reverse proxy (Vite's dev proxy, nginx, …) holds the response
+    // head until then — so EventSource would stall on open. A comment line is
+    // ignored by every SSE client, so this only affects flush timing.
+    let opened = tokio_stream::once(Ok::<Event, Infallible>(Event::default().comment("open")));
+    let events = opened.chain(live);
     Sse::new(events).keep_alive(KeepAlive::default())
 }
 
