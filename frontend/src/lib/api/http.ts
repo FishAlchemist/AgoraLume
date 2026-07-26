@@ -32,6 +32,8 @@ interface GroupStream {
   debug: Set<DebugHandler>;
   /** Pending close from a grace period; cleared if a subscriber returns first. */
   closeTimer?: ReturnType<typeof setTimeout>;
+  /** Set once the stream has connected; a later `open` event means a reconnect. */
+  connected?: boolean;
 }
 
 /** How long an idle group stream lingers before closing (see {@link SharedStreams}). */
@@ -112,8 +114,40 @@ class SharedStreams {
       const data = parseFrame<AgentTrace>(e.data);
       if (data) for (const h of stream.debug) h(data);
     });
+    source.onopen = () => {
+      // The first `open` is the initial connect — the caller (ChatView's effect)
+      // has already loaded history, so nothing to do. Every later `open` is a
+      // reconnect after a drop, common through a tunnel, and the stream missed
+      // whatever was broadcast while it was down (the channel keeps no backlog).
+      // Reconcile so the UI heals on its own instead of needing a page refresh.
+      if (stream.connected) this.resync(groupId, stream);
+      else stream.connected = true;
+    };
     this.byGroup.set(groupId, stream);
     return stream;
+  }
+
+  /**
+   * Refetches a group's messages after a reconnect and replays them through the
+   * live message handlers. The existing merge (dedupe by id) drops anything the
+   * client already has and adds what it missed; read receipts ride along on each
+   * message's `readBy`, so missed reads heal too. Best-effort — a failure just
+   * waits for the next reconnect.
+   */
+  private resync(groupId: string, stream: GroupStream): void {
+    void fetch(`${this.baseUrl}/groups/${groupId}/messages`, {
+      headers: { Accept: 'application/json' },
+    })
+      .then((res) => (res.ok ? (res.json() as Promise<Message[]>) : null))
+      .then((messages) => {
+        if (!messages) return;
+        for (const message of messages) {
+          for (const handler of stream.message) handler(message);
+        }
+      })
+      .catch(() => {
+        // Offline / transient — the next reconnect reconciles again.
+      });
   }
 
   /** Removes one handler, then closes the stream (after a grace period) if idle. */
