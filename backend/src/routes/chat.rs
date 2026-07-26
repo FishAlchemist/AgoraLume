@@ -220,6 +220,8 @@ struct ActivityFrame {
     responses((status = 200,
         description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace")))]
 async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
+    // Subscribe before reading the activity flag: any change that races this
+    // arrives on `live` afterwards, so the seed can only be stale, never lost.
     let receiver = state.channel(&id).subscribe();
     let live = BroadcastStream::new(receiver).filter_map(to_sse_event);
     // Emit a comment the instant the client subscribes. Without an initial byte
@@ -228,7 +230,12 @@ async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> i
     // head until then — so EventSource would stall on open. A comment line is
     // ignored by every SSE client, so this only affects flush timing.
     let opened = tokio_stream::once(Ok::<Event, Infallible>(Event::default().comment("open")));
-    let events = opened.chain(live);
+    // Seed the just-connected client with the current turn activity, reusing the
+    // same serialization as live frames. A reconnect (common through a tunnel)
+    // missed the `activity` frames broadcast while it was down, so without this
+    // its composer lock could stay stuck until a manual refresh.
+    let seed = tokio_stream::iter(to_sse_event(Ok(StreamEvent::Activity(state.is_active(&id)))));
+    let events = opened.chain(seed).chain(live);
     Sse::new(events).keep_alive(KeepAlive::default())
 }
 

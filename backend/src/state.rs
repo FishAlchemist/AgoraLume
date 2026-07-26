@@ -87,6 +87,10 @@ pub struct AppState {
     /// load lazily on first touch; this marks the ones already pulled in so a
     /// second access doesn't re-read (and clobber in-memory) the file.
     loaded_groups: Mutex<HashSet<String>>,
+    /// Group ids whose coordinator is currently running a turn. A stream reads
+    /// this on (re)connect to seed the composer lock, so a reconnect that missed
+    /// the broadcast `activity` frames still recovers the right state.
+    active_groups: Mutex<HashSet<String>>,
     /// LLM usage counters and recent traces for the debug panel.
     debug: Mutex<DebugState>,
     /// Token pricing for the estimated-cost readout, or `None` to show tokens
@@ -128,6 +132,7 @@ impl AppState {
             coordinators: Mutex::new(HashMap::new()),
             persistence,
             loaded_groups: Mutex::new(HashSet::new()),
+            active_groups: Mutex::new(HashSet::new()),
             debug: Mutex::new(DebugState::default()),
             pricing: None,
         }
@@ -300,11 +305,28 @@ impl AppState {
         self.persist_messages(group_id);
     }
 
-    /// Broadcasts whether the group's coordinator is actively running a turn.
-    /// The frontend keeps the composer locked while active so users send only
-    /// when the loop is idle.
+    /// Records and broadcasts whether the group's coordinator is actively running
+    /// a turn. The frontend keeps the composer locked while active so users send
+    /// only when the loop is idle. The recorded flag lets a stream that connects
+    /// (or reconnects) mid-turn seed its lock from [`is_active`].
     pub fn set_active(&self, group_id: &str, active: bool) {
+        {
+            let mut groups = self.active_groups.lock().unwrap();
+            if active {
+                groups.insert(group_id.to_string());
+            } else {
+                groups.remove(group_id);
+            }
+        }
         let _ = self.channel(group_id).send(StreamEvent::Activity(active));
+    }
+
+    /// Whether the group's coordinator is currently running a turn. A stream
+    /// seeds the composer lock with this on connect, so a reconnect (common
+    /// through a tunnel) that missed the broadcast `activity` frames recovers the
+    /// correct lock state without a page refresh.
+    pub fn is_active(&self, group_id: &str) -> bool {
+        self.active_groups.lock().unwrap().contains(group_id)
     }
 
     /// Appends a message and broadcasts it to live subscribers.
