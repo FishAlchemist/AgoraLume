@@ -342,6 +342,22 @@ impl AppState {
             persona_id: persona_id.to_string(),
         }));
     }
+
+    /// Whether an AI persona has already read a given message. Drives the resume
+    /// sweep: an agent whose inference failed never marked the trigger read, so
+    /// "not read" is exactly the set of agents a retry re-runs.
+    pub fn has_read(&self, group_id: &str, message_id: &str, persona_id: &str) -> bool {
+        self.ensure_loaded(group_id);
+        let store = self.messages.lock().unwrap();
+        let Some(list) = store.get(group_id) else {
+            return false;
+        };
+        matches!(
+            list.iter().find(|m| m.id() == message_id),
+            Some(Message::Conversation { read_by: Some(readers), .. })
+                if readers.iter().any(|id| id == persona_id)
+        )
+    }
 }
 
 /// Opening history so a freshly pointed-at backend shows content immediately.

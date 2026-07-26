@@ -1,8 +1,8 @@
-import { Badge, Group, HoverCard, Paper, Stack, Text } from '@mantine/core';
-import { IconChecks } from '@tabler/icons-react';
+import { Badge, Button, Group, HoverCard, Paper, Stack, Text } from '@mantine/core';
+import { IconAlertTriangle, IconChecks, IconRefresh } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { useUi } from '../store/ui';
-import type { Message, Persona } from '../types';
+import type { Message, Persona, SystemMessage } from '../types';
 import { PersonaAvatar } from './PersonaAvatar';
 
 interface Props {
@@ -15,6 +15,10 @@ interface Props {
   aiMembers: Persona[];
   /** AI ids that replied to this message (a subset of those who read it). */
   repliedBy?: string[];
+  /** Resumes a suspended turn; only wired for a `system` error message. */
+  onRetry?: () => void;
+  /** Whether the retry button is actionable (this error is the latest, loop idle). */
+  canRetry?: boolean;
 }
 
 /** Short clock time (e.g. "15:30") for the message header, in the UI locale. */
@@ -22,12 +26,27 @@ function formatTime(ts: number, locale: string): string {
   return new Date(ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
 }
 
-export function MessageItem({ message, persona, isSelf, fontSize, aiMembers, repliedBy }: Props) {
+export function MessageItem({
+  message,
+  persona,
+  isSelf,
+  fontSize,
+  aiMembers,
+  repliedBy,
+  onRetry,
+  canRetry,
+}: Props) {
   const { t, i18n } = useTranslation();
   const openCard = useUi((s) => s.openCard);
   // Short time shown inline; the full local date-time is on hover (title).
   const time = formatTime(message.ts, i18n.language);
   const fullTime = new Date(message.ts).toLocaleString(i18n.language);
+
+  if (message.kind === 'system') {
+    return (
+      <SystemNotice message={message} persona={persona} onRetry={onRetry} canRetry={canRetry} />
+    );
+  }
 
   if (message.kind === 'mood') {
     return (
@@ -103,6 +122,62 @@ export function MessageItem({ message, persona, isSelf, fontSize, aiMembers, rep
         )}
       </Stack>
       {isSelf && <PersonaAvatar persona={persona} onClick={() => openCard(persona.id)} />}
+    </Group>
+  );
+}
+
+interface SystemNoticeProps {
+  message: SystemMessage;
+  persona: Persona;
+  onRetry?: () => void;
+  canRetry?: boolean;
+}
+
+/**
+ * A failed-inference notice: the persona that failed, the sanitized HTTP status
+ * + reason (never the provider body), and a retry button that resumes the
+ * suspended turn while this error is still the latest line.
+ */
+function SystemNotice({ message, persona, onRetry, canRetry }: SystemNoticeProps) {
+  const { t, i18n } = useTranslation();
+  const detail = message.status ? `HTTP ${message.status} · ${message.reason}` : message.reason;
+  const fullTime = new Date(message.ts).toLocaleString(i18n.language);
+  return (
+    <Group justify="center" my={6}>
+      <Paper
+        px="md"
+        py={8}
+        radius="md"
+        withBorder
+        style={{
+          borderColor: 'var(--mantine-color-red-4)',
+          background: 'color-mix(in srgb, var(--mantine-color-red-6) 8%, transparent)',
+          maxWidth: 'min(90%, 520px)',
+        }}
+      >
+        <Group gap="sm" wrap="nowrap" align="center">
+          <IconAlertTriangle size={18} color="var(--mantine-color-red-6)" aria-hidden />
+          <Stack gap={0}>
+            <Text size="sm" fw={600}>
+              {t('chat.errorReplyFailed', { name: persona.name })}
+            </Text>
+            <Text size="xs" c="dimmed" title={fullTime}>
+              {detail}
+            </Text>
+          </Stack>
+          {onRetry && canRetry && (
+            <Button
+              size="xs"
+              variant="light"
+              color="red"
+              leftSection={<IconRefresh size={14} />}
+              onClick={onRetry}
+            >
+              {t('chat.retry')}
+            </Button>
+          )}
+        </Group>
+      </Paper>
     </Group>
   );
 }

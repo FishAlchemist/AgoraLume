@@ -104,6 +104,14 @@ export interface ChatApi {
   sendMessage(groupId: string, text: string, personaId?: string): Promise<Message>;
 
   /**
+   * Resumes a turn suspended by a failed agent inference: the agents that have
+   * not yet read the pending message respond to the current chat. A no-op when
+   * nothing is suspended (e.g. the pending turn was voided by a newer message).
+   * A no-op on the in-browser mock, whose rule brain never fails.
+   */
+  retry(groupId: string): Promise<void>;
+
+  /**
    * Subscribes to messages the backend pushes for a group (AI replies, mood
    * updates). Returns an unsubscribe function. The HTTP implementation backs
    * this with Server-Sent Events.

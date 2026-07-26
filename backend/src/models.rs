@@ -167,6 +167,23 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// A system notice that an agent's inference failed after exhausting retries.
+    /// Surfaces the HTTP status and canonical reason only — never the provider's
+    /// raw body, which can leak quota or key details. `personaId` is the agent
+    /// that failed. The frontend renders it as an error line with a retry button.
+    #[serde(rename_all = "camelCase")]
+    System {
+        id: String,
+        group_id: String,
+        persona_id: String,
+        ts: i64,
+        /// The HTTP status code, when the failure carried one (e.g. 429).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        /// The status's canonical reason (e.g. "Too Many Requests"), or a short
+        /// generic label for a transport failure with no status.
+        reason: String,
+    },
 }
 
 impl Message {
@@ -205,10 +222,29 @@ impl Message {
         }
     }
 
+    /// A fresh system notice for a failed agent inference.
+    pub fn system(
+        group_id: impl Into<String>,
+        persona_id: impl Into<String>,
+        status: Option<u16>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Message::System {
+            id: next_id(),
+            group_id: group_id.into(),
+            persona_id: persona_id.into(),
+            ts: now_ms(),
+            status,
+            reason: reason.into(),
+        }
+    }
+
     /// The stable id used to look a message up in a group's log.
     pub fn id(&self) -> &str {
         match self {
-            Message::Conversation { id, .. } | Message::Mood { id, .. } => id,
+            Message::Conversation { id, .. }
+            | Message::Mood { id, .. }
+            | Message::System { id, .. } => id,
         }
     }
 }

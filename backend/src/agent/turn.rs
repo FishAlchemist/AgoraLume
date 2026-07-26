@@ -16,7 +16,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::brain::{
-    Action, AgentBrain, AgentPersona, AgentPrompt, Decision, MemberInfo, Respond,
+    Action, AgentBrain, AgentPersona, AgentPrompt, BrainError, Decision, MemberInfo, Outcome,
+    Respond,
 };
 use crate::agent::event::{Event, Salience, appraise};
 use crate::agent::mock::RuleBrain;
@@ -77,22 +78,48 @@ enum TurnOutcome {
     Done,
     /// A hard event preempted the turn; the coordinator restarts with it.
     Preempted(Event),
+    /// An agent's inference failed; the turn stops at that agent and its trigger
+    /// is held so a manual retry can resume the agents that haven't yet read it.
+    Suspended(Event),
 }
 
 /// A group's coordinator task: it owns the command channel and runs turns one at
 /// a time, so there is never more than one turn in flight per group. A hard
 /// interrupt returns here and immediately re-runs with the preempting event.
 pub async fn coordinator_loop(state: Arc<AppState>, group_id: String, mut rx: mpsc::Receiver<Event>) {
+    // The trigger of a turn suspended by a failed inference, held while the loop
+    // is idle so a manual retry can resume it. Any fresh trigger clears it, which
+    // is exactly the "once you send a message you can't retry" rule.
+    let mut pending: Option<Event> = None;
     while let Some(event) = rx.recv().await {
+        // Resolve the incoming event into the turn to run: a retry resumes the
+        // pending trigger (or is dropped if there is none); anything else is a
+        // fresh trigger that voids any pending retry.
+        let (mut trigger, mut resuming) = match event {
+            Event::Retry => match pending.take() {
+                Some(t) => (t, true),
+                None => continue,
+            },
+            other => {
+                pending = None;
+                (other, false)
+            }
+        };
         // The loop is busy for the whole turn (including any hard-interrupt
         // restarts); it goes idle only once fully done. The composer gates on
         // this so a new user message can't interleave with a running turn.
         state.set_active(&group_id, true);
-        let mut trigger = event;
         loop {
-            match run_turn(&state, &group_id, trigger, &mut rx).await {
+            match run_turn(&state, &group_id, trigger, resuming, &mut rx).await {
                 TurnOutcome::Done => break,
-                TurnOutcome::Preempted(next) => trigger = next,
+                TurnOutcome::Preempted(next) => {
+                    trigger = next;
+                    resuming = false;
+                }
+                TurnOutcome::Suspended(t) => {
+                    pending = Some(t);
+                    break;
+                }
             }
         }
         state.set_active(&group_id, false);
@@ -102,10 +129,16 @@ pub async fn coordinator_loop(state: Arc<AppState>, group_id: String, mut rx: mp
 /// Runs one turn for a group. `rx` is watched throughout so events arriving
 /// mid-turn are appraised: hard ones preempt (returning `Preempted`), soft ones
 /// are folded into the context at the next member boundary.
+///
+/// When `resuming` is true this is a manual retry of a suspended turn: each
+/// round's members are filtered to those that have *not* yet read the trigger
+/// message, so agents that already responded aren't re-run. A fresh turn
+/// (`resuming` false) runs every member, leaving multi-round behavior intact.
 async fn run_turn(
     state: &AppState,
     group_id: &str,
     trigger: Event,
+    resuming: bool,
     rx: &mut mpsc::Receiver<Event>,
 ) -> TurnOutcome {
     let runtime = &state.runtime;
@@ -114,7 +147,7 @@ async fn run_turn(
     // The user's line every agent marks as read this turn (unlocks the composer).
     let read_target = match &trigger {
         Event::User { message_id, .. } => Some(message_id.clone()),
-        Event::Environment { .. } => None,
+        Event::Environment { .. } | Event::Retry => None,
     };
 
     // Events already folded into the context all agents can see. An environment
@@ -131,10 +164,18 @@ async fn run_turn(
         let Some((_self_id, member_ids)) = state.workspace().turn_members(group_id) else {
             return TurnOutcome::Done;
         };
-        if member_ids.is_empty() {
+        let mut order = member_ids;
+        // On a resume, re-run only the agents that have not yet read the pending
+        // message — those who already responded (or read silently) are skipped,
+        // so a retry picks up exactly where the failure left off.
+        if resuming
+            && let Some(target) = &read_target
+        {
+            order.retain(|persona_id| !state.has_read(group_id, target, persona_id));
+        }
+        if order.is_empty() {
             return TurnOutcome::Done;
         }
-        let mut order = member_ids;
         shuffle(&mut order, &mut rng);
 
         // The roster (who's in the room, incl. the user) is fixed for the round;
@@ -199,7 +240,33 @@ async fn run_turn(
                 }
             };
 
-            let Decision { respond, usage } = decision;
+            let Decision { outcome, usage } = decision;
+
+            // A failed inference is not a silent read: record it, surface a
+            // sanitized notice to the chat, and suspend the turn at this agent
+            // (leaving it *unread*) so a manual retry resumes from here.
+            let respond = match outcome {
+                Outcome::Responded(respond) => respond,
+                Outcome::Failed(error) => {
+                    state.record_trace(
+                        group_id,
+                        AgentTrace {
+                            ts: now_ms(),
+                            group_id: group_id.to_string(),
+                            persona_id: persona_id.clone(),
+                            persona_name: persona.name.clone(),
+                            system: prompt.system.clone(),
+                            conversation: prompt.conversation.clone(),
+                            action: "error".to_string(),
+                            message: Some(error.reason.clone()),
+                            mood: None,
+                            usage,
+                        },
+                    );
+                    emit_error(state, group_id, &persona_id, error);
+                    return TurnOutcome::Suspended(trigger);
+                }
+            };
             let Respond { action, message, mood } = respond;
 
             // Record exactly what this agent saw and decided (plus token cost),
@@ -286,6 +353,13 @@ fn emit_mood(state: &AppState, group_id: &str, persona_id: &str, mood: String) {
     state.emit(group_id, Message::mood(group_id, persona_id, mood, None));
 }
 
+/// Emits a system error notice to the group after an agent's inference failed —
+/// the sanitized status + reason only, never the provider body. Like a mood, it
+/// is UI-only and never enters the Context other agents read.
+fn emit_error(state: &AppState, group_id: &str, persona_id: &str, error: BrainError) {
+    state.emit(group_id, Message::system(group_id, persona_id, error.status, error.reason));
+}
+
 /// Cosmetic pacing between a mood and its message.
 async fn pace(cfg: &LoopConfig) {
     if cfg.pace_ms > 0 {
@@ -315,7 +389,9 @@ fn build_transcript(state: &AppState, group_id: &str) -> Vec<ContextLine> {
                     workspace.persona(&persona_id).map_or(persona_id, |p| p.name);
                 Some(ContextLine { name, text, ts })
             }
-            Message::Mood { .. } => None,
+            // Moods and system error notices are UI-only; agents reason over
+            // spoken lines alone.
+            Message::Mood { .. } | Message::System { .. } => None,
         })
         .collect()
 }
@@ -564,7 +640,7 @@ mod tests {
     /// channel never closes mid-turn).
     async fn run_once(state: &AppState, group: &str, trigger: Event) -> TurnOutcome {
         let (_tx, mut rx) = mpsc::channel::<Event>(8);
-        run_turn(state, group, trigger, &mut rx).await
+        run_turn(state, group, trigger, false, &mut rx).await
     }
 
     /// Counts how many times it is asked to decide (to prove round bounds).
@@ -604,6 +680,61 @@ mod tests {
             self.release.notified().await;
             Respond::speak("late").into()
         }
+    }
+
+    /// Always fails with a 429, to exercise the suspend-on-failure path.
+    struct FailingBrain;
+    #[async_trait]
+    impl AgentBrain for FailingBrain {
+        async fn decide(&self, _prompt: &AgentPrompt) -> Decision {
+            Decision {
+                outcome: Outcome::Failed(BrainError {
+                    status: Some(429),
+                    reason: "Too Many Requests".into(),
+                }),
+                usage: None,
+            }
+        }
+    }
+
+    /// A scripted brain: the 1st agent speaks, the 2nd fails (suspending the
+    /// turn), and every later call speaks. Drives the resume test — the retry must
+    /// re-run only the agent that failed, not the one that already spoke.
+    struct ScriptedBrain {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl AgentBrain for ScriptedBrain {
+        async fn decide(&self, _prompt: &AgentPrompt) -> Decision {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Respond::speak("first").into(),
+                1 => Decision {
+                    outcome: Outcome::Failed(BrainError {
+                        status: Some(429),
+                        reason: "Too Many Requests".into(),
+                    }),
+                    usage: None,
+                },
+                _ => Respond::speak("resumed").into(),
+            }
+        }
+    }
+
+    /// The AI persona ids that have read a given message.
+    fn readers(state: &AppState, group: &str, message_id: &str) -> Vec<String> {
+        state
+            .list(group)
+            .into_iter()
+            .find_map(|m| match m {
+                Message::Conversation { id, read_by, .. } if id == message_id => read_by,
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// How many system (error) notices a group's log holds.
+    fn system_count(state: &AppState, group: &str) -> usize {
+        state.list(group).iter().filter(|m| matches!(m, Message::System { .. })).count()
     }
 
     #[tokio::test]
@@ -654,6 +785,57 @@ mod tests {
         }
         assert_eq!(messages, 0);
         assert_eq!(reads, 2);
+    }
+
+    #[tokio::test]
+    async fn failed_inference_suspends_without_marking_read() {
+        let state = app(Arc::new(FailingBrain), cfg());
+        let mid = store_user(&state, "lab", "hi");
+
+        let outcome = run_once(&state, "lab", Event::User { message_id: mid.clone() }).await;
+
+        // The turn suspends at the first failing agent rather than completing.
+        assert!(matches!(outcome, TurnOutcome::Suspended(Event::User { .. })));
+        // Exactly one sanitized error notice reached the chat, carrying the code.
+        assert_eq!(system_count(&state, "lab"), 1);
+        let system = state
+            .list("lab")
+            .into_iter()
+            .find_map(|m| match m {
+                Message::System { status, reason, .. } => Some((status, reason)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(system.0, Some(429));
+        assert_eq!(system.1, "Too Many Requests");
+        // A failure is NOT a read: the message stays unread, so a retry can resume.
+        assert!(readers(&state, "lab", &mid).is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_resumes_only_the_unread_agent() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = app(Arc::new(ScriptedBrain { calls: calls.clone() }), cfg());
+        let mid = store_user(&state, "lab", "hi");
+
+        // Initial turn: agent #1 speaks (reads), agent #2 fails → suspend.
+        let outcome = run_once(&state, "lab", Event::User { message_id: mid.clone() }).await;
+        assert!(matches!(outcome, TurnOutcome::Suspended(Event::User { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(readers(&state, "lab", &mid).len(), 1); // only the speaker read
+        assert_eq!(system_count(&state, "lab"), 1);
+
+        // Retry (resuming): only the still-unread agent re-runs and now speaks.
+        let (_tx, mut rx) = mpsc::channel::<Event>(8);
+        let outcome =
+            run_turn(&state, "lab", Event::User { message_id: mid.clone() }, true, &mut rx).await;
+        assert!(matches!(outcome, TurnOutcome::Done));
+        // One more decide call, not two — the agent that already spoke is skipped.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Both AI members have now read the message; the turn is fully resolved.
+        assert_eq!(readers(&state, "lab", &mid).len(), 2);
+        // No second error notice was raised.
+        assert_eq!(system_count(&state, "lab"), 1);
     }
 
     #[test]
@@ -768,7 +950,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = run_turn(&state, "lab", Event::User { message_id: mid }, &mut rx).await;
+        let outcome = run_turn(&state, "lab", Event::User { message_id: mid }, false, &mut rx).await;
         assert!(matches!(outcome, TurnOutcome::Done));
 
         let seen = seen.lock().unwrap();
@@ -789,7 +971,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Event>(8);
         let running = state.clone();
         let handle = tokio::spawn(async move {
-            run_turn(&running, "lab", Event::User { message_id: mid }, &mut rx).await
+            run_turn(&running, "lab", Event::User { message_id: mid }, false, &mut rx).await
         });
 
         // Once an agent is mid-inference, fire a hard event (a new user message).

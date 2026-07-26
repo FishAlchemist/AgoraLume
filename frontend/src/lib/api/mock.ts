@@ -61,6 +61,9 @@ export class MockChatApi implements ChatApi {
     return msg;
   }
 
+  // The rule brain never fails, so there is never a suspended turn to resume.
+  async retry(_groupId: string): Promise<void> {}
+
   subscribe(groupId: string, handler: MessageHandler): () => void {
     const set = this.subs.get(groupId) ?? new Set<MessageHandler>();
     set.add(handler);

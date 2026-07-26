@@ -106,20 +106,45 @@ pub struct AgentPrompt {
     pub last_line: Option<String>,
 }
 
-/// A brain's output: the decision plus optional telemetry. Keeping usage
-/// alongside the decision lets the orchestrator record token cost without the
+/// A sanitized inference failure — the only error detail that leaves the brain.
+/// Deliberately carries no provider body (which can leak quota/key details):
+/// just the HTTP status and its canonical name, enough to surface a precise but
+/// safe notice to the chat.
+#[derive(Clone, Debug)]
+pub struct BrainError {
+    /// The HTTP status code, when the failure carried one (e.g. 429).
+    pub status: Option<u16>,
+    /// The status's canonical reason (e.g. "Too Many Requests"), or a short
+    /// generic label for a transport failure with no status.
+    pub reason: String,
+}
+
+/// What an agent's turn produced: a genuine decision, or a failure after the
+/// brain exhausted its retries. A failure is *not* a silent read — the
+/// orchestrator surfaces it and suspends the turn rather than pretending the
+/// agent chose to stay quiet.
+#[derive(Clone, Debug)]
+pub enum Outcome {
+    /// The model (or rule brain) decided what to do this turn.
+    Responded(Respond),
+    /// The inference failed and won't be retried automatically.
+    Failed(BrainError),
+}
+
+/// A brain's output: the outcome plus optional telemetry. Keeping usage
+/// alongside the outcome lets the orchestrator record token cost without the
 /// brain reaching into app state — it stays a pure prompt-in/decision-out
 /// function. The mock and providers that report nothing leave `usage` `None`.
 #[derive(Clone, Debug)]
 pub struct Decision {
-    pub respond: Respond,
+    pub outcome: Outcome,
     pub usage: Option<TokenUsage>,
 }
 
 impl From<Respond> for Decision {
     /// A decision with no usage telemetry — for the mock and test brains.
     fn from(respond: Respond) -> Self {
-        Self { respond, usage: None }
+        Self { outcome: Outcome::Responded(respond), usage: None }
     }
 }
 

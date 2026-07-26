@@ -45,6 +45,9 @@ class RoutingChatApi implements ChatApi {
   sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {
     return this.impl().sendMessage(groupId, text, personaId);
   }
+  retry(groupId: string): Promise<void> {
+    return this.impl().retry(groupId);
+  }
   subscribe(groupId: string, handler: MessageHandler): () => void {
     return this.impl().subscribe(groupId, handler);
   }

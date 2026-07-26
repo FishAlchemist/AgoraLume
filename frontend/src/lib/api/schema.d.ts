@@ -63,6 +63,15 @@ export interface paths {
      */
     post: operations["send_message"];
   };
+  "/groups/{id}/retry": {
+    /**
+     * Resumes a turn that was suspended by a failed agent inference: the agents who
+     * have not yet read the pending message respond to the current chat. A no-op if
+     * nothing is suspended (e.g. the pending turn was already voided by a newer
+     * message). Its effect arrives on the group's SSE stream.
+     */
+    post: operations["retry_turn"];
+  };
   "/groups/{id}/stream": {
     /**
      * Server-Sent Events for a group: default `message` events (AI replies and
@@ -255,6 +264,24 @@ export interface components {
       mood: string;
       note?: string | null;
       personaId: string;
+      /** Format: int64 */
+      ts: number;
+    }, {
+      groupId: string;
+      id: string;
+      /** @enum {string} */
+      kind: "system";
+      personaId: string;
+      /**
+       * @description The status's canonical reason (e.g. "Too Many Requests"), or a short
+       * generic label for a transport failure with no status.
+       */
+      reason: string;
+      /**
+       * Format: int32
+       * @description The HTTP status code, when the failure carried one (e.g. 429).
+       */
+      status?: number | null;
       /** Format: int64 */
       ts: number;
     }]>;
@@ -642,6 +669,30 @@ export interface operations {
         content: {
           "application/json": components["schemas"]["Message"];
         };
+      };
+      /** @description Unknown group */
+      404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * Resumes a turn that was suspended by a failed agent inference: the agents who
+   * have not yet read the pending message respond to the current chat. A no-op if
+   * nothing is suspended (e.g. the pending turn was already voided by a newer
+   * message). Its effect arrives on the group's SSE stream.
+   */
+  retry_turn: {
+    parameters: {
+      path: {
+        /** @description Group id */
+        id: string;
+      };
+    };
+    responses: {
+      /** @description Retry accepted */
+      202: {
+        content: never;
       };
       /** @description Unknown group */
       404: {

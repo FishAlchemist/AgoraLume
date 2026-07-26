@@ -76,7 +76,15 @@ async fn main() {
             std::process::exit(1);
         };
         let api_key = config.llm_api_key.as_deref().unwrap_or("");
-        match LlmBrain::new(base_url, model, api_key, config.llm_max_tokens, config.llm_max_rpm) {
+        match LlmBrain::new(
+            base_url,
+            model,
+            api_key,
+            config.llm_max_tokens,
+            config.llm_max_rpm,
+            config.llm_max_retries,
+            config.llm_retry_base_ms,
+        ) {
             Ok(brain) => AgentRuntime::llm(Arc::new(brain)),
             Err(e) => {
                 eprintln!("failed to initialise the LLM brain: {e}");

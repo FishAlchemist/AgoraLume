@@ -26,6 +26,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(debug_usage))
         .routes(routes!(list_messages, send_message))
         .routes(routes!(post_event))
+        .routes(routes!(retry_turn))
         .routes(routes!(debug_traces))
         .routes(routes!(stream))
 }
@@ -184,6 +185,23 @@ async fn post_event(
         &id,
         AgentEvent::Environment { description: body.description, urgent: body.urgent },
     );
+    StatusCode::ACCEPTED
+}
+
+/// Resumes a turn that was suspended by a failed agent inference: the agents who
+/// have not yet read the pending message respond to the current chat. A no-op if
+/// nothing is suspended (e.g. the pending turn was already voided by a newer
+/// message). Its effect arrives on the group's SSE stream.
+#[utoipa::path(post, path = "/groups/{id}/retry", tag = "chat",
+    params(("id" = String, Path, description = "Group id")),
+    responses(
+        (status = 202, description = "Retry accepted"),
+        (status = 404, description = "Unknown group")))]
+async fn retry_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+    if state.workspace().turn_members(&id).is_none() {
+        return StatusCode::NOT_FOUND;
+    }
+    state.dispatch(&id, AgentEvent::Retry);
     StatusCode::ACCEPTED
 }
 

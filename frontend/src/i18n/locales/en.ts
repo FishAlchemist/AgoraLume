@@ -55,6 +55,8 @@ export const en = {
     readReplied: 'Replied',
     readSilent: 'Read, no reply',
     readUnread: 'Not read yet',
+    errorReplyFailed: "{{name}} couldn't reply",
+    retry: 'Retry',
   },
   readonly: {
     badge: 'Read-only',

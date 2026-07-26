@@ -78,6 +78,13 @@ pub struct Config {
     /// free `flash-lite` tier). `0` disables throttling — set it higher on a
     /// paid tier. Agents that would exceed the cap simply wait their turn.
     pub llm_max_rpm: u64,
+    /// Automatic retries a retryable failure (429/5xx/transport) gets before the
+    /// error is surfaced to the chat. Read from `AGORALUME_LLM_MAX_RETRIES`;
+    /// defaults to 2. `0` disables auto-retry (a failure surfaces on the first try).
+    pub llm_max_retries: u32,
+    /// Base backoff (ms) before the first retry; each further retry doubles it.
+    /// Read from `AGORALUME_LLM_RETRY_BASE_MS`; defaults to 1000.
+    pub llm_retry_base_ms: u64,
     /// Optional token pricing for the estimated-cost readout. When unset, the
     /// debug panel shows token counts only. Rates are per 1,000,000 tokens.
     pub pricing: Option<Pricing>,
@@ -136,6 +143,14 @@ impl Config {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(15);
+        let llm_max_retries = std::env::var("AGORALUME_LLM_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2);
+        let llm_retry_base_ms = std::env::var("AGORALUME_LLM_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1000);
         Self {
             bind,
             data_dir,
@@ -146,6 +161,8 @@ impl Config {
             llm_api_key: env_nonempty("AGORALUME_LLM_API_KEY"),
             llm_max_tokens,
             llm_max_rpm,
+            llm_max_retries,
+            llm_retry_base_ms,
             pricing: read_pricing(),
             web_dir,
             open_browser,

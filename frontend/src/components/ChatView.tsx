@@ -141,6 +141,14 @@ export function ChatView({ group, personas }: Props) {
     }
   };
 
+  // Resumes a turn suspended by a failed agent. We don't lock optimistically:
+  // the backend's `activity` signal locks the composer only if there is actually
+  // something to resume, so a stale retry (already voided) can't wedge the UI.
+  const handleRetry = () => {
+    if (busy) return;
+    void api.retry(group.id).catch(() => {});
+  };
+
   const ordered = useMemo(
     () => (messages ? [...messages].sort(compareMessages) : messages),
     [messages],
@@ -176,10 +184,14 @@ export function ChatView({ group, personas }: Props) {
           </Center>
         ) : (
           <Stack gap="md">
-            {ordered.map((message) => {
+            {ordered.map((message, index) => {
               const persona = personas.get(message.personaId);
               if (!persona) return null;
               const replied = replyMap.get(message.id);
+              // A retry is only offered on the latest line while the loop is idle:
+              // sending a new message pushes a newer line, which both hides the
+              // button here and voids the pending retry on the backend.
+              const isLast = index === ordered.length - 1;
               return (
                 <MessageItem
                   key={message.id}
@@ -189,6 +201,8 @@ export function ChatView({ group, personas }: Props) {
                   fontSize={fontSize}
                   aiMembers={aiMembers}
                   repliedBy={replied ? [...replied] : undefined}
+                  onRetry={message.kind === 'system' ? handleRetry : undefined}
+                  canRetry={isLast && !busy}
                 />
               );
             })}

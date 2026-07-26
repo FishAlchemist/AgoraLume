@@ -12,6 +12,10 @@ pub enum Event {
     User { message_id: String },
     /// An environment change (rain, time passing, an emergency).
     Environment { description: String, urgent: bool },
+    /// A manual retry of a turn suspended by a failed agent inference. Carries no
+    /// data: the coordinator holds the pending trigger and resumes it, re-running
+    /// only the agents that have not yet read the pending message.
+    Retry,
 }
 
 impl Event {
@@ -21,7 +25,7 @@ impl Event {
     pub fn as_context(&self) -> Option<&str> {
         match self {
             Event::Environment { description, .. } => Some(description.as_str()),
-            Event::User { .. } => None,
+            Event::User { .. } | Event::Retry => None,
         }
     }
 }
@@ -51,5 +55,9 @@ pub fn appraise(event: &Event) -> Salience {
         // A non-urgent change carrying nothing to say isn't worth interrupting.
         Event::Environment { description, .. } if description.trim().is_empty() => Salience::Ignore,
         Event::Environment { .. } => Salience::Soft,
+        // A retry that lands mid-turn is stale — a turn is already running, so
+        // there is nothing suspended to resume. Drop it; the idle coordinator
+        // handles a genuine retry directly.
+        Event::Retry => Salience::Ignore,
     }
 }

@@ -56,6 +56,11 @@ export class HttpChatApi implements ChatApi {
     return (await res.json()) as Message;
   }
 
+  async retry(groupId: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/groups/${groupId}/retry`, { method: 'POST' });
+    if (!res.ok) throw new Error(`retry failed: ${res.status}`);
+  }
+
   subscribe(groupId: string, handler: MessageHandler): () => void {
     const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
     const onMessage = (event: MessageEvent<string>) => {

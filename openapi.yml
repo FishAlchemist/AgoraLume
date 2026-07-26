@@ -310,6 +310,28 @@ paths:
                 $ref: '#/components/schemas/Message'
         '404':
           description: Unknown group
+  /groups/{id}/retry:
+    post:
+      tags:
+      - chat
+      summary: |-
+        Resumes a turn that was suspended by a failed agent inference: the agents who
+        have not yet read the pending message respond to the current chat. A no-op if
+        nothing is suspended (e.g. the pending turn was already voided by a newer
+        message). Its effect arrives on the group's SSE stream.
+      operationId: retry_turn
+      parameters:
+      - name: id
+        in: path
+        description: Group id
+        required: true
+        schema:
+          type: string
+      responses:
+        '202':
+          description: Retry accepted
+        '404':
+          description: Unknown group
   /groups/{id}/stream:
     get:
       tags:
@@ -841,6 +863,45 @@ components:
             - 'null'
           personaId:
             type: string
+          ts:
+            type: integer
+            format: int64
+      - type: object
+        description: |-
+          A system notice that an agent's inference failed after exhausting retries.
+          Surfaces the HTTP status and canonical reason only — never the provider's
+          raw body, which can leak quota or key details. `personaId` is the agent
+          that failed. The frontend renders it as an error line with a retry button.
+        required:
+        - id
+        - groupId
+        - personaId
+        - ts
+        - reason
+        - kind
+        properties:
+          groupId:
+            type: string
+          id:
+            type: string
+          kind:
+            type: string
+            enum:
+            - system
+          personaId:
+            type: string
+          reason:
+            type: string
+            description: |-
+              The status's canonical reason (e.g. "Too Many Requests"), or a short
+              generic label for a transport failure with no status.
+          status:
+            type:
+            - integer
+            - 'null'
+            format: int32
+            description: The HTTP status code, when the failure carried one (e.g. 429).
+            minimum: 0
           ts:
             type: integer
             format: int64

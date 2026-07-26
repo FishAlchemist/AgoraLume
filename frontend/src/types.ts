@@ -110,4 +110,18 @@ export interface MoodMessage extends BaseMessage {
   note?: string;
 }
 
-export type Message = ConversationMessage | MoodMessage;
+/**
+ * A system notice that an agent's inference failed after exhausting retries.
+ * Carries only the HTTP status and its canonical reason (never the provider's
+ * raw body). `personaId` is the agent that failed. Rendered as an error line
+ * with a retry button.
+ */
+export interface SystemMessage extends BaseMessage {
+  kind: 'system';
+  /** HTTP status code, when the failure carried one (e.g. 429). */
+  status?: number;
+  /** Canonical reason (e.g. "Too Many Requests") or a short generic label. */
+  reason: string;
+}
+
+export type Message = ConversationMessage | MoodMessage | SystemMessage;
