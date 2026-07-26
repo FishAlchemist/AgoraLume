@@ -535,12 +535,14 @@ fn assemble_prompt(
         }
         system.push_str("</directory>\n");
     }
-    // The live transcript and any environment events, each in its own element.
+    // The live transcript first, then the volatile bits (environment, time) last.
+    // Ordering is deliberate for prompt caching: the transcript is append-only,
+    // so its leading messages are byte-identical across an agent's turns and can
+    // be served from the provider's prefix cache — but only when nothing volatile
+    // precedes them. The per-turn <time> (and any <environment> events) therefore
+    // trail the conversation rather than lead it, keeping the largest, most-
+    // repeated section a stable, cacheable prefix.
     let mut conversation = String::new();
-    // The current time (with timezone) leads, so the agent grounds "now".
-    if !now.is_empty() {
-        let _ = writeln!(conversation, "<time>\n{now}\n</time>\n");
-    }
     // Each message is its own XML element carrying the sender and the send time
     // (local, with timezone — same format as <time>), so the model can tell the
     // messages apart, attribute each to a speaker, and reason about when things
@@ -562,6 +564,12 @@ fn assemble_prompt(
             let _ = writeln!(conversation, "- {event}");
         }
         conversation.push_str("</environment>\n");
+    }
+    // The current time (with timezone) trails everything, so the agent still
+    // grounds "now" without a per-turn value invalidating the cacheable
+    // transcript prefix in front of it.
+    if !now.is_empty() {
+        let _ = writeln!(conversation, "\n<time>\n{now}\n</time>");
     }
 
     AgentPrompt {
