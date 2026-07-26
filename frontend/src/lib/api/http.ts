@@ -11,6 +11,134 @@ import type {
   ServerMeta,
 } from './types';
 
+/** Parses an SSE frame's JSON payload, yielding null on malformed data. */
+function parseFrame<T>(data: string): T | null {
+  try {
+    return JSON.parse(data) as T;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The set of live subscribers on one group's SSE connection, split by event
+ * kind. The connection stays open while any set is non-empty.
+ */
+interface GroupStream {
+  source: EventSource;
+  message: Set<MessageHandler>;
+  read: Set<ReadHandler>;
+  activity: Set<ActivityHandler>;
+  debug: Set<DebugHandler>;
+  /** Pending close from a grace period; cleared if a subscriber returns first. */
+  closeTimer?: ReturnType<typeof setTimeout>;
+}
+
+/** How long an idle group stream lingers before closing (see {@link SharedStreams}). */
+const LINGER_MS = 300;
+
+/**
+ * One SSE connection per group, shared by every subscriber. The backend
+ * multiplexes replies, read receipts, activity, and debug traces as named
+ * events on a single `/stream`, so all four subscription kinds ride one
+ * EventSource instead of opening four. The connection opens on the first
+ * subscriber and — after a short grace period — closes when the last one
+ * leaves. The grace period lets a React StrictMode remount or a quick
+ * group switch-back reuse the live connection rather than drop and reopen it,
+ * which a tunnel (cloudflared) would otherwise log as a stream cancellation.
+ */
+class SharedStreams {
+  private readonly byGroup = new Map<string, GroupStream>();
+
+  constructor(private readonly baseUrl: string) {}
+
+  subscribeMessage(groupId: string, handler: MessageHandler): () => void {
+    const stream = this.open(groupId);
+    stream.message.add(handler);
+    return () => this.drop(groupId, stream, stream.message, handler);
+  }
+
+  subscribeRead(groupId: string, handler: ReadHandler): () => void {
+    const stream = this.open(groupId);
+    stream.read.add(handler);
+    return () => this.drop(groupId, stream, stream.read, handler);
+  }
+
+  subscribeActivity(groupId: string, handler: ActivityHandler): () => void {
+    const stream = this.open(groupId);
+    stream.activity.add(handler);
+    return () => this.drop(groupId, stream, stream.activity, handler);
+  }
+
+  subscribeDebug(groupId: string, handler: DebugHandler): () => void {
+    const stream = this.open(groupId);
+    stream.debug.add(handler);
+    return () => this.drop(groupId, stream, stream.debug, handler);
+  }
+
+  /** Reuses the group's live stream, or opens one and wires its event listeners. */
+  private open(groupId: string): GroupStream {
+    const existing = this.byGroup.get(groupId);
+    if (existing) {
+      if (existing.closeTimer) {
+        clearTimeout(existing.closeTimer);
+        existing.closeTimer = undefined;
+      }
+      return existing;
+    }
+
+    const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
+    const stream: GroupStream = {
+      source,
+      message: new Set(),
+      read: new Set(),
+      activity: new Set(),
+      debug: new Set(),
+    };
+    // The default (unnamed) event carries a Message; the rest are named events.
+    source.addEventListener('message', (e: MessageEvent<string>) => {
+      const data = parseFrame<Message>(e.data);
+      if (data) for (const h of stream.message) h(data);
+    });
+    source.addEventListener('read', (e: MessageEvent<string>) => {
+      const data = parseFrame<ReadReceipt>(e.data);
+      if (data) for (const h of stream.read) h(data);
+    });
+    source.addEventListener('activity', (e: MessageEvent<string>) => {
+      const data = parseFrame<{ active: boolean }>(e.data);
+      if (data) for (const h of stream.activity) h(data.active);
+    });
+    source.addEventListener('debug', (e: MessageEvent<string>) => {
+      const data = parseFrame<AgentTrace>(e.data);
+      if (data) for (const h of stream.debug) h(data);
+    });
+    this.byGroup.set(groupId, stream);
+    return stream;
+  }
+
+  /** Removes one handler, then closes the stream (after a grace period) if idle. */
+  private drop<H>(groupId: string, stream: GroupStream, set: Set<H>, handler: H): void {
+    set.delete(handler);
+    if (this.isBusy(stream)) return;
+    stream.closeTimer = setTimeout(() => {
+      // A subscriber may have returned during the grace window; only close if
+      // this is still the group's current, now-idle stream.
+      if (this.isBusy(stream) || this.byGroup.get(groupId) !== stream) return;
+      stream.source.close();
+      this.byGroup.delete(groupId);
+    }, LINGER_MS);
+  }
+
+  private isBusy(stream: GroupStream): boolean {
+    return (
+      stream.message.size > 0 ||
+      stream.read.size > 0 ||
+      stream.activity.size > 0 ||
+      stream.debug.size > 0
+    );
+  }
+}
+
 /**
  * Talks to an AgoraLume backend over HTTP. The base URL is injected via
  * VITE_API_BASE_URL, so the frontend stays fully decoupled: point it at any
@@ -21,7 +149,12 @@ import type {
  * (regenerate both with `pnpm gen:api`).
  */
 export class HttpChatApi implements ChatApi {
-  constructor(private readonly baseUrl: string) {}
+  // All four subscription kinds share one SSE connection per group.
+  private readonly streams: SharedStreams;
+
+  constructor(private readonly baseUrl: string) {
+    this.streams = new SharedStreams(baseUrl);
+  }
 
   private async getJson<T>(path: string): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, {
@@ -62,44 +195,15 @@ export class HttpChatApi implements ChatApi {
   }
 
   subscribe(groupId: string, handler: MessageHandler): () => void {
-    const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
-    const onMessage = (event: MessageEvent<string>) => {
-      try {
-        handler(JSON.parse(event.data) as Message);
-      } catch {
-        // Ignore malformed events.
-      }
-    };
-    source.addEventListener('message', onMessage);
-    return () => source.close();
+    return this.streams.subscribeMessage(groupId, handler);
   }
 
   subscribeReads(groupId: string, handler: ReadHandler): () => void {
-    const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
-    const onRead = (event: MessageEvent<string>) => {
-      try {
-        handler(JSON.parse(event.data) as ReadReceipt);
-      } catch {
-        // Ignore malformed events.
-      }
-    };
-    // Read receipts arrive as a named "read" SSE event on the same stream.
-    source.addEventListener('read', onRead);
-    return () => source.close();
+    return this.streams.subscribeRead(groupId, handler);
   }
 
   subscribeActivity(groupId: string, handler: ActivityHandler): () => void {
-    const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
-    const onActivity = (event: MessageEvent<string>) => {
-      try {
-        handler((JSON.parse(event.data) as { active: boolean }).active);
-      } catch {
-        // Ignore malformed events.
-      }
-    };
-    // Turn activity arrives as a named "activity" SSE event on the same stream.
-    source.addEventListener('activity', onActivity);
-    return () => source.close();
+    return this.streams.subscribeActivity(groupId, handler);
   }
 
   getUsage(): Promise<DebugUsage> {
@@ -111,16 +215,6 @@ export class HttpChatApi implements ChatApi {
   }
 
   subscribeDebug(groupId: string, handler: DebugHandler): () => void {
-    const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
-    const onDebug = (event: MessageEvent<string>) => {
-      try {
-        handler(JSON.parse(event.data) as AgentTrace);
-      } catch {
-        // Ignore malformed events.
-      }
-    };
-    // Debug traces arrive as a named "debug" SSE event on the same stream.
-    source.addEventListener('debug', onDebug);
-    return () => source.close();
+    return this.streams.subscribeDebug(groupId, handler);
   }
 }
