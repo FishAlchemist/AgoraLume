@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::event::Event;
@@ -60,6 +61,17 @@ struct DebugState {
     traces: HashMap<String, VecDeque<AgentTrace>>,
 }
 
+/// A group's compressed older history. `text` is the running summary the
+/// orchestrator prepends to the (recent, verbatim) transcript; `through_id` is
+/// the id of the last conversation message already folded into it, so the loop
+/// knows which lines are still live and must be sent verbatim. An empty summary
+/// with no `through_id` (the default) means nothing has been compressed yet.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GroupSummary {
+    pub text: String,
+    pub through_id: Option<String>,
+}
+
 /// A snapshot of the cumulative usage counters, for building the `/debug/usage`
 /// response outside the lock.
 #[derive(Clone, Copy, Default)]
@@ -74,6 +86,9 @@ pub struct DebugTotals {
 pub struct AppState {
     workspace: Mutex<Workspace>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
+    /// Per-group compressed older history (the running summary + how far it
+    /// reaches). Loaded from disk alongside a group's messages on first touch.
+    summaries: Mutex<HashMap<String, GroupSummary>>,
     channels: Mutex<HashMap<String, broadcast::Sender<StreamEvent>>>,
     /// The swappable agent runtime (brain + memory + loop config).
     pub runtime: AgentRuntime,
@@ -127,6 +142,7 @@ impl AppState {
         Self {
             workspace: Mutex::new(workspace),
             messages: Mutex::new(messages),
+            summaries: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             runtime,
             coordinators: Mutex::new(HashMap::new()),
@@ -215,6 +231,12 @@ impl AppState {
         }
         let disk = persistence.load_messages(group_id);
         self.messages.lock().unwrap().entry(group_id.to_string()).or_insert(disk);
+        // The group's compressed history rides alongside its log — pulled in the
+        // same first touch so a restart resumes from the saved summary rather than
+        // re-summarizing (or worse, re-sending) the whole history.
+        if let Some(summary) = persistence.load_summary(group_id) {
+            self.summaries.lock().unwrap().entry(group_id.to_string()).or_insert(summary);
+        }
         loaded.insert(group_id.to_string());
     }
 
@@ -236,6 +258,24 @@ impl AppState {
         };
         let snapshot = self.messages.lock().unwrap().get(group_id).cloned().unwrap_or_default();
         persistence.save_messages(group_id, &snapshot);
+    }
+
+    /// A group's compressed older history (empty when nothing has been compressed
+    /// yet). The orchestrator prepends `text` to the recent transcript and drops
+    /// the lines up to and including `through_id`.
+    pub fn summary(&self, group_id: &str) -> GroupSummary {
+        self.ensure_loaded(group_id);
+        self.summaries.lock().unwrap().get(group_id).cloned().unwrap_or_default()
+    }
+
+    /// Replaces a group's compressed history after a compression pass, persisting
+    /// it so the summary survives a restart.
+    pub fn set_summary(&self, group_id: &str, summary: GroupSummary) {
+        self.ensure_loaded(group_id);
+        self.summaries.lock().unwrap().insert(group_id.to_string(), summary.clone());
+        if let Some(persistence) = &self.persistence {
+            persistence.save_summary(group_id, &summary);
+        }
     }
 
     /// Hands an event to a group's coordinator, spawning the coordinator task on

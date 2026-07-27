@@ -17,12 +17,12 @@ use tokio::sync::mpsc;
 
 use crate::agent::brain::{
     Action, AgentBrain, AgentPersona, AgentPrompt, BrainError, Decision, MemberInfo, Outcome,
-    Respond,
+    Respond, SummaryRequest,
 };
 use crate::agent::event::{Event, Salience, appraise};
 use crate::agent::mock::RuleBrain;
 use crate::models::{AgentTrace, Message, now_ms};
-use crate::state::AppState;
+use crate::state::{AppState, GroupSummary};
 use crate::workspace::RosterMember;
 
 /// Tunables for the loop. The bounded compute per triggering message — the "not
@@ -39,11 +39,21 @@ pub struct LoopConfig {
     /// Shuffle seed. `None` seeds from the clock (production); `Some` makes the
     /// member order deterministic (tests).
     pub seed: Option<u64>,
+    /// Context-compression high-water mark: once a group's un-summarized
+    /// conversation tail passes this many lines, the oldest are folded into its
+    /// running summary at the next turn boundary. `0` disables compression. Only
+    /// acts on an LLM runtime (`mock` false) — the mock has no model to summarize
+    /// with. See [`crate::config::Config::compress_after`].
+    pub compress_after: usize,
+    /// How many of the most recent conversation lines stay verbatim when
+    /// compressing — the "don't forget what just happened" window. Kept below
+    /// `compress_after`. See [`crate::config::Config::compress_keep`].
+    pub compress_keep: usize,
 }
 
 impl Default for LoopConfig {
     fn default() -> Self {
-        Self { max_rounds: 1, pace_ms: 450, seed: None }
+        Self { max_rounds: 1, pace_ms: 450, seed: None, compress_after: 50, compress_keep: 20 }
     }
 }
 
@@ -109,20 +119,110 @@ pub async fn coordinator_loop(state: Arc<AppState>, group_id: String, mut rx: mp
         // restarts); it goes idle only once fully done. The composer gates on
         // this so a new user message can't interleave with a running turn.
         state.set_active(&group_id, true);
-        loop {
+        let completed = loop {
             match run_turn(&state, &group_id, trigger, resuming, &mut rx).await {
-                TurnOutcome::Done => break,
+                TurnOutcome::Done => break true,
                 TurnOutcome::Preempted(next) => {
                     trigger = next;
                     resuming = false;
                 }
                 TurnOutcome::Suspended(t) => {
                     pending = Some(t);
-                    break;
+                    break false;
                 }
             }
-        }
+        };
         state.set_active(&group_id, false);
+        // Compress the older history once the turn has fully settled — not after a
+        // suspend, whose failing provider would only fail the summary too. Running
+        // here (idle, off the reply path) keeps the summarizing call's latency out
+        // of the user's wait, and a message that arrives meanwhile simply queues
+        // and starts its turn on the freshly compacted context.
+        if completed {
+            maybe_compress(&state, &group_id).await;
+        }
+    }
+}
+
+/// Folds a group's oldest conversation lines into its running summary when the
+/// un-summarized tail has grown past the high-water mark, keeping only the most
+/// recent `compress_keep` lines verbatim. A no-op on the mock runtime, when
+/// compression is disabled (`compress_after == 0`), or when the tail is still
+/// short. Best-effort: a failed summarization is logged and the full transcript
+/// is kept, to be retried at the next boundary.
+async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
+    let runtime = &state.runtime;
+    let cfg = &runtime.config;
+    if runtime.mock || cfg.compress_after == 0 {
+        return;
+    }
+
+    let summary = state.summary(group_id);
+    let transcript = build_transcript(state, group_id);
+    let tail = tail_after(&transcript, summary.through_id.as_deref());
+    // Only compress once the live tail is over the high-water mark; below it, the
+    // whole tail is cheap enough to send verbatim.
+    if tail.len() <= cfg.compress_after {
+        return;
+    }
+    // Fold everything except the most recent `compress_keep` lines.
+    let fold_count = tail.len().saturating_sub(cfg.compress_keep);
+    if fold_count == 0 {
+        return;
+    }
+    let to_fold = &tail[..fold_count];
+    let through_id = to_fold.last().map(|line| line.id.clone());
+    let lines: Vec<String> =
+        to_fold.iter().map(|line| format!("{}: {}", line.name, line.text)).collect();
+    let folded = lines.join("\n");
+
+    let request = SummaryRequest {
+        prior: (!summary.text.trim().is_empty()).then(|| summary.text.clone()),
+        lines,
+    };
+    match runtime.brain.summarize(&request).await {
+        Ok(result) => {
+            let text = result.text.trim().to_string();
+            // A blank result would silently drop the folded lines — skip rather
+            // than advance `through_id` past history the summary doesn't cover.
+            if text.is_empty() {
+                tracing::warn!(group = %group_id, "compression returned an empty summary; keeping the full transcript");
+                return;
+            }
+            state.set_summary(group_id, GroupSummary { text: text.clone(), through_id });
+            // Record the summarizing call so its tokens count toward the usage /
+            // cost panel, exactly like a decision. It is not an agent's turn, so it
+            // rides under a synthetic "system" persona with a `summarize` action.
+            state.record_trace(
+                group_id,
+                AgentTrace {
+                    ts: now_ms(),
+                    group_id: group_id.to_string(),
+                    persona_id: "system".to_string(),
+                    persona_name: "Context summary".to_string(),
+                    system: String::new(),
+                    conversation: folded,
+                    action: "summarize".to_string(),
+                    message: Some(text),
+                    mood: None,
+                    usage: result.usage,
+                },
+            );
+            tracing::debug!(
+                group = %group_id,
+                folded = fold_count,
+                kept = cfg.compress_keep,
+                "compressed older conversation into the running summary"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                group = %group_id,
+                status = ?error.status,
+                reason = %error.reason,
+                "context compression failed; keeping the full transcript this round"
+            );
+        }
     }
 }
 
@@ -158,6 +258,11 @@ async fn run_turn(
     }
 
     let mut rng = Rng::new(cfg.seed.unwrap_or_else(time_seed));
+
+    // The compressed older history, fetched once: it can only change at a turn
+    // boundary (via `maybe_compress`, on this same coordinator task), so it is
+    // stable for the whole turn even as agents append fresh lines.
+    let summary = state.summary(group_id);
 
     for _round in 0..cfg.max_rounds.max(1) {
         // Phase 2: fresh membership, reshuffled each round.
@@ -196,11 +301,23 @@ async fn run_turn(
                 continue;
             };
             let transcript = build_transcript(state, group_id);
+            // Only the lines past the summary go in verbatim; the summary stands
+            // in for everything before them.
+            let tail = tail_after(&transcript, summary.through_id.as_deref());
+            let summary_text =
+                (!summary.text.trim().is_empty()).then_some(summary.text.as_str());
 
             // Assemble the prompt — the orchestrator owns context, so a brain is
             // just prompt-in/decision-out (the LLM boundary).
-            let prompt =
-                assemble_prompt(&persona, &roster, &directory, &transcript, &injected_events, &now);
+            let prompt = assemble_prompt(
+                &persona,
+                &roster,
+                &directory,
+                summary_text,
+                tail,
+                &injected_events,
+                &now,
+            );
             tracing::trace!(
                 target: "agent::prompt",
                 persona = %persona_id,
@@ -369,8 +486,10 @@ async fn pace(cfg: &LoopConfig) {
 
 /// One line of the Context Stream — the filtered transcript agents read. Only
 /// spoken lines appear; moods, read receipts and private notes never do. `ts` is
-/// the send time (epoch millis) so the assembled prompt can stamp each message.
+/// the send time (epoch millis) so the assembled prompt can stamp each message;
+/// `id` is the message id, so compression can mark how far the summary reaches.
 struct ContextLine {
+    id: String,
     name: String,
     text: String,
     ts: i64,
@@ -384,16 +503,31 @@ fn build_transcript(state: &AppState, group_id: &str) -> Vec<ContextLine> {
     messages
         .into_iter()
         .filter_map(|message| match message {
-            Message::Conversation { persona_id, text, ts, .. } => {
+            Message::Conversation { id, persona_id, text, ts, .. } => {
                 let name =
                     workspace.persona(&persona_id).map_or(persona_id, |p| p.name);
-                Some(ContextLine { name, text, ts })
+                Some(ContextLine { id, name, text, ts })
             }
             // Moods and system error notices are UI-only; agents reason over
             // spoken lines alone.
             Message::Mood { .. } | Message::System { .. } => None,
         })
         .collect()
+}
+
+/// The transcript lines *after* the one the summary reaches through — the live
+/// tail sent verbatim. With no `through_id` (nothing compressed yet) the whole
+/// transcript is the tail. If the boundary message can't be found (e.g. a log
+/// edited out from under a stale summary), the whole transcript is returned
+/// rather than risk hiding recent lines.
+fn tail_after<'a>(transcript: &'a [ContextLine], through_id: Option<&str>) -> &'a [ContextLine] {
+    match through_id {
+        Some(id) => match transcript.iter().position(|line| line.id == id) {
+            Some(pos) => &transcript[pos + 1..],
+            None => transcript,
+        },
+        None => transcript,
+    }
 }
 
 /// Resolves a persona into the identity + variables a brain needs to decide.
@@ -482,6 +616,7 @@ fn assemble_prompt(
     persona: &AgentPersona,
     roster: &[RosterMember],
     directory: &[MemberInfo],
+    summary: Option<&str>,
     transcript: &[ContextLine],
     events: &[String],
     now: &str,
@@ -543,6 +678,13 @@ fn assemble_prompt(
     // trail the conversation rather than lead it, keeping the largest, most-
     // repeated section a stable, cacheable prefix.
     let mut conversation = String::new();
+    // The compressed older history leads, standing in for the messages dropped
+    // from the verbatim log below. It changes only when a compression runs (and
+    // the tail shifts with it), so between compressions it stays a stable prefix —
+    // just like the transcript — and doesn't defeat the provider's prefix cache.
+    if let Some(summary) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = writeln!(conversation, "<summary>\n{summary}\n</summary>\n");
+    }
     // Each message is its own XML element carrying the sender and the send time
     // (local, with timezone — same format as <time>), so the model can tell the
     // messages apart, attribute each to a speaker, and reason about when things
@@ -623,7 +765,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    use crate::agent::brain::{AgentPrompt, Decision};
+    use crate::agent::brain::{AgentPrompt, Decision, Summary, SummaryRequest};
     use crate::agent::mock::RuleBrain;
     use crate::state::StreamEvent;
 
@@ -725,6 +867,25 @@ mod tests {
                 },
                 _ => Respond::speak("resumed").into(),
             }
+        }
+    }
+
+    /// Reads silently, but folds compression batches into the running summary by
+    /// joining the lines (so a test can assert what was folded without a model).
+    struct JoinBrain;
+    #[async_trait]
+    impl AgentBrain for JoinBrain {
+        async fn decide(&self, _prompt: &AgentPrompt) -> Decision {
+            Respond::read().into()
+        }
+        async fn summarize(&self, request: &SummaryRequest) -> Result<Summary, BrainError> {
+            let mut text = String::new();
+            if let Some(prior) = &request.prior {
+                text.push_str(prior);
+                text.push('\n');
+            }
+            text.push_str(&request.lines.join(" | "));
+            Ok(Summary { text, usage: None })
         }
     }
 
@@ -872,7 +1033,7 @@ mod tests {
             RosterMember { name: "Nox".into(), blurb: Some("Dry strategist.".into()), is_self: false },
             RosterMember { name: "Sol".into(), blurb: None, is_self: false },
         ];
-        let prompt = assemble_prompt(&persona, &roster, &[], &[], &[], "");
+        let prompt = assemble_prompt(&persona, &roster, &[], None, &[], &[], "");
         // The user is present and flagged "(the user)"; blurbs render when set,
         // and a member without one still appears.
         assert!(prompt.system.contains("<group_members>"));
@@ -896,7 +1057,7 @@ mod tests {
             MemberInfo { name: "You".into(), blurb: Some("Your own voice.".into()), is_user: true },
             MemberInfo { name: "Nox".into(), blurb: Some("Dry strategist.".into()), is_user: false },
         ];
-        let prompt = assemble_prompt(&persona, &roster, &directory, &[], &[], "");
+        let prompt = assemble_prompt(&persona, &roster, &directory, None, &[], &[], "");
 
         assert!(prompt.system.contains("<directory>"));
         // People not in the room are listed, the user flagged "(the user)".
@@ -916,7 +1077,7 @@ mod tests {
         };
         // A fixed RFC 3339 timestamp with offset renders in its own section.
         let prompt =
-            assemble_prompt(&persona, &[], &[], &[], &[], "2026-07-25T15:30:00+08:00");
+            assemble_prompt(&persona, &[], &[], None, &[], &[], "2026-07-25T15:30:00+08:00");
         assert!(prompt.conversation.contains("<time>"));
         assert!(prompt.conversation.contains("2026-07-25T15:30:00+08:00"));
     }
@@ -930,10 +1091,13 @@ mod tests {
         };
         // 2026-07-25T00:00:00Z in epoch millis; the exact local rendering depends
         // on the test host's timezone, so assert the structure, not the offset.
-        let transcript = vec![
-            ContextLine { name: "You".into(), text: "hi <there>".into(), ts: 1_774_396_800_000 },
-        ];
-        let prompt = assemble_prompt(&persona, &[], &[], &transcript, &[], "");
+        let transcript = vec![ContextLine {
+            id: "m1".into(),
+            name: "You".into(),
+            text: "hi <there>".into(),
+            ts: 1_774_396_800_000,
+        }];
+        let prompt = assemble_prompt(&persona, &[], &[], None, &transcript, &[], "");
 
         // Each line is its own element, tagged with the sender and a send time.
         assert!(prompt.conversation.contains("<message from=\"You\" time=\""));
@@ -996,5 +1160,113 @@ mod tests {
             .any(|m| matches!(m, Message::Conversation { text, .. } if text == "late"));
         assert!(!leaked);
         let _ = release; // kept alive; the gated future is dropped, not released
+    }
+
+    #[test]
+    fn summary_section_leads_the_conversation() {
+        let persona = AgentPersona {
+            name: "Aria".into(),
+            system_prompt: "You are Aria.".into(),
+            variables: std::collections::HashMap::new(),
+        };
+        let transcript =
+            vec![ContextLine { id: "m1".into(), name: "You".into(), text: "hi".into(), ts: 0 }];
+        let prompt = assemble_prompt(
+            &persona,
+            &[],
+            &[],
+            Some("Earlier: they agreed on the plan."),
+            &transcript,
+            &[],
+            "",
+        );
+        let convo = &prompt.conversation;
+        assert!(convo.contains("<summary>"));
+        assert!(convo.contains("Earlier: they agreed on the plan."));
+        // The summary stands in for older history, so it precedes the live log.
+        assert!(convo.find("<summary>").unwrap() < convo.find("<conversation>").unwrap());
+    }
+
+    #[test]
+    fn tail_after_returns_only_lines_past_the_boundary() {
+        let lines = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| ContextLine {
+                    id: (*id).into(),
+                    name: "You".into(),
+                    text: (*id).into(),
+                    ts: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+        let transcript = lines(&["a", "b", "c", "d"]);
+        // Nothing compressed → the whole transcript is the tail.
+        assert_eq!(tail_after(&transcript, None).len(), 4);
+        // Compressed through "b" → only c, d remain live.
+        let tail = tail_after(&transcript, Some("b"));
+        assert_eq!(tail.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["c", "d"]);
+        // A boundary that no longer exists falls back to the whole transcript.
+        assert_eq!(tail_after(&transcript, Some("gone")).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn compression_folds_old_lines_and_shrinks_the_tail() {
+        // High-water 3, keep 1: five lines must fold the oldest four, leave one.
+        let config = LoopConfig { compress_after: 3, compress_keep: 1, ..cfg() };
+        let state = Arc::new(AppState::with_runtime(AgentRuntime {
+            brain: Arc::new(JoinBrain),
+            config,
+            mock: false,
+        }));
+        for i in 0..5 {
+            state.emit("lab", Message::conversation("lab", "aria", format!("line{i}"), None));
+        }
+
+        maybe_compress(&state, "lab").await;
+
+        let summary = state.summary("lab");
+        assert!(summary.through_id.is_some(), "a compression should have run");
+        // The four oldest lines are folded; the newest stays verbatim.
+        assert!(summary.text.contains("line0"));
+        assert!(summary.text.contains("line3"));
+        assert!(!summary.text.contains("line4"));
+
+        // The live tail the next turn sends is just the un-summarized line.
+        let transcript = build_transcript(&state, "lab");
+        let tail = tail_after(&transcript, summary.through_id.as_deref());
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].text, "line4");
+    }
+
+    #[tokio::test]
+    async fn compression_is_skipped_below_the_high_water_mark() {
+        let config = LoopConfig { compress_after: 10, compress_keep: 2, ..cfg() };
+        let state = Arc::new(AppState::with_runtime(AgentRuntime {
+            brain: Arc::new(JoinBrain),
+            config,
+            mock: false,
+        }));
+        for i in 0..4 {
+            state.emit("lab", Message::conversation("lab", "aria", format!("line{i}"), None));
+        }
+
+        maybe_compress(&state, "lab").await;
+
+        // Four lines is under the mark of ten: nothing compressed.
+        assert!(state.summary("lab").through_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_runtime_never_compresses() {
+        // Same volume, but a mock runtime: compression must not run (no model).
+        let config = LoopConfig { compress_after: 1, compress_keep: 0, ..cfg() };
+        let state = app(Arc::new(RuleBrain::seeded(1)), config);
+        for i in 0..5 {
+            state.emit("lab", Message::conversation("lab", "aria", format!("line{i}"), None));
+        }
+
+        maybe_compress(&state, "lab").await;
+
+        assert!(state.summary("lab").through_id.is_none());
     }
 }

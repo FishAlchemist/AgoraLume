@@ -85,6 +85,25 @@ pub struct Config {
     /// Base backoff (ms) before the first retry; each further retry doubles it.
     /// Read from `AGORALUME_LLM_RETRY_BASE_MS`; defaults to 1000.
     pub llm_retry_base_ms: u64,
+    /// Context-compression high-water mark: once a group's un-summarized
+    /// conversation tail exceeds this many lines, the oldest ones are folded into
+    /// a running summary so the prompt stops growing without bound. Read from
+    /// `AGORALUME_COMPRESS_AFTER`; defaults to 50. `0` disables compression (the
+    /// full transcript is always sent). Only ever runs in LLM mode — the mock has
+    /// no model to summarize with.
+    pub compress_after: usize,
+    /// How many of the most recent conversation lines stay verbatim when
+    /// compressing — the "don't forget what just happened" window. Read from
+    /// `AGORALUME_COMPRESS_KEEP`; defaults to 20. Kept below `compress_after` so a
+    /// compression always has older lines to fold.
+    pub compress_keep: usize,
+    /// Output-token ceiling for one summarization call. Separate from
+    /// `llm_max_tokens` (which caps a single agent's short chat reply): a running
+    /// summary is a *cumulative* digest of a whole multi-persona history, so it
+    /// needs far more room than one reply. Read from
+    /// `AGORALUME_COMPRESS_MAX_TOKENS`; defaults to 1024. A ceiling, not a target —
+    /// the summary prompt still asks for compact notes.
+    pub compress_max_tokens: u64,
     /// Optional token pricing for the estimated-cost readout. When unset, the
     /// debug panel shows token counts only. Rates are per 1,000,000 tokens.
     pub pricing: Option<Pricing>,
@@ -151,6 +170,18 @@ impl Config {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1000);
+        let compress_after = std::env::var("AGORALUME_COMPRESS_AFTER")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(50);
+        let compress_keep = std::env::var("AGORALUME_COMPRESS_KEEP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(20);
+        let compress_max_tokens = std::env::var("AGORALUME_COMPRESS_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1024);
         Self {
             bind,
             data_dir,
@@ -163,6 +194,9 @@ impl Config {
             llm_max_rpm,
             llm_max_retries,
             llm_retry_base_ms,
+            compress_after,
+            compress_keep,
+            compress_max_tokens,
             pricing: read_pricing(),
             web_dir,
             open_browser,

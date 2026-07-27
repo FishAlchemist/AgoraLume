@@ -3,8 +3,9 @@
 //! Layout under the data directory (`AGORALUME_DATA_DIR`):
 //!
 //! ```text
-//! workspace.json            the whole editable workspace (small; loaded at startup)
-//! messages/<group_id>.json  one group's chat log (loaded lazily, saved on change)
+//! workspace.json             the whole editable workspace (small; loaded at startup)
+//! messages/<group_id>.json   one group's chat log (loaded lazily, saved on change)
+//! summaries/<group_id>.json  one group's compressed older history (loaded with its log)
 //! ```
 //!
 //! Splitting the message logs off the workspace means a running server only
@@ -19,6 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::models::Message;
+use crate::state::GroupSummary;
 use crate::workspace::WorkspaceSnapshot;
 
 /// A handle to the data directory. Held by [`crate::state::AppState`] when
@@ -38,6 +40,10 @@ impl Persistence {
 
     fn message_path(&self, group_id: &str) -> PathBuf {
         self.dir.join("messages").join(format!("{}.json", sanitize(group_id)))
+    }
+
+    fn summary_path(&self, group_id: &str) -> PathBuf {
+        self.dir.join("summaries").join(format!("{}.json", sanitize(group_id)))
     }
 
     /// Loads the persisted workspace, or `None` when there is no saved file yet
@@ -92,6 +98,33 @@ impl Persistence {
     pub fn save_messages(&self, group_id: &str, messages: &[Message]) {
         if let Err(e) = write_atomic(&self.message_path(group_id), &messages) {
             tracing::warn!(group = %group_id, error = %e, "failed to persist a message log");
+        }
+    }
+
+    /// Loads one group's compressed history, or `None` when it has never been
+    /// compressed (or the file is unreadable/corrupt) — in which case the group
+    /// simply starts from its full transcript.
+    pub fn load_summary(&self, group_id: &str) -> Option<GroupSummary> {
+        let path = self.summary_path(group_id);
+        let bytes = std::fs::read(&path).ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(summary) => Some(summary),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ignoring a corrupt context summary; starting the group from its full transcript"
+                );
+                None
+            }
+        }
+    }
+
+    /// Writes one group's compressed history out. Called after each compression
+    /// pass; failures are logged, not fatal.
+    pub fn save_summary(&self, group_id: &str, summary: &GroupSummary) {
+        if let Err(e) = write_atomic(&self.summary_path(group_id), summary) {
+            tracing::warn!(group = %group_id, error = %e, "failed to persist a context summary");
         }
     }
 }

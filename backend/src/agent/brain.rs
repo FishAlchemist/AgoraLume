@@ -148,6 +148,26 @@ impl From<Respond> for Decision {
     }
 }
 
+/// A request to fold a group's oldest conversation lines into its running
+/// summary, so the transcript the orchestrator sends stops growing without
+/// bound. `prior` is the summary so far (`None` on the very first compression);
+/// `lines` are the older messages to absorb, oldest first, each already rendered
+/// as `"Name: text"`.
+#[derive(Clone, Debug)]
+pub struct SummaryRequest {
+    pub prior: Option<String>,
+    pub lines: Vec<String>,
+}
+
+/// The result of a compression pass: the new running summary text plus the usage
+/// the summarizing call cost, so the orchestrator can account for it exactly as
+/// it does a decision (the summary is a real LLM request that spends tokens).
+#[derive(Clone, Debug)]
+pub struct Summary {
+    pub text: String,
+    pub usage: Option<TokenUsage>,
+}
+
 /// The single inference seam. A real implementation sends the prompt to an LLM
 /// and parses its `respond` tool call; the mock applies deterministic rules.
 /// Implementations must be cancel-safe: dropping the returned future aborts the
@@ -156,4 +176,14 @@ impl From<Respond> for Decision {
 #[async_trait]
 pub trait AgentBrain: Send + Sync {
     async fn decide(&self, prompt: &AgentPrompt) -> Decision;
+
+    /// Folds `request.lines` into `request.prior`, returning the updated running
+    /// summary. The default is a no-op that keeps the prior summary unchanged, so
+    /// a brain with no real model (the mock, and the test brains) never
+    /// compresses — the orchestrator only ever calls this on an LLM-backed
+    /// runtime. The [`crate::agent::llm::LlmBrain`] overrides it to actually
+    /// summarize with the model.
+    async fn summarize(&self, request: &SummaryRequest) -> Result<Summary, BrainError> {
+        Ok(Summary { text: request.prior.clone().unwrap_or_default(), usage: None })
+    }
 }

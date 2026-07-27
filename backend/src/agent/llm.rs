@@ -27,7 +27,9 @@ use rig_core::providers::openai;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::brain::{AgentBrain, AgentPrompt, BrainError, Decision, Outcome, Respond};
+use crate::agent::brain::{
+    AgentBrain, AgentPrompt, BrainError, Decision, Outcome, Respond, Summary, SummaryRequest,
+};
 use crate::agent::ratelimit::RateLimiter;
 use crate::models::TokenUsage;
 
@@ -88,8 +90,10 @@ You are one participant in a group text chat. The context above is given in \
 XML-tagged sections: <persona> and <context> are you; <group_members> lists who \
 is in this room; <directory> lists other members of the workspace you may refer \
 to by their exact, globally-unique name (with their short bio) even though they \
-are not here. The message below carries the live <conversation>, then any \
-<environment> events, and ends with the current <time> (with timezone). Inside \
+are not here. The message below may open with a <summary> of earlier \
+conversation that has scrolled out of view — treat it as established background — \
+then carries the live <conversation>, then any <environment> events, and ends \
+with the current <time> (with timezone). Inside \
 <conversation>, each line is a <message from=\"NAME\" time=\"TIMESTAMP\">…</message> \
 element: `from` is the speaker and `time` is when they sent it (same timezone as \
 <time>), so you can judge what is recent and what is stale. Decide your single next \
@@ -97,6 +101,21 @@ action using the response schema. Speak only when you have something worth \
 adding; otherwise choose `read` to stay silent. Moods are UI-only flavour and \
 are never shown to other participants as text. Keep any reply to one short chat \
 message.";
+
+/// How the model is told to compress older history. Deliberately narrow: produce
+/// *notes*, not a reply, and keep the facts that outlive small talk — so the
+/// running summary stays a faithful, compact stand-in for what it replaces.
+const SUMMARY_GUIDANCE: &str = "\
+You maintain a running summary of an ongoing group chat so its older history can \
+be dropped from context without losing what matters. You are given the summary \
+so far (if any) inside <summary_so_far>, then the next batch of older messages \
+inside <older_messages>. Produce ONE updated summary that folds the new batch \
+into the prior one. Preserve durable facts: decisions made, commitments, \
+participants and their stated views, open questions, and anything a later reply \
+would need to stay consistent. Drop greetings, filler, and resolved small talk. \
+Write compact plain notes (short bullet points or a few short paragraphs), in \
+the conversation's own language — not a message addressed to anyone. Output only \
+the summary.";
 
 /// An upper bound on any single retry backoff, so a misconfigured base or a
 /// large retry count can't park an agent (and its turn) for minutes.
@@ -197,12 +216,38 @@ fn to_token_usage(usage: Usage) -> TokenUsage {
     }
 }
 
+/// Everything needed to build an [`LlmBrain`], grouped so the constructor stays
+/// one clear config bag instead of a long positional argument list.
+pub struct LlmConfig<'a> {
+    /// OpenAI-compatible API root, e.g. `https://api.openai.com/v1`.
+    pub base_url: &'a str,
+    /// Model name to request.
+    pub model: &'a str,
+    /// Bearer key; empty for local endpoints that need none.
+    pub api_key: &'a str,
+    /// Output-token ceiling for one agent reply.
+    pub max_tokens: u64,
+    /// Output-token ceiling for one compression call — larger, since a running
+    /// summary is a cumulative digest rather than a single short reply.
+    pub summary_max_tokens: u64,
+    /// Requests per rolling minute (0 = unlimited).
+    pub max_rpm: u64,
+    /// Automatic retries on a retryable failure before it surfaces to the chat.
+    pub max_retries: u32,
+    /// Base backoff (ms) before the first retry; each further retry doubles it.
+    pub retry_base_ms: u64,
+}
+
 /// An [`AgentBrain`] that drives decisions with an OpenAI-compatible chat model
 /// via rig-core. Endpoint, model, and key all come from config.
 pub struct LlmBrain {
     client: openai::CompletionsClient,
     model: String,
     max_tokens: u64,
+    /// Output-token ceiling for a summarization call — larger than `max_tokens`
+    /// because a running summary is a cumulative digest of a whole multi-persona
+    /// history, not a single short reply.
+    summary_max_tokens: u64,
     /// Optional server-wide request throttle, so a free-tier per-minute quota
     /// (e.g. Gemini's 15 rpm) isn't exceeded. `None` means unlimited.
     limiter: Option<RateLimiter>,
@@ -215,20 +260,20 @@ pub struct LlmBrain {
 }
 
 impl LlmBrain {
-    /// Builds the client against an OpenAI-compatible endpoint. `api_key` may be
-    /// empty for local servers that need no auth. `max_rpm` caps outgoing
-    /// requests per rolling minute (0 = unlimited). `max_retries` and
-    /// `retry_base_ms` tune the automatic backoff on a retryable failure. Fails
-    /// only if the client can't be constructed.
-    pub fn new(
-        base_url: &str,
-        model: impl Into<String>,
-        api_key: &str,
-        max_tokens: u64,
-        max_rpm: u64,
-        max_retries: u32,
-        retry_base_ms: u64,
-    ) -> Result<Self, String> {
+    /// Builds the client against an OpenAI-compatible endpoint from an
+    /// [`LlmConfig`]. `api_key` may be empty for local servers that need no auth.
+    /// Fails only if the client can't be constructed.
+    pub fn new(config: LlmConfig<'_>) -> Result<Self, String> {
+        let LlmConfig {
+            base_url,
+            model,
+            api_key,
+            max_tokens,
+            summary_max_tokens,
+            max_rpm,
+            max_retries,
+            retry_base_ms,
+        } = config;
         let client = openai::CompletionsClient::builder()
             .api_key(api_key)
             .base_url(base_url)
@@ -237,8 +282,9 @@ impl LlmBrain {
         let limiter = (max_rpm > 0).then(|| RateLimiter::per_minute(max_rpm as usize));
         Ok(Self {
             client,
-            model: model.into(),
+            model: model.to_string(),
             max_tokens,
+            summary_max_tokens,
             limiter,
             max_retries,
             retry_base: Duration::from_millis(retry_base_ms),
@@ -360,6 +406,51 @@ impl AgentBrain for LlmBrain {
             }
         }
     }
+
+    async fn summarize(&self, request: &SummaryRequest) -> Result<Summary, BrainError> {
+        use std::fmt::Write as _;
+
+        // The prior summary (framed) plus the batch of older lines to absorb.
+        // Same XML-tagged framing the guidance names, so the model can tell the
+        // established summary apart from the raw messages being folded in.
+        let mut input = String::new();
+        if let Some(prior) = request.prior.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            let _ = write!(input, "<summary_so_far>\n{prior}\n</summary_so_far>\n\n");
+        }
+        input.push_str("<older_messages>\n");
+        for line in &request.lines {
+            let _ = writeln!(input, "{line}");
+        }
+        input.push_str("</older_messages>");
+
+        // A plain-text completion (no structured output/tools): the summary is
+        // free-form notes, not a `respond` decision.
+        let agent = self
+            .client
+            .agent(self.model.as_str())
+            .preamble(SUMMARY_GUIDANCE)
+            .max_tokens(self.summary_max_tokens)
+            .build();
+
+        // One attempt, throttled like a decision. Compression is best-effort: if
+        // it fails the orchestrator just keeps the full transcript this time and
+        // retries at the next boundary, so a retry loop here would only spend more
+        // quota for no correctness gain.
+        if let Some(limiter) = &self.limiter {
+            limiter.acquire().await;
+        }
+        match agent.prompt(input).extended_details().await {
+            Ok(response) => Ok(Summary {
+                text: response.output.trim().to_string(),
+                usage: Some(to_token_usage(response.usage)),
+            }),
+            Err(e) => {
+                let (status, reason) = classify_failure(&e);
+                tracing::warn!(error = %e, ?status, "context compression failed");
+                Err(BrainError { status, reason })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -408,7 +499,17 @@ mod tests {
 
     #[test]
     fn backoff_grows_with_equal_jitter_then_caps() {
-        let brain = LlmBrain::new("http://x", "m", "", 64, 0, 5, 1000).unwrap();
+        let brain = LlmBrain::new(LlmConfig {
+            base_url: "http://x",
+            model: "m",
+            api_key: "",
+            max_tokens: 64,
+            summary_max_tokens: 1024,
+            max_rpm: 0,
+            max_retries: 5,
+            retry_base_ms: 1000,
+        })
+        .unwrap();
         // Equal jitter: the wait lands in [cap/2, cap) for cap = 1s, 2s, 4s …
         // Sample repeatedly so the random half is actually exercised.
         for _ in 0..50 {
@@ -424,7 +525,17 @@ mod tests {
 
     #[test]
     fn backoff_honors_the_server_hint() {
-        let brain = LlmBrain::new("http://x", "m", "", 64, 0, 5, 1000).unwrap();
+        let brain = LlmBrain::new(LlmConfig {
+            base_url: "http://x",
+            model: "m",
+            api_key: "",
+            max_tokens: 64,
+            summary_max_tokens: 1024,
+            max_rpm: 0,
+            max_retries: 5,
+            retry_base_ms: 1000,
+        })
+        .unwrap();
         // A hint wins over the exponential schedule (plus a little jitter).
         let w = brain.backoff(0, Some(Duration::from_secs(3)));
         assert!(w >= Duration::from_secs(3) && w <= Duration::from_millis(3_250), "{w:?}");

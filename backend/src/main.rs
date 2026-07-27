@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
-use crate::agent::llm::LlmBrain;
+use crate::agent::llm::{LlmBrain, LlmConfig};
 use crate::agent::turn::AgentRuntime;
 use crate::config::Config;
 use crate::persist::Persistence;
@@ -76,16 +76,22 @@ async fn main() {
             std::process::exit(1);
         };
         let api_key = config.llm_api_key.as_deref().unwrap_or("");
-        match LlmBrain::new(
+        match LlmBrain::new(LlmConfig {
             base_url,
             model,
             api_key,
-            config.llm_max_tokens,
-            config.llm_max_rpm,
-            config.llm_max_retries,
-            config.llm_retry_base_ms,
-        ) {
-            Ok(brain) => AgentRuntime::llm(Arc::new(brain)),
+            max_tokens: config.llm_max_tokens,
+            summary_max_tokens: config.compress_max_tokens,
+            max_rpm: config.llm_max_rpm,
+            max_retries: config.llm_max_retries,
+            retry_base_ms: config.llm_retry_base_ms,
+        }) {
+            Ok(brain) => {
+                let mut runtime = AgentRuntime::llm(Arc::new(brain));
+                runtime.config.compress_after = config.compress_after;
+                runtime.config.compress_keep = config.compress_keep;
+                runtime
+            }
             Err(e) => {
                 eprintln!("failed to initialise the LLM brain: {e}");
                 std::process::exit(1);
