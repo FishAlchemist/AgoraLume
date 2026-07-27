@@ -89,6 +89,98 @@ fn to_respond(args: RespondArgs) -> Respond {
     }
 }
 
+/// Why a transport-successful completion still can't be used: the model
+/// answered, but the answer isn't a usable decision. Distinct from a
+/// [`PromptError`] (a transport/provider failure) — these are the model's own bad
+/// output, retried with a corrective hint rather than backoff.
+#[derive(Debug)]
+enum BadOutput {
+    /// Not valid `RespondArgs` JSON — malformed, or (as weak models often do)
+    /// truncated mid-string when the reply overran the token cap.
+    Malformed,
+    /// Parsed, but a field is runaway repetition — a weak model looping the same
+    /// phrase or emoji cluster. That's chat spam and wasted tokens, not a reply.
+    Repetitive,
+}
+
+impl BadOutput {
+    /// The corrective hint appended to the next attempt, naming what went wrong so
+    /// the retry steers away from repeating it.
+    fn hint(&self) -> &'static str {
+        match self {
+            BadOutput::Malformed => {
+                "Your previous reply was not a single valid JSON object for the response \
+                 schema (it may have been cut off). Reply again with one short, complete \
+                 JSON decision."
+            }
+            BadOutput::Repetitive => {
+                "Your previous reply repeated the same characters or phrase many times. Reply \
+                 again with one short, natural chat message — no repetition or filler."
+            }
+        }
+    }
+
+    /// The short, sanitized reason surfaced to the chat once retries are spent —
+    /// never the raw model output (which could be a wall of spam).
+    fn reason(&self) -> &'static str {
+        match self {
+            BadOutput::Malformed => "model returned an unparseable response",
+            BadOutput::Repetitive => "model returned a repetitive response",
+        }
+    }
+}
+
+/// Turns a completion's raw text into a decision, rejecting output that can't be
+/// used. A *valid but under-specified* decision (e.g. `speak` with no message)
+/// still degrades to a legitimate silent read via [`to_respond`] — only output
+/// that is malformed/truncated JSON or runaway repetition is an error worth a
+/// retry.
+fn validate_decision(output: &str) -> Result<Respond, BadOutput> {
+    let args =
+        serde_json::from_str::<RespondArgs>(output.trim()).map_err(|_| BadOutput::Malformed)?;
+    if args.message.as_deref().is_some_and(looks_repetitive)
+        || args.mood.as_deref().is_some_and(looks_repetitive)
+    {
+        return Err(BadOutput::Repetitive);
+    }
+    Ok(to_respond(args))
+}
+
+/// Whether `s` is dominated by runaway repetition — a short unit repeated
+/// consecutively enough to be spam rather than speech. Tuned to fire only on
+/// clear loops: a unit of up to `MAX_PERIOD` chars repeated at least
+/// `MIN_REPEATS` times and spanning at least `MIN_COVER` chars, so ordinary
+/// emphasis ("!!!", "哈哈哈") stays well under the bar.
+fn looks_repetitive(s: &str) -> bool {
+    const MAX_PERIOD: usize = 20;
+    const MIN_REPEATS: usize = 8;
+    const MIN_COVER: usize = 60;
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    if n < MIN_COVER {
+        return false;
+    }
+    for period in 1..=MAX_PERIOD.min(n / 2) {
+        let mut i = 0;
+        while i + period <= n {
+            // How many times the window [i, i+period) repeats back-to-back.
+            let mut j = i + period;
+            let mut repeats = 1;
+            while j + period <= n && chars[i..i + period] == chars[j..j + period] {
+                repeats += 1;
+                j += period;
+            }
+            if repeats >= MIN_REPEATS && repeats * period >= MIN_COVER {
+                return true;
+            }
+            // Jump past a measured run; otherwise slide one char to the next
+            // alignment.
+            i = if repeats > 1 { j } else { i + 1 };
+        }
+    }
+    false
+}
+
 /// How the agent is told to use the `respond` schema and the context it has.
 /// Appended *after* the persona's own system prompt, so character comes first
 /// and mechanics second.
@@ -221,6 +313,29 @@ fn to_token_usage(usage: Usage) -> TokenUsage {
         total_tokens: total,
         cached_prompt_tokens: usage.cached_input_tokens,
     }
+}
+
+/// Sums two usage records so a decision reached after retries reports the tokens
+/// every attempt cost. Saturating, so a misreporting provider can't wrap.
+fn add_usage(a: TokenUsage, b: TokenUsage) -> TokenUsage {
+    TokenUsage {
+        prompt_tokens: a.prompt_tokens.saturating_add(b.prompt_tokens),
+        completion_tokens: a.completion_tokens.saturating_add(b.completion_tokens),
+        total_tokens: a.total_tokens.saturating_add(b.total_tokens),
+        cached_prompt_tokens: a.cached_prompt_tokens.saturating_add(b.cached_prompt_tokens),
+    }
+}
+
+/// A short, single-line preview of model output for logs, so rejecting a wall of
+/// repetition doesn't itself flood the log with that same spam.
+fn preview(s: &str) -> String {
+    const MAX: usize = 160;
+    let trimmed = s.trim();
+    let mut out: String = trimmed.chars().take(MAX).collect();
+    if trimmed.chars().nth(MAX).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// Everything needed to build an [`LlmBrain`], grouped so the constructor stays
@@ -426,11 +541,20 @@ impl AgentBrain for LlmBrain {
         // because the preamble is persona- and membership-specific.
         let preamble = format!("{}\n\n{GUIDANCE}", prompt.system.trim());
 
-        // Retry loop: a retryable failure (rate limit, server overload, transport
-        // hiccup) is retried with exponential backoff up to `max_retries`; a
-        // permanent one is surfaced immediately. `attempt` counts retries taken so
-        // far, so `attempt == 0` is the first try.
+        // Retry loop. Two kinds of failure feed it: a transport/provider error
+        // (rate limit, overload, network) is retried with exponential backoff; a
+        // transport-successful but *unusable* completion — malformed/truncated
+        // JSON, or runaway repetition — is retried immediately with a corrective
+        // hint appended so the model steers away from repeating the mistake.
+        // Either way, once `max_retries` is spent the failure is surfaced to the
+        // chat rather than swallowed as a silent read. `attempt == 0` is the first
+        // try.
         let mut attempt: u32 = 0;
+        // A one-line hint appended to the *next* attempt after unusable output.
+        let mut correction: Option<&'static str> = None;
+        // Tokens accumulate across attempts: every attempt that reaches the model
+        // is billed, so a decision reached after retries reports its whole cost.
+        let mut usage_acc = TokenUsage::default();
         loop {
             // Throttle before issuing the request so the server stays under the
             // provider's per-minute quota. Waiting here (rather than after) means a
@@ -441,32 +565,58 @@ impl AgentBrain for LlmBrain {
 
             // A structured-output completion: `RespondArgs` as the schema, no
             // tools, so rig resolves `OutputMode::Auto` to native structured output
-            // — one request, no function-call round-trip. That keeps the decision a
-            // single succeed-or-fail completion whichever provider backs the brain.
-            match self
-                .prompt_once(&preamble, self.max_tokens, true, prompt.conversation.clone())
-                .await
-            {
+            // — one request, no function-call round-trip. Any correction from a
+            // prior unusable attempt rides along as its own tagged section so the
+            // model sees why its last reply was rejected.
+            let text = match correction {
+                Some(hint) => {
+                    format!("{}\n\n<retry_note>{hint}</retry_note>", prompt.conversation)
+                }
+                None => prompt.conversation.clone(),
+            };
+            match self.prompt_once(&preamble, self.max_tokens, true, text).await {
                 Ok(response) => {
-                    let respond = serde_json::from_str::<RespondArgs>(response.output.trim())
-                        .map(to_respond)
-                        .unwrap_or_else(|e| {
-                            // The loop finished but the final text wasn't the expected
-                            // structured decision. The model *did* answer, so this is
-                            // its own (malformed) completion, not a transport failure —
-                            // stay silent rather than guess, and don't retry.
+                    usage_acc = add_usage(usage_acc, to_token_usage(response.usage));
+                    match validate_decision(&response.output) {
+                        Ok(respond) => {
+                            return Decision {
+                                outcome: Outcome::Responded(respond),
+                                usage: Some(usage_acc),
+                            };
+                        }
+                        // The model answered, but the answer can't be used. This is
+                        // the model's own output, not a transport failure, so retry
+                        // it *with a hint* (no backoff — it isn't server pressure)
+                        // and, when retries run out, surface a failure so the turn
+                        // stays unread instead of masquerading as a chosen silence.
+                        Err(bad) if attempt < self.max_retries => {
                             tracing::warn!(
                                 persona = %prompt.persona_name,
-                                error = %e,
-                                output = %response.output,
-                                "could not parse the agent's structured decision; treating as read"
+                                reason = bad.reason(),
+                                output = %preview(&response.output),
+                                attempt = attempt + 1,
+                                "unusable agent output; retrying with a corrective hint"
                             );
-                            Respond::read()
-                        });
-                    return Decision {
-                        outcome: Outcome::Responded(respond),
-                        usage: Some(to_token_usage(response.usage)),
-                    };
+                            correction = Some(bad.hint());
+                            attempt += 1;
+                            continue;
+                        }
+                        Err(bad) => {
+                            tracing::warn!(
+                                persona = %prompt.persona_name,
+                                reason = bad.reason(),
+                                output = %preview(&response.output),
+                                "unusable agent output after retries; surfacing to chat"
+                            );
+                            return Decision {
+                                outcome: Outcome::Failed(BrainError {
+                                    status: None,
+                                    reason: bad.reason().to_string(),
+                                }),
+                                usage: Some(usage_acc),
+                            };
+                        }
+                    }
                 }
                 Err(e) => {
                     let (status, reason) = classify_failure(&e);
@@ -486,17 +636,22 @@ impl AgentBrain for LlmBrain {
                         );
                         tokio::time::sleep(wait).await;
                         attempt += 1;
+                        // This attempt never reached the model, so there's no bad
+                        // completion to correct — drop any pending content hint.
+                        correction = None;
                         continue;
                     }
                     // Out of retries (or a permanent error): surface the sanitized
                     // failure to the chat rather than pretending the agent read.
+                    // Report any tokens earlier attempts already spent.
                     tracing::warn!(
                         persona = %prompt.persona_name,
                         error = %e,
                         ?status,
                         "LLM decide failed; surfacing to chat"
                     );
-                    return Decision { outcome: Outcome::Failed(BrainError { status, reason }), usage: None };
+                    let usage = (usage_acc.total_tokens > 0).then_some(usage_acc);
+                    return Decision { outcome: Outcome::Failed(BrainError { status, reason }), usage };
                 }
             }
         }
@@ -674,5 +829,59 @@ mod tests {
         );
         // `mood` with no mood → silent.
         assert_eq!(to_respond(args(ActionKind::Mood, None, None)).action, Action::Read);
+    }
+
+    #[test]
+    fn flags_runaway_repetition_only() {
+        // A looped emoji cluster and a long single-char run are spam.
+        assert!(looks_repetitive(&"🏐💥🚀🔥💪✨🚀🎉".repeat(30)));
+        assert!(looks_repetitive(&"!".repeat(80)));
+        assert!(looks_repetitive(&"哈".repeat(80)));
+        // Ordinary emphasis and normal chat stay under the bar.
+        assert!(!looks_repetitive("哈哈哈"));
+        assert!(!looks_repetitive("好的！！！我知道了"));
+        assert!(!looks_repetitive(
+            "這是一句正常、稍微長一點點的聊天訊息，內容沒有任何連續重複的片段。"
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_unusable_output_but_keeps_valid() {
+        // Malformed / truncated JSON → a retryable content error.
+        assert!(matches!(
+            validate_decision(r#"{"action": "speak", "message": "hi"#),
+            Err(BadOutput::Malformed)
+        ));
+        // Valid JSON whose spoken line is spam → a retryable content error.
+        let spam = format!(r#"{{"action":"speak","message":"{}"}}"#, "🔥🚀".repeat(50));
+        assert!(matches!(validate_decision(&spam), Err(BadOutput::Repetitive)));
+        // A clean decision parses through.
+        let ok = validate_decision(r#"{"action":"speak","message":"hello"}"#).unwrap();
+        assert_eq!(ok.action, Action::Speak);
+        // A valid-but-underspecified decision still degrades to a legit read,
+        // *not* an error — the model genuinely chose to say nothing usable.
+        let read = validate_decision(r#"{"action":"speak"}"#).unwrap();
+        assert_eq!(read.action, Action::Read);
+    }
+
+    #[test]
+    fn add_usage_sums_each_field() {
+        let a = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_prompt_tokens: 2,
+        };
+        let b = TokenUsage {
+            prompt_tokens: 3,
+            completion_tokens: 7,
+            total_tokens: 10,
+            cached_prompt_tokens: 1,
+        };
+        let sum = add_usage(a, b);
+        assert_eq!(sum.prompt_tokens, 13);
+        assert_eq!(sum.completion_tokens, 12);
+        assert_eq!(sum.total_tokens, 25);
+        assert_eq!(sum.cached_prompt_tokens, 3);
     }
 }
