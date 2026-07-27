@@ -1,29 +1,36 @@
-//! The LLM-backed [`AgentBrain`] — rig-core structured output over an
-//! OpenAI-compatible chat endpoint.
+//! The LLM-backed [`AgentBrain`] — rig-core structured output over a configured
+//! chat endpoint.
 //!
 //! This is the real implementation of the single inference seam. The
 //! orchestrator still owns all context work; this brain just turns an
 //! [`AgentPrompt`] into a structured `respond` decision by asking a model.
-//! Everything about the endpoint is configured (base URL, model, key) — nothing
-//! is hard-coded to a provider, so it drives OpenAI, OpenRouter, or a local
-//! Ollama / llama.cpp server equally.
 //!
-//! The decision is one structured-output completion: no callable tools, so
+//! The backend is not coupled to any one provider. Everything about the endpoint
+//! is configured (base URL, model, key), so by default an OpenAI-compatible
+//! [`Provider::OpenAi`] client drives OpenAI, OpenRouter, or a local Ollama /
+//! llama.cpp server equally. The one exception is a base URL that points at
+//! Gemini's OpenAI-compat shim (`generativelanguage.googleapis.com/…/openai/`):
+//! it is auto-detected and redirected to rig's *native* Gemini provider
+//! ([`Provider::Gemini`]), logged when that happens. The compat wire format has
+//! no field for Gemini's `thoughtSignature`, which the native path round-trips —
+//! so anything that relies on it (a tool / thought-carrying turn) works only on
+//! the native client, not the compat one.
+//!
+//! The decision itself is one structured-output completion: no callable tools, so
 //! rig resolves `OutputMode::Auto` to native structured output — a single
 //! request, no function-call round-trip. Member lookups the agent might have
 //! needed a tool for are handed to it up front in the prompt's `<directory>`
-//! section instead. A live tool loop needs a follow-up turn, which providers
-//! like Gemini reject (their function calls carry a `thought_signature` that rig
-//! 0.40 can't round-trip); staying single-shot keeps every decision succeed-or-
+//! section instead. Staying single-shot keeps every decision succeed-or-
 //! genuinely-fail, so a silent "read" is always the model's own choice rather
 //! than a swallowed tool-call error.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rig_core::agent::PromptResponse;
 use rig_core::client::completion::CompletionClient;
-use rig_core::completion::{Prompt, Usage};
-use rig_core::providers::openai;
+use rig_core::completion::{Prompt, PromptError, Usage};
+use rig_core::providers::{gemini, openai};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -238,10 +245,89 @@ pub struct LlmConfig<'a> {
     pub retry_base_ms: u64,
 }
 
-/// An [`AgentBrain`] that drives decisions with an OpenAI-compatible chat model
-/// via rig-core. Endpoint, model, and key all come from config.
+/// The concrete rig client behind the brain. Keeping the two providers behind one
+/// enum is what lets the rest of the brain — retry loop, usage accounting, prompt
+/// framing — stay provider-agnostic: only [`LlmBrain::prompt_once`] ever has to
+/// name which one is in play.
+enum Provider {
+    /// An OpenAI-compatible chat endpoint (OpenAI, OpenRouter, Ollama, …).
+    OpenAi(openai::CompletionsClient),
+    /// rig's native Gemini provider, selected when the configured base URL targets
+    /// Gemini's OpenAI-compat shim (see [`is_gemini_openai_compat`]).
+    Gemini(gemini::Client),
+}
+
+impl Provider {
+    /// Selects and builds the provider for a configured endpoint. A base URL that
+    /// targets Gemini's OpenAI-compat shim is redirected to the native Gemini
+    /// provider (and logged, so the switch is visible); every other endpoint is
+    /// treated as OpenAI-compatible. `api_key` may be empty for a local server
+    /// that needs none.
+    fn resolve(base_url: &str, api_key: &str) -> Result<Self, String> {
+        if is_gemini_openai_compat(base_url) {
+            tracing::info!(
+                base_url,
+                "base URL targets Gemini's OpenAI-compat endpoint; switching to \
+                 rig's native Gemini provider so thought signatures round-trip"
+            );
+            // The native provider uses its own default base URL and API path — the
+            // compat URL was only the signal, not an endpoint to forward to.
+            let client = gemini::Client::builder()
+                .api_key(api_key)
+                .build()
+                .map_err(|e| format!("failed to build the Gemini client: {e}"))?;
+            Ok(Provider::Gemini(client))
+        } else {
+            let client = openai::CompletionsClient::builder()
+                .api_key(api_key)
+                .base_url(base_url)
+                .build()
+                .map_err(|e| format!("failed to build the LLM client: {e}"))?;
+            Ok(Provider::OpenAi(client))
+        }
+    }
+}
+
+/// Builds and runs one completion against any rig client, handing rig's raw
+/// response (or error) back for the caller's retry and usage handling. Generic
+/// over the provider so the OpenAI and Gemini arms share a single body; the two
+/// concrete clients differ only in construction, never here. `structured` toggles
+/// the `respond` output schema (a decision) versus a plain-text completion (a
+/// summary). Extended details carry token usage, which feeds the debug/cost panel.
+async fn prompt_completion<C>(
+    client: &C,
+    model: &str,
+    preamble: &str,
+    max_tokens: u64,
+    structured: bool,
+    text: String,
+) -> Result<PromptResponse, PromptError>
+where
+    C: CompletionClient,
+    C::CompletionModel: 'static,
+{
+    let mut builder = client.agent(model).preamble(preamble).max_tokens(max_tokens);
+    if structured {
+        builder = builder.output_schema::<RespondArgs>();
+    }
+    builder.build().prompt(text).extended_details().await
+}
+
+/// Whether a base URL points at Gemini's OpenAI-compatibility endpoint
+/// (`https://generativelanguage.googleapis.com/…/openai/`). Such a URL is the
+/// signal to drive rig's *native* Gemini provider instead: the OpenAI wire format
+/// has no field for Gemini's `thoughtSignature`, which the native path round-trips.
+/// Tolerant of a trailing slash and letter case so a hand-typed value still matches.
+fn is_gemini_openai_compat(base_url: &str) -> bool {
+    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    normalized.contains("generativelanguage.googleapis.com") && normalized.ends_with("/openai")
+}
+
+/// An [`AgentBrain`] that drives decisions with a rig-core chat model. Endpoint,
+/// model, and key all come from config; the provider (OpenAI-compatible or native
+/// Gemini) is chosen from the base URL at construction.
 pub struct LlmBrain {
-    client: openai::CompletionsClient,
+    client: Provider,
     model: String,
     max_tokens: u64,
     /// Output-token ceiling for a summarization call — larger than `max_tokens`
@@ -260,9 +346,9 @@ pub struct LlmBrain {
 }
 
 impl LlmBrain {
-    /// Builds the client against an OpenAI-compatible endpoint from an
-    /// [`LlmConfig`]. `api_key` may be empty for local servers that need no auth.
-    /// Fails only if the client can't be constructed.
+    /// Builds the brain from an [`LlmConfig`], choosing the provider from the base
+    /// URL (see [`Provider::resolve`]). `api_key` may be empty for local servers
+    /// that need no auth. Fails only if the client can't be constructed.
     pub fn new(config: LlmConfig<'_>) -> Result<Self, String> {
         let LlmConfig {
             base_url,
@@ -274,11 +360,7 @@ impl LlmBrain {
             max_retries,
             retry_base_ms,
         } = config;
-        let client = openai::CompletionsClient::builder()
-            .api_key(api_key)
-            .base_url(base_url)
-            .build()
-            .map_err(|e| format!("failed to build the LLM client: {e}"))?;
+        let client = Provider::resolve(base_url, api_key)?;
         let limiter = (max_rpm > 0).then(|| RateLimiter::per_minute(max_rpm as usize));
         Ok(Self {
             client,
@@ -289,6 +371,26 @@ impl LlmBrain {
             max_retries,
             retry_base: Duration::from_millis(retry_base_ms),
         })
+    }
+
+    /// Dispatches one completion to whichever provider backs this brain. Both the
+    /// decision retry loop and the summary path go through here, so the choice of
+    /// provider is named in exactly one place rather than duplicated per call site.
+    async fn prompt_once(
+        &self,
+        preamble: &str,
+        max_tokens: u64,
+        structured: bool,
+        text: String,
+    ) -> Result<PromptResponse, PromptError> {
+        match &self.client {
+            Provider::OpenAi(c) => {
+                prompt_completion(c, &self.model, preamble, max_tokens, structured, text).await
+            }
+            Provider::Gemini(c) => {
+                prompt_completion(c, &self.model, preamble, max_tokens, structured, text).await
+            }
+        }
     }
 
     /// The wait before the `attempt`-th retry (0-based). A server-supplied
@@ -324,19 +426,6 @@ impl AgentBrain for LlmBrain {
         // because the preamble is persona- and membership-specific.
         let preamble = format!("{}\n\n{GUIDANCE}", prompt.system.trim());
 
-        // `RespondArgs` as the structured output schema, with no tools — so rig
-        // resolves `OutputMode::Auto` to native structured output: one request,
-        // no function-call round-trip. That keeps the decision a single
-        // succeed-or-fail completion across providers (including Gemini, which
-        // rejects a tool loop's follow-up turn over `thought_signature`).
-        let agent = self
-            .client
-            .agent(self.model.as_str())
-            .preamble(&preamble)
-            .max_tokens(self.max_tokens)
-            .output_schema::<RespondArgs>()
-            .build();
-
         // Retry loop: a retryable failure (rate limit, server overload, transport
         // hiccup) is retried with exponential backoff up to `max_retries`; a
         // permanent one is surfaced immediately. `attempt` counts retries taken so
@@ -350,8 +439,14 @@ impl AgentBrain for LlmBrain {
                 limiter.acquire().await;
             }
 
-            // Extended details carry the token usage, which feeds the debug/cost panel.
-            match agent.prompt(prompt.conversation.clone()).extended_details().await {
+            // A structured-output completion: `RespondArgs` as the schema, no
+            // tools, so rig resolves `OutputMode::Auto` to native structured output
+            // — one request, no function-call round-trip. That keeps the decision a
+            // single succeed-or-fail completion whichever provider backs the brain.
+            match self
+                .prompt_once(&preamble, self.max_tokens, true, prompt.conversation.clone())
+                .await
+            {
                 Ok(response) => {
                     let respond = serde_json::from_str::<RespondArgs>(response.output.trim())
                         .map(to_respond)
@@ -423,15 +518,6 @@ impl AgentBrain for LlmBrain {
         }
         input.push_str("</older_messages>");
 
-        // A plain-text completion (no structured output/tools): the summary is
-        // free-form notes, not a `respond` decision.
-        let agent = self
-            .client
-            .agent(self.model.as_str())
-            .preamble(SUMMARY_GUIDANCE)
-            .max_tokens(self.summary_max_tokens)
-            .build();
-
         // One attempt, throttled like a decision. Compression is best-effort: if
         // it fails the orchestrator just keeps the full transcript this time and
         // retries at the next boundary, so a retry loop here would only spend more
@@ -439,7 +525,9 @@ impl AgentBrain for LlmBrain {
         if let Some(limiter) = &self.limiter {
             limiter.acquire().await;
         }
-        match agent.prompt(input).extended_details().await {
+        // A plain-text completion (no structured output/tools): the summary is
+        // free-form notes, not a `respond` decision.
+        match self.prompt_once(SUMMARY_GUIDANCE, self.summary_max_tokens, false, input).await {
             Ok(response) => Ok(Summary {
                 text: response.output.trim().to_string(),
                 usage: Some(to_token_usage(response.usage)),
@@ -542,6 +630,21 @@ mod tests {
         // Still clamped to the cap so a turn can't hang on a huge hint.
         let w = brain.backoff(0, Some(Duration::from_secs(600)));
         assert!(w >= MAX_BACKOFF && w <= MAX_BACKOFF + Duration::from_millis(250), "{w:?}");
+    }
+
+    #[test]
+    fn detects_gemini_openai_compat_endpoint() {
+        // The exact shim URL, and tolerant of a trailing slash / letter case.
+        assert!(is_gemini_openai_compat("https://generativelanguage.googleapis.com/v1beta/openai/"));
+        assert!(is_gemini_openai_compat("https://generativelanguage.googleapis.com/v1beta/openai"));
+        assert!(is_gemini_openai_compat(
+            "  HTTPS://generativelanguage.googleapis.com/v1beta/OpenAI/  "
+        ));
+        // A plain OpenAI-compatible endpoint (incl. Gemini's *native* base) is not
+        // the compat shim, so it stays on the OpenAI-compatible client.
+        assert!(!is_gemini_openai_compat("https://api.openai.com/v1"));
+        assert!(!is_gemini_openai_compat("http://localhost:11434/v1"));
+        assert!(!is_gemini_openai_compat("https://generativelanguage.googleapis.com"));
     }
 
     #[test]

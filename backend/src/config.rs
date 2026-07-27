@@ -63,6 +63,10 @@ pub struct Config {
     pub llm: bool,
     /// OpenAI-compatible API root, e.g. `https://api.openai.com/v1` or a local
     /// `http://localhost:11434/v1` (Ollama). Read from `AGORALUME_LLM_BASE_URL`.
+    /// Pointing this at Gemini's OpenAI-compat shim
+    /// (`https://generativelanguage.googleapis.com/v1beta/openai/`) is detected and
+    /// redirected to rig's native Gemini provider (logged at startup), since the
+    /// compat wire format can't carry Gemini's `thoughtSignature`.
     pub llm_base_url: Option<String>,
     /// Model name to request, e.g. `gpt-4o-mini` or `llama3.1`. Read from
     /// `AGORALUME_LLM_MODEL`. Nothing is hard-coded — you choose the model.
