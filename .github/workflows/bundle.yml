@@ -1,8 +1,9 @@
 name: Bundle
 
-# Packages the distributable zip on every push to main and on PRs, and uploads
-# it as an artifact that expires after one day. Kept separate from ci.yml
-# because packaging is a different concern from the quality gates.
+# Packages the distributable zip for each OS (Linux + Windows) on every push to
+# main and on PRs, and uploads each as an artifact that expires after one day.
+# Kept separate from ci.yml because packaging is a different concern from the
+# quality gates.
 #
 # Same policy as ci.yml: only first-party actions (GitHub's actions/*, pnpm's
 # action-setup) with Rust via the pre-bundled rustup, each pinned to a full
@@ -22,8 +23,17 @@ permissions:
 
 jobs:
   bundle:
-    name: Bundle (distributable zip)
-    runs-on: ubuntu-latest
+    name: Bundle (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One OS failing shouldn't cancel the other's bundle.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: AgoraLume-linux-x64
+          - os: windows-latest
+            artifact: AgoraLume-win32-x64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
@@ -58,10 +68,10 @@ jobs:
         run: node scripts/bundle.mjs
       # Upload the staged folder rather than the script's own .zip: GitHub always
       # wraps an artifact in one zip, so this way the download unzips exactly once
-      # to the runnable exe + web/ + .env.example.
+      # to the runnable exe + web/ + .env.example + BUILD_INFO.txt.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: AgoraLume-linux-x64
+          name: ${{ matrix.artifact }}
           path: dist-bundle/AgoraLume
           retention-days: 1
           if-no-files-found: error

@@ -10,7 +10,7 @@
 // Run from anywhere: `node scripts/bundle.mjs`.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,6 +25,18 @@ function run(cmd, args, cwd = repoRoot) {
   if (res.status !== 0) {
     throw new Error(`${cmd} exited with ${res.status ?? res.signal}`);
   }
+}
+
+// The full commit this bundle was built from, so two otherwise-identical zips
+// (each CI run overwrites the 1-day artifact) can be told apart. Prefer the
+// working tree's own HEAD; fall back to the CI-provided SHA, then "unknown".
+// A dirty tree is flagged so a hand-built bundle isn't mistaken for a clean one.
+function buildCommit() {
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' });
+  const sha = head.status === 0 ? head.stdout.trim() : process.env.GITHUB_SHA || 'unknown';
+  const status = spawnSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8' });
+  const dirty = status.status === 0 && status.stdout.trim() !== '';
+  return dirty ? `${sha} (dirty)` : sha;
 }
 
 // 1. Build the frontend in same-origin mode (defaults to the serving origin,
@@ -44,6 +56,14 @@ cpSync(join(repoRoot, 'frontend', 'dist'), join(stageDir, 'web'), { recursive: t
 // Ship the settings template beside the exe; users copy it to `.env` (which the
 // backend loads on startup) to configure without exporting env vars by hand.
 cpSync(join(repoRoot, '.env.example'), join(stageDir, '.env.example'));
+// Stamp the bundle with its source commit and build time so identical-looking
+// zips (the CI artifact is overwritten on every push) stay distinguishable.
+const commit = buildCommit();
+writeFileSync(
+  join(stageDir, 'BUILD_INFO.txt'),
+  `AgoraLume bundle\ncommit: ${commit}\nbuilt:  ${new Date().toISOString()}\n`,
+);
+console.log(`  build commit: ${commit}`);
 
 // 4. Zip the staged folder with each OS's standard tool.
 const zipName = `AgoraLume-${process.platform}-${process.arch}.zip`;
