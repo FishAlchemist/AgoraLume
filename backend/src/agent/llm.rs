@@ -410,7 +410,10 @@ struct SuggestArgs {
 /// arrives in the tagged input; this preamble is the standing instruction. It
 /// holds one harm floor — never voice contempt for another participant — but
 /// stops there: it declines the cruel line without mandating a virtuous one, so
-/// the openers stay natural and the user keeps the choice.
+/// the openers stay natural and the user keeps the choice. It also aims the
+/// openers to open a door rather than script the user: complete enough to send,
+/// but leaving the real substance for the user to bring, so the feature guides
+/// rather than ghostwrites.
 const SUGGEST_GUIDANCE: &str = "\
 You help a user who isn't sure what to say next in a group text chat. You are \
 given who is in the room in <group_members> (the human is marked \"(the user)\"), \
@@ -421,7 +424,10 @@ conversation. Rules: write in the first person AS the user (not as any AI \
 member); keep each to one short, natural sentence that can be sent verbatim; fit \
 the part of day (never ask about the evening in the morning, or vice versa); and \
 prefer variety — a question, a fresh topic, and a follow-up that acknowledges or \
-builds on what someone just said. Never put a line in the user's mouth that \
+builds on what someone just said. Prefer openers that open a door — an invitation \
+or an open question that leaves the real substance to the user — over lines that \
+settle the user's own opinion, feelings, or conclusion for them; the aim is to \
+get the user talking, not to talk for them. Never put a line in the user's mouth that \
 mocks, belittles, threatens, or shows contempt for another participant — leave \
 it out even if the recent tone invites it. Stay natural, not preachy: you offer \
 openers the user may pick or ignore, never a lesson. \
