@@ -34,8 +34,8 @@ Each file owns one concern; follow the link into the code for detail.
 | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main.rs`      | Process entry, tracing, `--dump-openapi` one-shot, server bind.                                                                                                                                                                        |
 | `config.rs`    | Environment-driven configuration (bind address, data dir, LLM). Loads a `.env` beside the executable (or the working dir in dev) at startup, so a bundle is configured with a file rather than shell exports; real env vars still win. |
-| `models.rs`    | Wire types: `Message` (conversation / mood), `ReadReceipt`, `ServerMeta`.                                                                                                                                                              |
-| `workspace.rs` | The SSOT: personas, groups, memberships; persona/variable resolution with org→dept→persona inheritance.                                                                                                                                |
+| `models.rs`    | Wire types: `Persona` (with its identity `promptHash`), `Memory`, `PromptLabel`, `Message` (conversation / mood), `ReadReceipt`, `ServerMeta`.                                                                                          |
+| `workspace.rs` | The SSOT: personas, groups, memberships; per-persona memories partitioned by identity hash; persona/variable resolution with org→dept→persona inheritance.                                                                             |
 | `state.rs`     | In-memory `AppState`: workspace, per-group message logs, per-group SSE broadcast channels, per-group coordinators, and the agent runtime.                                                                                              |
 | `routes/`      | HTTP surface. `chat.rs` holds the endpoints; `mod.rs` composes the router and the OpenAPI document.                                                                                                                                    |
 | `agent/`       | The multi-agent conversation engine — see [agent-loop.md](./agent-loop.md).                                                                                                                                                            |
@@ -92,6 +92,40 @@ it with `AGORALUME_LLM=1` and set `AGORALUME_LLM_BASE_URL` / `AGORALUME_LLM_MODE
 `.env` file beside the executable (see `.env.example`). This is what makes the
 loop testable without an LLM and connectable to one without a rewrite — detailed
 in [agent-loop.md](./agent-loop.md).
+
+## Persona memory & identity
+
+A persona's `system_prompt` is freely editable, which creates an out-of-character
+hazard: rewrite who a character is, and old memories would feed back to someone who
+no longer resembles the character that recorded them. The fix is a content
+**identity hash** and per-version partitioning.
+
+- **The hash covers the raw `system_prompt` text only** — not the fully-resolved
+  `AgentPrompt.system` (which also carries the roster / `<directory>` and would
+  churn when group membership changes), and **not variables**. Variables inherit
+  org → department → persona, so hashing resolved values would let an org or
+  department edit silently bump a persona's version from a UI its own editor never
+  sees — an invisible failure. The hash is the text box the user is looking at when
+  they think "I'm redefining this character."
+- **Content-addressed and nameable.** Pasting the old prompt text back resolves to
+  the same hash (a counter would call it a new version); a `{ hash, label }` side
+  table lets a user name a version git-tag style ("night-shift 版") without
+  polluting `Persona` itself.
+- **Memories are stamped with the persona's current hash**, partitioning them per
+  identity. Recall filters to the current hash: memories written by earlier
+  versions are kept and still listed in the management UI, but held out of recall
+  so the character stays true to who it is now. Memories cascade-delete with the
+  persona.
+- **Accepted limitation.** Shared org/department variables (designed to carry a
+  common tone down the inheritance chain) can shift a persona's effective voice
+  without changing its hash. This is not solved automatically; the manual memory
+  UI is the escape hatch, deliberately in place of any auto-bump — bumping the
+  version on an unrelated edit (a typo fix, a color change) would look like the
+  character mysteriously losing its memory.
+
+The write and recall mechanics — the two pull tools — live in
+[agent-loop.md](./agent-loop.md#persona-memory); the REST surface for browsing and
+managing memories is generated into `openapi.yml`.
 
 ## Conventions
 

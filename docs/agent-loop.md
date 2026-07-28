@@ -109,10 +109,55 @@ Information is deliberately segregated:
 - **UI View Stream** — the outward SSE feed (`message` + mood), rendering bubbles
   and mood animations. Corresponds to `GET /groups/{id}/stream`.
 
-> Per-agent long-term memory is intentionally **not** part of this build. Personas
-> reason over the current transcript only; the conversation itself is the shared
-> record. A private memory store can slot in behind the orchestrator later without
-> changing the `AgentBrain` seam.
+> Per-agent long-term memory now lives behind this seam — added without changing
+> the `AgentBrain` signature, exactly as the seam promised. See
+> [Persona memory](#persona-memory) below.
+
+---
+
+## Persona memory
+
+Personas carry private, long-term memories, exposed to the brain as two rig tools
+rather than folded into the prompt:
+
+- **`recall_memory`** — registered **only when** the persona has memories for its
+  _current_ identity (the identity hash in
+  [backend-architecture.md](./backend-architecture.md#persona-memory--identity)).
+  It returns those memories' contents on demand.
+- **`remember`** — always registered; lets a persona store a fact it wants to
+  keep. The orchestrator writes it through the same `Workspace::add_memory` path
+  the REST endpoint uses, so the brain stays a pure prompt → decision function.
+
+Both are **pull** tools, and that is the point. A turn that reaches for one costs
+a _second_ provider request (the model calls the tool, rig feeds the result back,
+then the model finalizes); a turn that touches neither stays a single request.
+Recall is rare, so injecting every persona's memories into every prompt would burn
+the request and token budget on a payload almost never read. Registering a tool is
+itself free — rig finalizes the instant the model calls `final_result` — so cost
+is incurred only on actual use. Because a tool is always present, decisions always
+run in rig's `Tool` output mode, and the agent's `max_turns` is raised above 1 so
+a tool loop isn't cut short by a `MaxTurnsError`.
+
+## Tools, structured output, and cost
+
+`respond` is not a callable tool — it is the single-shot **structured output** that
+finalizes every decision, kept that way deliberately for determinism even after
+native-Gemini routing removed the general blocker to tool use. Real tools (memory,
+and anything added later) coexist with that schema through rig-core's
+`OutputMode::Auto`, which resolves to `Tool` mode wherever a provider's native
+structured output would otherwise suppress tool calls: the schema is registered as
+a synthetic `final_result` tool the model calls last, after freely using its real
+tools. `respond`'s validation needs no changes for this — rig handles the switch.
+
+Two rules follow from the cost model above:
+
+- **A real tool earns its request only when static context can't serve the same
+  fact for free.** Don't add a pull tool for something the prompt already carries
+  (e.g. the roster / `<directory>` block).
+- **External world-state is a push, not a pull.** Rain, time, an emergency —
+  anything room-wide — belongs in `Event::Environment` (see
+  [Event & Salience](#event--salience)), not a `get_*` tool that would open a
+  second, competing, request-costing pathway for the same kind of fact.
 
 ---
 
