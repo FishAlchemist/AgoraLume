@@ -25,7 +25,16 @@ export function Composer({ disabled, placeholder, onSend, fill }: Props) {
   useEffect(() => {
     if (!fill) return;
     setValue(fill.text);
-    ref.current?.focus();
+    // Focus and drop the caret at the end so the filled text reads as a start to
+    // continue from, not a finished draft to send. rAF waits for React to commit
+    // the new value so the caret lands past the last character.
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      const end = el.value.length;
+      el.setSelectionRange(end, end);
+    });
   }, [fill?.nonce]);
 
   const submit = () => {
