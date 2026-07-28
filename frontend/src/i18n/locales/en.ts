@@ -38,6 +38,8 @@ export const en = {
     member: '{{count}} member',
     confirm: 'Confirm',
     confirmTitle: 'Please confirm',
+    copy: 'Copy',
+    copied: 'Copied',
   },
   chat: {
     placeholder: 'Message the group…',
@@ -52,6 +54,7 @@ export const en = {
     waiting: 'Waiting for a reply…',
     aiTag: 'AI',
     readCount: 'Read {{count}}/{{total}}',
+    readReceiptsTitle: 'Read receipts',
     readReplied: 'Replied',
     readSilent: 'Read, no reply',
     readUnread: 'Not read yet',

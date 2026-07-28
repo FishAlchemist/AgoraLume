@@ -1,4 +1,5 @@
-import { Badge, Button, Group, HoverCard, Paper, Stack, Text } from '@mantine/core';
+import { Badge, Button, Group, Modal, Paper, Stack, Text, UnstyledButton } from '@mantine/core';
+import { useDisclosure } from '@mantine/hooks';
 import { IconAlertTriangle, IconChecks, IconRefresh } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { useUi } from '../store/ui';
@@ -188,9 +189,14 @@ interface ReadReceiptsProps {
   repliedBy?: string[];
 }
 
-/** Read-receipt badge for your own message, with a hover list of who read it. */
+/**
+ * Read-receipt badge for your own message. Clicking it opens a persistent modal
+ * listing who read it — a modal rather than a hover card so it survives the chat
+ * scrolling while you compare names against who's in the room.
+ */
 function ReadReceipts({ readBy, aiMembers, repliedBy }: ReadReceiptsProps) {
   const { t } = useTranslation();
+  const [opened, { open, close }] = useDisclosure(false);
   const readSet = new Set(readBy ?? []);
   const repliedSet = new Set(repliedBy ?? []);
   const replied = aiMembers.filter((p) => repliedSet.has(p.id));
@@ -198,23 +204,23 @@ function ReadReceipts({ readBy, aiMembers, repliedBy }: ReadReceiptsProps) {
   const unread = aiMembers.filter((p) => !readSet.has(p.id) && !repliedSet.has(p.id));
 
   return (
-    <HoverCard width={230} position="top-end" withArrow shadow="md" openDelay={120}>
-      <HoverCard.Target>
-        <Group gap={4} pr={6} wrap="nowrap" c="dimmed" style={{ cursor: 'default' }}>
+    <>
+      <UnstyledButton onClick={open} aria-label={t('chat.readReceiptsTitle')}>
+        <Group gap={4} pr={6} wrap="nowrap" c="dimmed">
           <IconChecks size={13} />
           <Text size="xs">
             {t('chat.readCount', { count: readSet.size, total: aiMembers.length })}
           </Text>
         </Group>
-      </HoverCard.Target>
-      <HoverCard.Dropdown>
+      </UnstyledButton>
+      <Modal opened={opened} onClose={close} title={t('chat.readReceiptsTitle')} size="sm" centered>
         <Stack gap="sm">
           <ReaderGroup label={t('chat.readReplied')} list={replied} />
           <ReaderGroup label={t('chat.readSilent')} list={readSilent} />
           <ReaderGroup label={t('chat.readUnread')} list={unread} dim />
         </Stack>
-      </HoverCard.Dropdown>
-    </HoverCard>
+      </Modal>
+    </>
   );
 }
 

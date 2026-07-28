@@ -43,6 +43,19 @@ export function applyTemplate(template: string, variables: Record<string, string
   );
 }
 
+/**
+ * Lists the distinct {{name}} placeholders a template references, in first-seen
+ * order. Same token grammar as `applyTemplate` — this enumerates the tokens
+ * instead of substituting them, to show which variables a template uses.
+ */
+export function extractPlaceholders(template: string): string[] {
+  const seen = new Set<string>();
+  for (const [, name] of template.matchAll(PLACEHOLDER)) {
+    seen.add(name);
+  }
+  return [...seen];
+}
+
 /** Resolves a persona's system prompt with all variables applied. */
 export function resolveSystemPrompt(
   persona: Persona,

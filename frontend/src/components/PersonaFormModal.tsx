@@ -21,6 +21,7 @@ import { useWorkspace } from '../store/workspace';
 import type { Department, Persona, PersonaKind } from '../types';
 import { AvatarUpload } from './AvatarUpload';
 import { ColorSelect } from './ColorSelect';
+import { CopyIconButton } from './CopyIconButton';
 import { VariablesEditor } from './VariablesEditor';
 
 interface Props {
@@ -268,9 +269,12 @@ export function PersonaFormModal({ opened, onClose, persona, defaultKind = 'ai' 
                   </span>
                 ))}
               </Text>
-              <Text size="sm" fw={500}>
-                {t('personas.preview')}
-              </Text>
+              <Group justify="space-between" align="center" wrap="nowrap">
+                <Text size="sm" fw={500}>
+                  {t('personas.preview')}
+                </Text>
+                {preview && <CopyIconButton value={preview} />}
+              </Group>
               <Paper withBorder p="sm" radius="md" bg="var(--mantine-color-body)">
                 <Text
                   size="sm"

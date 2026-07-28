@@ -18,6 +18,7 @@ import type { AgentTrace, DebugUsage } from '../lib/api/types';
 import { useBackendStatus } from '../lib/useBackendStatus';
 import { useConnection } from '../store/connection';
 import type { Persona } from '../types';
+import { CopyIconButton } from './CopyIconButton';
 
 interface Props {
   groupId: string;
@@ -207,18 +208,17 @@ function TraceItem({
       </Accordion.Control>
       <Accordion.Panel>
         <Stack gap={6}>
-          <Text size="xs" fw={600} c="dimmed">
-            {t('debug.system')}
-          </Text>
-          <Code block fz="xs">
-            {trace.system.trim()}
-          </Code>
-          <Text size="xs" fw={600} c="dimmed">
-            {t('debug.context')}
-          </Text>
-          <Code block fz="xs">
-            {trace.conversation.trim()}
-          </Code>
+          {/* System + context default collapsed: expanding a trace to see "what
+              did it decide" shouldn't force-render two long, mostly-duplicate
+              text blocks the user didn't ask for. */}
+          <Accordion multiple variant="contained" chevronPosition="left">
+            <CollapsibleText value="system" label={t('debug.system')} text={trace.system.trim()} />
+            <CollapsibleText
+              value="context"
+              label={t('debug.context')}
+              text={trace.conversation.trim()}
+            />
+          </Accordion>
           <Text size="xs" fw={600} c="dimmed">
             {t('debug.decision')}
           </Text>
@@ -239,6 +239,33 @@ function TraceItem({
             )}
           </Text>
         </Stack>
+      </Accordion.Panel>
+    </Accordion.Item>
+  );
+}
+
+/**
+ * One collapsible prompt section (system or context). Default collapsed; when
+ * open, the text is height-bounded so a long system prompt can't blow out the
+ * panel, with a copy button so the full text is one click away.
+ */
+function CollapsibleText({ value, label, text }: { value: string; label: string; text: string }) {
+  return (
+    <Accordion.Item value={value}>
+      <Accordion.Control>
+        <Text size="xs" fw={600} c="dimmed">
+          {label}
+        </Text>
+      </Accordion.Control>
+      <Accordion.Panel>
+        <Group align="flex-start" gap="xs" wrap="nowrap">
+          <ScrollArea.Autosize mah={200} style={{ flex: 1, minWidth: 0 }}>
+            <Code block fz="xs">
+              {text}
+            </Code>
+          </ScrollArea.Autosize>
+          <CopyIconButton value={text} />
+        </Group>
       </Accordion.Panel>
     </Accordion.Item>
   );

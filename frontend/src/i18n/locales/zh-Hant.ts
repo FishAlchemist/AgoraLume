@@ -40,6 +40,8 @@ export const zhHant: TranslationSchema = {
     member: '{{count}} 位成員',
     confirm: '確定',
     confirmTitle: '請確認',
+    copy: '複製',
+    copied: '已複製',
   },
   chat: {
     placeholder: '對群組說點什麼…',
@@ -54,6 +56,7 @@ export const zhHant: TranslationSchema = {
     waiting: '等待回覆中…',
     aiTag: 'AI',
     readCount: '已讀 {{count}}/{{total}}',
+    readReceiptsTitle: '已讀回條',
     readReplied: '已回覆',
     readSilent: '已讀不回',
     readUnread: '未讀',

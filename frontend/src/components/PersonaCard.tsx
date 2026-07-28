@@ -17,6 +17,7 @@ import { buildBundle, downloadBundle, slugify } from '../lib/transfer';
 import { useReadOnly } from '../store/readonly';
 import { useUi } from '../store/ui';
 import { useWorkspace } from '../store/workspace';
+import { CopyIconButton } from './CopyIconButton';
 import { OrgTag } from './OrgTag';
 import { PersonaAvatar } from './PersonaAvatar';
 
@@ -85,9 +86,12 @@ export function PersonaCard() {
               <Divider />
 
               <Stack gap={4}>
-                <Text fw={600} size="sm">
-                  {t('personas.systemPrompt')}
-                </Text>
+                <Group justify="space-between" align="center" wrap="nowrap">
+                  <Text fw={600} size="sm">
+                    {t('personas.systemPrompt')}
+                  </Text>
+                  {resolvedPrompt && <CopyIconButton value={resolvedPrompt} />}
+                </Group>
                 <Paper withBorder p="sm" radius="md" bg="var(--mantine-color-body)">
                   <Text
                     size="sm"
