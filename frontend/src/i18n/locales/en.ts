@@ -211,6 +211,7 @@ export const en = {
     tracesHint: 'The exact context each character received, and what it decided.',
     empty: 'No inferences yet. Send a message to see what each character receives.',
     system: 'System',
+    systemUnknown: 'version n/a',
     context: 'Context (public messages)',
     decision: 'Decision',
     noReply: 'Read — stayed silent',

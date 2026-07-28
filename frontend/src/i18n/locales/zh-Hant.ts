@@ -211,6 +211,7 @@ export const zhHant: TranslationSchema = {
     tracesHint: '每個角色實際收到的內容，以及它的決定。',
     empty: '尚無推論。送出訊息即可看到每個角色收到什麼。',
     system: '系統',
+    systemUnknown: '版本不明',
     context: '上下文（公共訊息）',
     decision: '決定',
     noReply: '已讀 —— 保持沉默',
