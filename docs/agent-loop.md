@@ -171,7 +171,7 @@ a single tool-free structured-output request).
 
 The cost discipline above shapes when it runs. Suggestions are **generated
 server-side, cached, and persisted** (`suggestions/<group>.json`, loaded with the
-group's log); the frontend only *fetches and displays* them. A `GET` returns the
+group's log); the frontend only _fetches and displays_ them. A `GET` returns the
 cache immediately and kicks a background regeneration **only when stale** — no
 cache yet, the conversation advanced since they were made, or the part of day
 changed (so a morning opener doesn't linger into the evening). The current

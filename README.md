@@ -14,7 +14,7 @@ OpenAI-compatible model.
 > [!NOTE]
 > **Built with AI ("vibe coding").** The direction is human — what to build, the
 > architecture, the API shape, the design trade-offs — but nearly everything you
-> can *read* in this repository was written by AI: not only the low-level
+> can _read_ in this repository was written by AI: not only the low-level
 > implementation, but this README, the notes under [`docs/`](docs/), and the
 > commit messages. None of it is exhaustively hand-audited, so treat fine-grained
 > code quality and documentation accuracy with corresponding caution, and review
