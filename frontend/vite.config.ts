@@ -43,19 +43,25 @@ export default defineConfig(({ mode }) => {
     .map((host) => host.trim())
     .filter(Boolean);
 
+  // Shared by both the dev server and `vite preview`, so a production build
+  // served by preview (`pnpm start:single`) forwards the backend routes exactly
+  // like the dev proxy does — the only difference being dev vs. built assets.
+  const serverOptions = {
+    port: devPort,
+    // Only override when configured, so the default stays Vite's own list.
+    ...(allowedHosts.length > 0 ? { allowedHosts } : {}),
+    strictPort: devPort !== undefined,
+    // changeOrigin rewrites the Host header to the target; SSE (/groups/:id/
+    // stream) streams straight through since the proxy doesn't buffer plain
+    // HTTP responses.
+    proxy: Object.fromEntries(
+      API_PREFIXES.map((path) => [path, { target: proxyTarget, changeOrigin: true }]),
+    ),
+  };
+
   return {
     plugins: [react()],
-    server: {
-      port: devPort,
-      // Only override when configured, so the default stays Vite's own list.
-      ...(allowedHosts.length > 0 ? { allowedHosts } : {}),
-      strictPort: devPort !== undefined,
-      // changeOrigin rewrites the Host header to the target; SSE (/groups/:id/
-      // stream) streams straight through since the proxy doesn't buffer plain
-      // HTTP responses.
-      proxy: Object.fromEntries(
-        API_PREFIXES.map((path) => [path, { target: proxyTarget, changeOrigin: true }]),
-      ),
-    },
+    server: serverOptions,
+    preview: serverOptions,
   };
 });
