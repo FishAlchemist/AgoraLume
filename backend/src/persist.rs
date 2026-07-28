@@ -16,13 +16,43 @@
 //! Everything degrades safely: a missing or corrupt file falls back to a seed
 //! (or an empty log) rather than crashing, and writes are atomic (temp file +
 //! rename) so a crash mid-write can never leave a half-written file behind.
+//!
+//! `workspace.json` — the one irreplaceable file — is additionally wrapped in a
+//! [`Versioned`] envelope (`{ "version": N, "data": … }`). Additive fields still
+//! evolve freely via `#[serde(default)]`; the version guards *breaking* shape
+//! changes. On a version the running build doesn't recognise, or an unreadable
+//! file, the workspace is moved aside (`.corrupt-<epoch>`) rather than silently
+//! overwritten by the next save, so nothing is ever lost without a trace. The
+//! cheap-to-regenerate files (messages, summaries, suggestions) stay bare.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::models::{GroupSuggestions, Message};
 use crate::state::GroupSummary;
 use crate::workspace::WorkspaceSnapshot;
+
+/// On-disk format version for `workspace.json`. Bump this **only** on a breaking
+/// change to [`WorkspaceSnapshot`]'s shape (a renamed or retyped field, a
+/// removed variant); additive fields ride `#[serde(default)]` and need no bump.
+/// A file whose version this build doesn't recognise is preserved, never
+/// overwritten — see [`Persistence::load_workspace`].
+const WORKSPACE_FORMAT_VERSION: u32 = 1;
+
+/// A versioned envelope around persisted data: `{ "version": N, "data": … }`.
+/// Only `workspace.json` — the one irreplaceable file — is written this way;
+/// message logs, summaries, and suggestion caches stay bare, being cheap to lose
+/// and regenerate. Generic over `T` so a write can borrow
+/// (`Versioned<&WorkspaceSnapshot>`) while a read owns
+/// (`Versioned<WorkspaceSnapshot>`), with no clone of the whole workspace.
+#[derive(Serialize, Deserialize)]
+struct Versioned<T> {
+    version: u32,
+    data: T,
+}
 
 /// A handle to the data directory. Held by [`crate::state::AppState`] when
 /// persistence is enabled; absent (`None`) for a pure in-memory run.
@@ -52,28 +82,67 @@ impl Persistence {
     }
 
     /// Loads the persisted workspace, or `None` when there is no saved file yet
-    /// (so the caller seeds a fresh one). A corrupt file is logged and treated
-    /// as absent rather than taking the server down.
+    /// (so the caller seeds a fresh one).
+    ///
+    /// The file is a [`Versioned`] envelope, and three cases are handled
+    /// explicitly — **none of which ever overwrites data**:
+    /// - **current version** — returned as-is.
+    /// - **legacy, unversioned** (written before the envelope existed) — a bare
+    ///   [`WorkspaceSnapshot`] is accepted and re-wrapped on the next save.
+    /// - **unknown version, or corrupt** — the file is [`quarantine`]d (moved
+    ///   aside, never discarded) and a fresh workspace is seeded, so an
+    ///   unreadable or newer-format file survives for manual recovery instead of
+    ///   being silently replaced.
     pub fn load_workspace(&self) -> Option<WorkspaceSnapshot> {
         let path = self.workspace_path();
         let bytes = std::fs::read(&path).ok()?;
-        match serde_json::from_slice(&bytes) {
-            Ok(snapshot) => Some(snapshot),
+
+        // Current format: a versioned envelope.
+        match serde_json::from_slice::<Versioned<WorkspaceSnapshot>>(&bytes) {
+            Ok(file) if file.version == WORKSPACE_FORMAT_VERSION => return Some(file.data),
+            Ok(file) => {
+                // A version this build doesn't understand (e.g. one written by a
+                // newer release). Preserve it rather than overwrite it.
+                tracing::warn!(
+                    path = %path.display(),
+                    found = file.version,
+                    expected = WORKSPACE_FORMAT_VERSION,
+                    "workspace.json has an unsupported format version; moving it aside and seeding a fresh workspace"
+                );
+                quarantine(&path);
+                return None;
+            }
+            Err(_) => {}
+        }
+
+        // Legacy: a bare, unversioned snapshot from before the envelope existed.
+        // Accept it; the next save re-writes it inside the current envelope.
+        match serde_json::from_slice::<WorkspaceSnapshot>(&bytes) {
+            Ok(snapshot) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "migrating an unversioned workspace.json to the versioned format on the next save"
+                );
+                Some(snapshot)
+            }
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "ignoring corrupt workspace.json; seeding a fresh workspace"
+                    "workspace.json is unreadable; moving it aside and seeding a fresh workspace"
                 );
+                quarantine(&path);
                 None
             }
         }
     }
 
-    /// Writes the workspace out. Failures are logged, not fatal: a persistence
-    /// hiccup must not break the live API.
+    /// Writes the workspace out inside the current [`Versioned`] envelope.
+    /// Failures are logged, not fatal: a persistence hiccup must not break the
+    /// live API.
     pub fn save_workspace(&self, snapshot: &WorkspaceSnapshot) {
-        if let Err(e) = write_atomic(&self.workspace_path(), snapshot) {
+        let file = Versioned { version: WORKSPACE_FORMAT_VERSION, data: snapshot };
+        if let Err(e) = write_atomic(&self.workspace_path(), &file) {
             tracing::warn!(error = %e, "failed to persist the workspace");
         }
     }
@@ -184,4 +253,107 @@ fn sanitize(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
+}
+
+/// Moves an unreadable or unsupported file aside — appending `.corrupt-<epoch>`
+/// — instead of letting the next save overwrite it, so its data is preserved
+/// for manual recovery. Best-effort: a rename failure is logged and swallowed
+/// (the caller seeds fresh regardless).
+fn quarantine(path: &Path) {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut dest = path.as_os_str().to_owned();
+    dest.push(format!(".corrupt-{stamp}"));
+    let dest = PathBuf::from(dest);
+    match std::fs::rename(path, &dest) {
+        Ok(()) => {
+            tracing::warn!(from = %path.display(), to = %dest.display(), "preserved an unreadable file");
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not preserve an unreadable file");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::Workspace;
+
+    /// A fresh, unique scratch directory under the system temp dir.
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agoralume-persist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn workspace_round_trips_through_the_versioned_envelope() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+        let snapshot = Workspace::seeded().to_snapshot();
+
+        store.save_workspace(&snapshot);
+
+        // The file on disk carries the version tag, not a bare snapshot.
+        let raw = std::fs::read_to_string(store.workspace_path()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["version"], WORKSPACE_FORMAT_VERSION);
+        assert!(value["data"]["personas"].is_array());
+
+        let loaded = store.load_workspace().expect("load");
+        assert_eq!(loaded.personas.len(), snapshot.personas.len());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_unversioned_workspace_is_accepted() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+        let snapshot = Workspace::seeded().to_snapshot();
+
+        // Write the pre-envelope format: a bare snapshot with no version tag.
+        write_atomic(&store.workspace_path(), &snapshot).unwrap();
+
+        let loaded = store.load_workspace().expect("accept legacy file");
+        assert_eq!(loaded.personas.len(), snapshot.personas.len());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_version_is_preserved_not_overwritten() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+        let snapshot = Workspace::seeded().to_snapshot();
+
+        // A file from a hypothetical newer build.
+        let future = Versioned { version: WORKSPACE_FORMAT_VERSION + 1, data: &snapshot };
+        write_atomic(&store.workspace_path(), &future).unwrap();
+
+        assert!(store.load_workspace().is_none(), "unknown version seeds fresh");
+        // The original file is gone from its path but preserved beside it, so a
+        // subsequent save can't clobber it.
+        assert!(!store.workspace_path().exists());
+        let preserved: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(preserved.len(), 1, "the newer-format file was quarantined");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_workspace_is_quarantined() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+        std::fs::write(store.workspace_path(), b"{ this is not json").unwrap();
+
+        assert!(store.load_workspace().is_none());
+        assert!(!store.workspace_path().exists(), "the corrupt file was moved aside");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
