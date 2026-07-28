@@ -1,4 +1,4 @@
-import type { Message } from '../../types';
+import type { GroupSuggestions, Message } from '../../types';
 import type {
   ActivityHandler,
   AgentTrace,
@@ -9,6 +9,7 @@ import type {
   ReadHandler,
   ReadReceipt,
   ServerMeta,
+  SuggestionsHandler,
 } from './types';
 
 /** Parses an SSE frame's JSON payload, yielding null on malformed data. */
@@ -30,6 +31,7 @@ interface GroupStream {
   read: Set<ReadHandler>;
   activity: Set<ActivityHandler>;
   debug: Set<DebugHandler>;
+  suggestions: Set<SuggestionsHandler>;
   /** Pending close from a grace period; cleared if a subscriber returns first. */
   closeTimer?: ReturnType<typeof setTimeout>;
   /** Set once the stream has connected; a later `open` event means a reconnect. */
@@ -78,6 +80,12 @@ class SharedStreams {
     return () => this.drop(groupId, stream, stream.debug, handler);
   }
 
+  subscribeSuggestions(groupId: string, handler: SuggestionsHandler): () => void {
+    const stream = this.open(groupId);
+    stream.suggestions.add(handler);
+    return () => this.drop(groupId, stream, stream.suggestions, handler);
+  }
+
   /** Reuses the group's live stream, or opens one and wires its event listeners. */
   private open(groupId: string): GroupStream {
     const existing = this.byGroup.get(groupId);
@@ -96,6 +104,7 @@ class SharedStreams {
       read: new Set(),
       activity: new Set(),
       debug: new Set(),
+      suggestions: new Set(),
     };
     // The default (unnamed) event carries a Message; the rest are named events.
     source.addEventListener('message', (e: MessageEvent<string>) => {
@@ -113,6 +122,10 @@ class SharedStreams {
     source.addEventListener('debug', (e: MessageEvent<string>) => {
       const data = parseFrame<AgentTrace>(e.data);
       if (data) for (const h of stream.debug) h(data);
+    });
+    source.addEventListener('suggestions', (e: MessageEvent<string>) => {
+      const data = parseFrame<GroupSuggestions>(e.data);
+      if (data) for (const h of stream.suggestions) h(data);
     });
     source.onopen = () => {
       // The first `open` is the initial connect — the caller (ChatView's effect)
@@ -168,7 +181,8 @@ class SharedStreams {
       stream.message.size > 0 ||
       stream.read.size > 0 ||
       stream.activity.size > 0 ||
-      stream.debug.size > 0
+      stream.debug.size > 0 ||
+      stream.suggestions.size > 0
     );
   }
 }
@@ -250,5 +264,20 @@ export class HttpChatApi implements ChatApi {
 
   subscribeDebug(groupId: string, handler: DebugHandler): () => void {
     return this.streams.subscribeDebug(groupId, handler);
+  }
+
+  getSuggestions(groupId: string): Promise<GroupSuggestions> {
+    return this.getJson<GroupSuggestions>(`/groups/${groupId}/suggestions`);
+  }
+
+  async regenerateSuggestions(groupId: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/groups/${groupId}/suggestions/regenerate`, {
+      method: 'POST',
+    });
+    if (!res.ok) throw new Error(`regenerateSuggestions failed: ${res.status}`);
+  }
+
+  subscribeSuggestions(groupId: string, handler: SuggestionsHandler): () => void {
+    return this.streams.subscribeSuggestions(groupId, handler);
   }
 }

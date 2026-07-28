@@ -8,6 +8,7 @@ import { useWorkspace } from '../store/workspace';
 import type { Group, Message, Persona } from '../types';
 import { Composer } from './Composer';
 import { MessageItem } from './MessageItem';
+import { SuggestionChips } from './SuggestionChips';
 
 interface Props {
   group: Group;
@@ -84,6 +85,11 @@ export function ChatView({ group, personas }: Props) {
   // The agent loop's busy/idle state, driven by the backend's activity signal.
   // The composer stays locked while busy, so a message can't interleave a turn.
   const [busy, setBusy] = useState(false);
+  // Server-generated conversation openers; the frontend only fetches & displays.
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  // A chip click pushes its text into the composer (never sends). The nonce lets
+  // the same suggestion re-fill after it was edited or cleared.
+  const [fill, setFill] = useState<{ text: string; nonce: number }>();
   const viewport = useRef<HTMLDivElement>(null);
   // Buffered read receipts, keyed by message id — decouples receipts from the
   // arrival of their target message so none are lost to the SSE/POST race.
@@ -94,10 +100,21 @@ export function ChatView({ group, personas }: Props) {
     let active = true;
     setMessages(null);
     setBusy(false);
+    setSuggestions([]);
     reads.current = new Map();
 
     void api.listMessages(group.id).then((initial) => {
       if (active) setMessages(applyReads(initial, reads.current));
+    });
+
+    // Fetch the cached openers on open; a stale set kicks a background regen on
+    // the backend, whose result then arrives on the `suggestions` frame below.
+    void api.getSuggestions(group.id).then((s) => {
+      if (active) setSuggestions(s.prompts);
+    });
+
+    const unsubscribeSuggestions = api.subscribeSuggestions(group.id, (s) => {
+      setSuggestions(s.prompts);
     });
 
     const unsubscribe = api.subscribe(group.id, (message) => {
@@ -120,8 +137,23 @@ export function ChatView({ group, personas }: Props) {
       unsubscribe();
       unsubscribeReads();
       unsubscribeActivity();
+      unsubscribeSuggestions();
     };
   }, [group.id, backendUrl]);
+
+  // When a turn ends (busy → idle) the conversation has advanced, so the openers
+  // are stale. Re-fetch to nudge the backend into regenerating for the new state;
+  // the fresh set streams back on the `suggestions` frame.
+  const wasBusy = useRef(false);
+  useEffect(() => {
+    if (wasBusy.current && !busy) {
+      void api
+        .getSuggestions(group.id)
+        .then((s) => setSuggestions(s.prompts))
+        .catch(() => {});
+    }
+    wasBusy.current = busy;
+  }, [busy, group.id]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: messages is the intended trigger — scroll to the bottom whenever the list changes.
   useEffect(() => {
@@ -215,11 +247,21 @@ export function ChatView({ group, personas }: Props) {
             {t('readonly.chatNotice')}
           </Text>
         ) : (
-          <Composer
-            onSend={handleSend}
-            disabled={locked || busy}
-            placeholder={locked ? t('chat.locked') : busy ? t('chat.waiting') : undefined}
-          />
+          <>
+            {!locked && !busy && suggestions.length > 0 && (
+              <SuggestionChips
+                prompts={suggestions}
+                onPick={(text) => setFill({ text, nonce: Date.now() })}
+                onRegenerate={() => void api.regenerateSuggestions(group.id).catch(() => {})}
+              />
+            )}
+            <Composer
+              onSend={handleSend}
+              disabled={locked || busy}
+              placeholder={locked ? t('chat.locked') : busy ? t('chat.waiting') : undefined}
+              fill={fill}
+            />
+          </>
         )}
       </Box>
     </Stack>

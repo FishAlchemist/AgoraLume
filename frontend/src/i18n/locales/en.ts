@@ -60,6 +60,7 @@ export const en = {
     readUnread: 'Not read yet',
     errorReplyFailed: "{{name}} couldn't reply",
     retry: 'Retry',
+    suggestRegenerate: 'Suggest other ideas',
   },
   readonly: {
     badge: 'Read-only',

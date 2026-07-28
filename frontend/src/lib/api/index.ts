@@ -1,5 +1,5 @@
 import { useConnection } from '../../store/connection';
-import type { Message } from '../../types';
+import type { GroupSuggestions, Message } from '../../types';
 import { HttpChatApi } from './http';
 import { MockChatApi } from './mock';
 import type {
@@ -11,6 +11,7 @@ import type {
   MessageHandler,
   ReadHandler,
   ServerMeta,
+  SuggestionsHandler,
 } from './types';
 
 /**
@@ -65,6 +66,15 @@ class RoutingChatApi implements ChatApi {
   }
   subscribeDebug(groupId: string, handler: DebugHandler): () => void {
     return this.impl().subscribeDebug(groupId, handler);
+  }
+  getSuggestions(groupId: string): Promise<GroupSuggestions> {
+    return this.impl().getSuggestions(groupId);
+  }
+  regenerateSuggestions(groupId: string): Promise<void> {
+    return this.impl().regenerateSuggestions(groupId);
+  }
+  subscribeSuggestions(groupId: string, handler: SuggestionsHandler): () => void {
+    return this.impl().subscribeSuggestions(groupId, handler);
   }
 }
 

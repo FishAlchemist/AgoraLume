@@ -1,6 +1,6 @@
 import { ActionIcon, Group, Textarea } from '@mantine/core';
 import { IconSend } from '@tabler/icons-react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 interface Props {
@@ -8,11 +8,25 @@ interface Props {
   /** Overrides the default placeholder (e.g. a locked/waiting reason). */
   placeholder?: string;
   onSend: (text: string) => void;
+  /**
+   * Text to load into the input without sending (a suggestion chip click). The
+   * input state stays local — this only pushes a value in, so the user still
+   * edits and presses send. Bump `nonce` to re-fill even with identical text.
+   */
+  fill?: { text: string; nonce: number };
 }
 
-export function Composer({ disabled, placeholder, onSend }: Props) {
+export function Composer({ disabled, placeholder, onSend, fill }: Props) {
   const { t } = useTranslation();
   const [value, setValue] = useState('');
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: fill.nonce is the intended trigger — re-fill (and refocus) even when the text is unchanged; reading fill.text here is deliberate.
+  useEffect(() => {
+    if (!fill) return;
+    setValue(fill.text);
+    ref.current?.focus();
+  }, [fill?.nonce]);
 
   const submit = () => {
     if (disabled) return;
@@ -25,6 +39,7 @@ export function Composer({ disabled, placeholder, onSend }: Props) {
   return (
     <Group align="flex-end" gap="sm" wrap="nowrap">
       <Textarea
+        ref={ref}
         flex={1}
         autosize
         minRows={1}

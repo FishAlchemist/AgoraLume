@@ -1,5 +1,5 @@
 import { useWorkspace } from '../../store/workspace';
-import type { Message } from '../../types';
+import type { GroupSuggestions, Message } from '../../types';
 import type {
   ActivityHandler,
   AgentTrace,
@@ -9,6 +9,7 @@ import type {
   MessageHandler,
   ReadHandler,
   ServerMeta,
+  SuggestionsHandler,
 } from './types';
 
 let seq = 0;
@@ -103,6 +104,18 @@ export class MockChatApi implements ChatApi {
   }
 
   subscribeDebug(_groupId: string, _handler: DebugHandler): () => void {
+    return () => {};
+  }
+
+  // Canned, time-aware openers so the suggestion chips work with no backend.
+  async getSuggestions(_groupId: string): Promise<GroupSuggestions> {
+    return mockSuggestions();
+  }
+
+  // Nothing to regenerate in-browser — the openers are already time-aware.
+  async regenerateSuggestions(_groupId: string): Promise<void> {}
+
+  subscribeSuggestions(_groupId: string, _handler: SuggestionsHandler): () => void {
     return () => {};
   }
 
@@ -231,4 +244,51 @@ function mockReply(userText: string): string {
   const text = userText.trim();
   if (!text) return 'Hmm?';
   return `You said “${text}”. (Mock reply — set VITE_API_BASE_URL to talk to a real backend.)`;
+}
+
+/**
+ * Time-aware conversation openers, mirroring the backend rule brain's canned
+ * lines so the chips are usable offline. The part of day is bucketed the same
+ * way the backend does (morning 5–10, afternoon 11–16, evening 17–21, else
+ * night), so an evening opener isn't offered in the morning.
+ */
+function mockSuggestions(): GroupSuggestions {
+  const hour = new Date().getHours();
+  const { timeOfDay, prompts } =
+    hour >= 5 && hour <= 10
+      ? {
+          timeOfDay: 'morning',
+          prompts: [
+            'Good morning! What is everyone up to today?',
+            'Any plans for the morning?',
+            "What's the first thing on your mind today?",
+          ],
+        }
+      : hour >= 11 && hour <= 16
+        ? {
+            timeOfDay: 'afternoon',
+            prompts: [
+              'How is your afternoon going?',
+              'What are you all working on right now?',
+              'Anyone up for a quick chat?',
+            ],
+          }
+        : hour >= 17 && hour <= 21
+          ? {
+              timeOfDay: 'evening',
+              prompts: [
+                "How was everyone's day?",
+                'Any plans for tonight?',
+                "What's the highlight of your day so far?",
+              ],
+            }
+          : {
+              timeOfDay: 'night',
+              prompts: [
+                'Still up? What is keeping you awake?',
+                'How was your day overall?',
+                'Any quiet thoughts before bed?',
+              ],
+            };
+  return { prompts, generatedAt: Date.now(), timeOfDay };
 }

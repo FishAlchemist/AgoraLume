@@ -1,6 +1,8 @@
-import type { Message } from '../../types';
+import type { GroupSuggestions, Message } from '../../types';
 
 export type MessageHandler = (message: Message) => void;
+
+export type SuggestionsHandler = (suggestions: GroupSuggestions) => void;
 
 /** A single AI persona acknowledging it successfully processed a message. */
 export interface ReadReceipt {
@@ -132,6 +134,30 @@ export interface ChatApi {
    * unsubscribe function.
    */
   subscribeActivity(groupId: string, handler: ActivityHandler): () => void;
+
+  /**
+   * The group's cached conversation suggestions. Returns immediately from the
+   * server-side cache; the backend regenerates in the background only when they
+   * are stale (conversation advanced, or the time of day changed), pushing the
+   * refreshed set on the stream's `suggestions` frame. The frontend only
+   * fetches and displays — it never generates.
+   */
+  getSuggestions(groupId: string): Promise<GroupSuggestions>;
+
+  /**
+   * Asks the backend to regenerate this group's suggestions ("give me other
+   * ideas"). Fire-and-forget: the fresh set arrives on the `suggestions` frame.
+   * The backend rate-limits regeneration per group, so this can be spammed
+   * safely. A no-op on the in-browser mock.
+   */
+  regenerateSuggestions(groupId: string): Promise<void>;
+
+  /**
+   * Subscribes to a group's suggestion updates — one frame whenever the backend
+   * finishes a (re)generation. Returns an unsubscribe function. A no-op on the
+   * in-browser mock.
+   */
+  subscribeSuggestions(groupId: string, handler: SuggestionsHandler): () => void;
 
   /** Cumulative LLM usage since the backend started (the debug panel's totals). */
   getUsage(): Promise<DebugUsage>;

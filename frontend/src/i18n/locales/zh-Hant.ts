@@ -62,6 +62,7 @@ export const zhHant: TranslationSchema = {
     readUnread: '未讀',
     errorReplyFailed: '{{name}} 無法回覆',
     retry: '重試',
+    suggestRegenerate: '換一批建議',
   },
   readonly: {
     badge: '唯讀',
