@@ -81,6 +81,17 @@ body {
   }
 }
 
+/* Chat bubbles carry a frosted background too. There are many on screen at once,
+   so their per-bubble backdrop blur is the heaviest scroll cost of all — kept for
+   desktop, dropped on mobile (the 20%-translucent fill over the gradient still
+   reads fine without it). */
+@media (min-width: 48em) {
+  .agora-msg-bubble {
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+}
+
 /* Slim, cool-tinted scrollbars. */
 * {
   scrollbar-width: thin;

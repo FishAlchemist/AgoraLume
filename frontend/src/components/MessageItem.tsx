@@ -1,6 +1,7 @@
 import { Badge, Button, Group, Paper, Stack, Text, UnstyledButton } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import { IconAlertTriangle, IconChecks, IconRefresh } from '@tabler/icons-react';
+import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useUi } from '../store/ui';
 import type { Message, Persona, SystemMessage } from '../types';
@@ -28,7 +29,13 @@ function formatTime(ts: number, locale: string): string {
   return new Date(ts).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
 }
 
-export function MessageItem({
+/**
+ * A single chat line. Memoized because an active multi-AI turn streams replies in
+ * quickly, re-rendering the whole list each time — with stable props, existing
+ * bubbles (all AI lines, which carry no changing receipt data) skip re-rendering
+ * and only genuinely-changed lines repaint.
+ */
+export const MessageItem = memo(function MessageItem({
   message,
   persona,
   isSelf,
@@ -99,11 +106,11 @@ export function MessageItem({
           radius="lg"
           withBorder={!isSelf}
           c={isSelf ? 'white' : undefined}
+          className="agora-msg-bubble"
           style={{
             background: isSelf
               ? 'linear-gradient(135deg, var(--mantine-color-indigo-6), var(--mantine-color-cyan-5))'
               : 'color-mix(in srgb, var(--mantine-color-body) 80%, transparent)',
-            backdropFilter: 'blur(6px)',
             boxShadow: '0 6px 18px rgba(0, 0, 0, 0.10)',
             borderColor: isSelf
               ? undefined
@@ -126,7 +133,7 @@ export function MessageItem({
       {isSelf && <PersonaAvatar persona={persona} onClick={() => openCard(persona.id)} />}
     </Group>
   );
-}
+});
 
 interface SystemNoticeProps {
   message: SystemMessage;
