@@ -1,6 +1,6 @@
-import { AppShell, Burger, Group, Text, Title } from '@mantine/core';
+import { AppShell, Burger, Center, Group, Loader, Text, Title } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { HashRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { AppNav } from './components/AppNav';
@@ -10,13 +10,25 @@ import { HeaderControls } from './components/HeaderControls';
 import { MemoryDrawer } from './components/MemoryDrawer';
 import { PersonaCard } from './components/PersonaCard';
 import { PersonaFormModal } from './components/PersonaFormModal';
-import { ChatPage } from './pages/ChatPage';
-import { MePage } from './pages/MePage';
-import { OrganizationsPage } from './pages/OrganizationsPage';
-import { PersonasPage } from './pages/PersonasPage';
-import { SettingsPage } from './pages/SettingsPage';
 import { useUi } from './store/ui';
 import { useWorkspace } from './store/workspace';
+
+// Each page is a separate chunk, fetched on first navigation to it. The Suspense
+// boundary below sits *inside* the main content area, so the shell (header +
+// navbar) — the "structure" — paints immediately and only the content region
+// shows a spinner while a page's chunk loads, then swaps in. Named exports are
+// unwrapped to the default `lazy()` expects.
+const ChatPage = lazy(() => import('./pages/ChatPage').then((m) => ({ default: m.ChatPage })));
+const MePage = lazy(() => import('./pages/MePage').then((m) => ({ default: m.MePage })));
+const OrganizationsPage = lazy(() =>
+  import('./pages/OrganizationsPage').then((m) => ({ default: m.OrganizationsPage })),
+);
+const PersonasPage = lazy(() =>
+  import('./pages/PersonasPage').then((m) => ({ default: m.PersonasPage })),
+);
+const SettingsPage = lazy(() =>
+  import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })),
+);
 
 const HEADER_HEIGHT = 56;
 
@@ -76,15 +88,17 @@ function Shell() {
 
       <AppShell.Main>
         <div style={{ height: `calc(100dvh - ${HEADER_HEIGHT}px)`, overflowY: 'auto' }}>
-          <Routes>
-            <Route path="/" element={<IndexRedirect />} />
-            <Route path="/g/:groupId" element={<ChatPage />} />
-            <Route path="/personas" element={<PersonasPage />} />
-            <Route path="/organizations" element={<OrganizationsPage />} />
-            <Route path="/me" element={<MePage />} />
-            <Route path="/settings" element={<SettingsPage />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <Suspense fallback={<PageLoader />}>
+            <Routes>
+              <Route path="/" element={<IndexRedirect />} />
+              <Route path="/g/:groupId" element={<ChatPage />} />
+              <Route path="/personas" element={<PersonasPage />} />
+              <Route path="/organizations" element={<OrganizationsPage />} />
+              <Route path="/me" element={<MePage />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </Suspense>
         </div>
       </AppShell.Main>
 
@@ -93,6 +107,15 @@ function Shell() {
       <PersonaEditorHost />
       <ConfirmDialog />
     </AppShell>
+  );
+}
+
+/** Fills the content area with a spinner while a lazy page chunk is loading. */
+function PageLoader() {
+  return (
+    <Center h="100%">
+      <Loader />
+    </Center>
   );
 }
 
