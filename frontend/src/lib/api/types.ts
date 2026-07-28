@@ -2,6 +2,20 @@ import type { GroupSuggestions, Message } from '../../types';
 
 export type MessageHandler = (message: Message) => void;
 
+/** Options for paging message history — see {@link ChatApi.listMessages}. */
+export interface HistoryPage {
+  /** Return only messages strictly older than this message id (page upward). */
+  before?: string;
+  /** Cap to the newest N of the selected range (the default page is the tail). */
+  limit?: number;
+  /**
+   * The read mark (epoch millis). On the initial page (no `before`), the tail is
+   * extended back to include every message newer than this — so the whole unread
+   * run loads even when it exceeds `limit`, keeping the divider and count exact.
+   */
+  since?: number;
+}
+
 export type SuggestionsHandler = (suggestions: GroupSuggestions) => void;
 
 /** A single AI persona acknowledging it successfully processed a message. */
@@ -96,7 +110,12 @@ export interface ChatApi {
    */
   probe(): Promise<ServerMeta | null>;
 
-  listMessages(groupId: string): Promise<Message[]>;
+  /**
+   * A page of message history, oldest first. With no options the full log is
+   * returned; `limit` fetches the newest N (the initial tail); `before` walks
+   * earlier pages from the oldest line already loaded.
+   */
+  listMessages(groupId: string, opts?: HistoryPage): Promise<Message[]>;
 
   /**
    * Sends a user message and resolves with the persisted message. `personaId`

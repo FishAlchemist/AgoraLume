@@ -1,11 +1,21 @@
-import { Box, Center, Loader, ScrollArea, Stack, Text, UnstyledButton } from '@mantine/core';
+import {
+  Box,
+  Button,
+  Center,
+  Loader,
+  ScrollArea,
+  Stack,
+  Text,
+  UnstyledButton,
+} from '@mantine/core';
 import { IconArrowDown } from '@tabler/icons-react';
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
 import { useChatReadTracking } from '../lib/useChatReadTracking';
 import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
+import { useReadState } from '../store/readState';
 import { useWorkspace } from '../store/workspace';
 import type { ConversationMessage, Group, Message, Persona } from '../types';
 import { Composer } from './Composer';
@@ -26,6 +36,11 @@ const REGEN_MIN_MS = 1000;
 // rather than leaving the user on a spinner forever.
 const REGEN_TIMEOUT_MS = 8000;
 
+// How many lines the initial open loads, and how many each "load earlier" page
+// pulls. The initial page is extended past this when there are more unread lines,
+// so the whole unread run is always present; older history is fetched on demand.
+const PAGE_SIZE = 40;
+
 /** Appends a streamed message, replacing any existing entry with the same id. */
 function appendMessage(prev: Message[] | null, message: Message): Message[] {
   if (!prev) return [message];
@@ -33,6 +48,14 @@ function appendMessage(prev: Message[] | null, message: Message): Message[] {
     return prev.map((m) => (m.id === message.id ? message : m));
   }
   return [...prev, message];
+}
+
+/** Prepends an older page ahead of the loaded lines, dropping any known ids. */
+function prependMessages(prev: Message[] | null, older: Message[]): Message[] {
+  if (!prev || prev.length === 0) return older;
+  const have = new Set(prev.map((m) => m.id));
+  const fresh = older.filter((m) => !have.has(m.id));
+  return fresh.length > 0 ? [...fresh, ...prev] : prev;
 }
 
 /**
@@ -143,6 +166,14 @@ export function ChatView({ group, personas }: Props) {
   const locked = aiMemberCount === 0;
 
   const [messages, setMessages] = useState<Message[] | null>(null);
+  // History loads in pages: the initial tail (extended to cover the whole unread
+  // run), then earlier pages on demand. `hasEarlier` gates the top loader.
+  const [hasEarlier, setHasEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const loadingEarlierRef = useRef(false);
+  // Pre-prepend scroll metrics, so the layout effect can hold the reader's place
+  // when an earlier page grows the content above them.
+  const pendingAnchor = useRef<{ height: number; top: number } | null>(null);
   // The agent loop's busy/idle state, driven by the backend's activity signal.
   // The composer stays locked while busy, so a message can't interleave a turn.
   const [busy, setBusy] = useState(false);
@@ -232,6 +263,10 @@ export function ChatView({ group, personas }: Props) {
   useEffect(() => {
     let active = true;
     setMessages(null);
+    setHasEarlier(false);
+    setLoadingEarlier(false);
+    loadingEarlierRef.current = false;
+    pendingAnchor.current = null;
     setBusy(false);
     setSuggestions([]);
     finishRegen();
@@ -239,8 +274,15 @@ export function ChatView({ group, personas }: Props) {
     // Re-anchor the view when history reloads for a new data source.
     resetForReload();
 
-    void api.listMessages(group.id).then((initial) => {
-      if (active) setMessages(applyReads(initial, reads.current));
+    // Load the newest page, extended back far enough to include everything newer
+    // than the read mark — so the whole unread run is present and its divider and
+    // count stay exact. Earlier lines are fetched on demand as the reader scrolls
+    // up. Reading the mark imperatively keeps it out of this effect's deps.
+    const since = useReadState.getState().lastRead[group.id];
+    void api.listMessages(group.id, { limit: PAGE_SIZE, since }).then((initial) => {
+      if (!active) return;
+      setMessages(applyReads(initial, reads.current));
+      setHasEarlier(initial.length >= PAGE_SIZE);
     });
 
     // Fetch the cached openers on open; a stale set kicks a background regen on
@@ -315,6 +357,48 @@ export function ChatView({ group, personas }: Props) {
     if (busy) return;
     void api.retry(group.id).catch(() => {});
   }, [busy, group.id]);
+
+  // The oldest loaded line — the cursor for fetching the page before it.
+  const oldestLoadedId = ordered?.[0]?.id;
+
+  // Fetches the page just before the oldest loaded line and prepends it. Records
+  // the scroll metrics first so the layout effect can hold the reader's place;
+  // a short page means the log's start is reached, so the loader retires.
+  const handleLoadEarlier = useCallback(() => {
+    if (!oldestLoadedId || loadingEarlierRef.current) return;
+    loadingEarlierRef.current = true;
+    setLoadingEarlier(true);
+    const el = viewport.current;
+    const anchorHeight = el?.scrollHeight ?? 0;
+    const anchorTop = el?.scrollTop ?? 0;
+    void api
+      .listMessages(group.id, { before: oldestLoadedId, limit: PAGE_SIZE })
+      .then((older) => {
+        setHasEarlier(older.length >= PAGE_SIZE);
+        if (older.length > 0) {
+          pendingAnchor.current = { height: anchorHeight, top: anchorTop };
+          setMessages((prev) => applyReads(prependMessages(prev, older), reads.current));
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        loadingEarlierRef.current = false;
+        setLoadingEarlier(false);
+      });
+  }, [oldestLoadedId, group.id, viewport]);
+
+  // After an earlier page prepends, the content above the reader grew — shift
+  // scrollTop by that delta so their view stays put instead of being flung up.
+  // Only a prepend sets the anchor; ordinary appends leave it null (a no-op).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: messages is the intended trigger — re-run on a prepend; viewport.current is a stable DOM ref read imperatively.
+  useLayoutEffect(() => {
+    const anchor = pendingAnchor.current;
+    if (!anchor) return;
+    pendingAnchor.current = null;
+    const el = viewport.current;
+    if (!el) return;
+    el.scrollTop = anchor.top + (el.scrollHeight - anchor.height);
+  }, [messages]);
 
   // The newest line you sent — the one the pinned progress bar tracks.
   const lastSelfMessage = useMemo(() => {
@@ -396,6 +480,9 @@ export function ChatView({ group, personas }: Props) {
             busy={busy}
             onRetry={handleRetry}
             locale={i18n.language}
+            hasEarlier={hasEarlier}
+            loadingEarlier={loadingEarlier}
+            onLoadEarlier={handleLoadEarlier}
           />
         </ScrollArea>
         {!atBottom && (
@@ -460,6 +547,11 @@ interface MessageListProps {
   busy: boolean;
   onRetry: () => void;
   locale: string;
+  /** Whether an earlier page may still be fetched — shows the top loader. */
+  hasEarlier: boolean;
+  /** An earlier page is in flight — the top loader spins. */
+  loadingEarlier: boolean;
+  onLoadEarlier: () => void;
 }
 
 /**
@@ -480,6 +572,9 @@ const MessageList = memo(function MessageList({
   busy,
   onRetry,
   locale,
+  hasEarlier,
+  loadingEarlier,
+  onLoadEarlier,
 }: MessageListProps) {
   const { t } = useTranslation();
   if (dayGroups === null) {
@@ -498,6 +593,19 @@ const MessageList = memo(function MessageList({
   }
   return (
     <Stack gap="md">
+      {hasEarlier && (
+        <Center>
+          <Button
+            variant="subtle"
+            size="xs"
+            color="gray"
+            loading={loadingEarlier}
+            onClick={onLoadEarlier}
+          >
+            {t('chat.loadEarlier')}
+          </Button>
+        </Center>
+      )}
       {dayGroups.map((day) => (
         <Stack key={day.day} gap="md" pos="relative">
           <DayHeader label={formatDayLabel(day.ts, locale, t)} />

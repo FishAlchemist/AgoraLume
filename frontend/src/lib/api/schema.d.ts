@@ -54,7 +54,12 @@ export interface paths {
     post: operations["post_event"];
   };
   "/groups/{id}/messages": {
-    /** The full message history for a group, oldest first. */
+    /**
+     * A page of a group's message history, oldest first. The initial open sends
+     * `limit` (and `since`, the read mark, so the entire unread tail is included);
+     * `before`+`limit` then walks earlier pages. With no query it returns the whole
+     * log.
+     */
     get: operations["list_messages"];
     /**
      * Posts a user message and kicks off the agents' turn. The returned line is the
@@ -765,16 +770,39 @@ export interface operations {
       };
     };
   };
-  /** The full message history for a group, oldest first. */
+  /**
+   * A page of a group's message history, oldest first. The initial open sends
+   * `limit` (and `since`, the read mark, so the entire unread tail is included);
+   * `before`+`limit` then walks earlier pages. With no query it returns the whole
+   * log.
+   */
   list_messages: {
     parameters: {
+      query?: {
+        /**
+         * @description Page upward: return only messages strictly older than this message id (the
+         * oldest line already loaded). Takes precedence over `since`.
+         */
+        before?: string | null;
+        /**
+         * @description Cap the result to the newest N messages of the selected range, so the
+         * default page is the tail of history.
+         */
+        limit?: number | null;
+        /**
+         * @description The client's read mark (epoch millis). On the initial page (no `before`)
+         * the tail is extended back far enough to include every message newer than
+         * this, so the whole unread run is loaded even when it exceeds `limit`.
+         */
+        since?: number | null;
+      };
       path: {
         /** @description Group id */
         id: string;
       };
     };
     responses: {
-      /** @description Message history */
+      /** @description Message history page, oldest first */
       200: {
         content: {
           "application/json": components["schemas"]["Message"][];

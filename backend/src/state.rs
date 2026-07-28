@@ -433,6 +433,64 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// A page of a group's log, oldest-first, for lazy history loading. `before`
+    /// keeps only the messages strictly older than that message id (paging
+    /// upward from a known cursor); `limit` then caps to the newest N of that
+    /// range — so the default page (`before` = None) is the tail of history, and
+    /// each earlier page walks back from the oldest line already shown. An
+    /// unknown `before` id yields an empty page, which the client reads as "no
+    /// more history", rather than replaying the whole log.
+    pub fn list_page(
+        &self,
+        group_id: &str,
+        before: Option<&str>,
+        limit: Option<usize>,
+    ) -> Vec<Message> {
+        self.ensure_loaded(group_id);
+        let store = self.messages.lock().unwrap();
+        let Some(list) = store.get(group_id) else {
+            return Vec::new();
+        };
+        let end = match before {
+            Some(id) => match list.iter().position(|m| m.id() == id) {
+                Some(idx) => idx,
+                None => return Vec::new(),
+            },
+            None => list.len(),
+        };
+        let slice = &list[..end];
+        let start = match limit {
+            Some(n) => slice.len().saturating_sub(n),
+            None => 0,
+        };
+        slice[start..].to_vec()
+    }
+
+    /// The initial history page, oldest-first: the newest `limit` messages, but
+    /// always extended far enough back to include every message newer than
+    /// `since` (the client's read mark). Unread lines are the newest tail, so
+    /// this guarantees the client loads the whole unread run — the "new messages"
+    /// divider and its count stay correct — while a caught-up open still costs
+    /// just one screen. With neither bound set it returns the full log.
+    pub fn list_tail(&self, group_id: &str, limit: Option<usize>, since: Option<i64>) -> Vec<Message> {
+        self.ensure_loaded(group_id);
+        let store = self.messages.lock().unwrap();
+        let Some(list) = store.get(group_id) else {
+            return Vec::new();
+        };
+        let by_limit = match limit {
+            Some(n) => list.len().saturating_sub(n),
+            None => 0,
+        };
+        // First line strictly newer than the read mark — the start of the unread
+        // run. Absent (all read) means don't extend past the limit.
+        let by_since = match since {
+            Some(ts) => list.iter().position(|m| m.ts() > ts).unwrap_or(list.len()),
+            None => list.len(),
+        };
+        list[by_limit.min(by_since)..].to_vec()
+    }
+
     /// The broadcast sender for a group, creating it on first use so late
     /// subscribers and the first emit share the same channel.
     pub fn channel(&self, group_id: &str) -> broadcast::Sender<StreamEvent> {

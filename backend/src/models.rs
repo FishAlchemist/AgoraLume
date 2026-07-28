@@ -353,6 +353,16 @@ impl Message {
             | Message::System { id, .. } => id,
         }
     }
+
+    /// The message's creation timestamp (epoch millis) — the authoritative order
+    /// key, shared with the client, used to page history around the read mark.
+    pub fn ts(&self) -> i64 {
+        match self {
+            Message::Conversation { ts, .. }
+            | Message::Mood { ts, .. }
+            | Message::System { ts, .. } => *ts,
+        }
+    }
 }
 
 /// A single AI persona acknowledging it successfully processed a message —

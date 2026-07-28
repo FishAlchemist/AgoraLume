@@ -6,6 +6,7 @@ import type {
   ChatApi,
   DebugHandler,
   DebugUsage,
+  HistoryPage,
   MessageHandler,
   ReadHandler,
   ServerMeta,
@@ -34,9 +35,30 @@ export class MockChatApi implements ChatApi {
     return { mock: true, llm: false, persistent: false };
   }
 
-  async listMessages(groupId: string): Promise<Message[]> {
-    // Return a copy so callers never alias (and mutate) our internal array.
-    return [...(this.messages[groupId] ?? [])];
+  async listMessages(groupId: string, opts?: HistoryPage): Promise<Message[]> {
+    // The log is kept oldest-first (seed order + appends), matching the server,
+    // so history paging is plain index slicing. Return a copy so callers never
+    // alias (and mutate) our internal array.
+    const all = this.messages[groupId] ?? [];
+    // "Load earlier": everything strictly before the cursor, capped to newest N.
+    // An unknown cursor yields an empty page ("no more history").
+    if (opts?.before) {
+      const idx = all.findIndex((m) => m.id === opts.before);
+      if (idx <= 0) return [];
+      const slice = all.slice(0, idx);
+      return opts.limit != null ? slice.slice(Math.max(0, slice.length - opts.limit)) : slice;
+    }
+    // Initial page: the newest `limit`, extended back to include everything newer
+    // than `since` (the read mark) so the whole unread run is present.
+    const byLimit = opts?.limit != null ? Math.max(0, all.length - opts.limit) : 0;
+    const bySince =
+      opts?.since != null
+        ? (() => {
+            const i = all.findIndex((m) => m.ts > (opts.since as number));
+            return i === -1 ? all.length : i;
+          })()
+        : all.length;
+    return all.slice(Math.min(byLimit, bySince));
   }
 
   async sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {

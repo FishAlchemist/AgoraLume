@@ -4,14 +4,14 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -96,15 +96,42 @@ async fn debug_traces(
     Json(state.debug_traces(&id))
 }
 
-/// The full message history for a group, oldest first.
+/// Query for a page of message history. Both fields are optional: with neither,
+/// the full log is returned (oldest first), preserving the original behaviour.
+#[derive(Deserialize, IntoParams)]
+#[serde(rename_all = "camelCase")]
+struct HistoryQuery {
+    /// Page upward: return only messages strictly older than this message id (the
+    /// oldest line already loaded). Takes precedence over `since`.
+    before: Option<String>,
+    /// Cap the result to the newest N messages of the selected range, so the
+    /// default page is the tail of history.
+    limit: Option<usize>,
+    /// The client's read mark (epoch millis). On the initial page (no `before`)
+    /// the tail is extended back far enough to include every message newer than
+    /// this, so the whole unread run is loaded even when it exceeds `limit`.
+    since: Option<i64>,
+}
+
+/// A page of a group's message history, oldest first. The initial open sends
+/// `limit` (and `since`, the read mark, so the entire unread tail is included);
+/// `before`+`limit` then walks earlier pages. With no query it returns the whole
+/// log.
 #[utoipa::path(get, path = "/groups/{id}/messages", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
-    responses((status = 200, description = "Message history", body = Vec<Message>)))]
+    params(("id" = String, Path, description = "Group id"), HistoryQuery),
+    responses((status = 200, description = "Message history page, oldest first", body = Vec<Message>)))]
 async fn list_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<HistoryQuery>,
 ) -> Json<Vec<Message>> {
-    Json(state.list(&id))
+    // `before` is the "load earlier" cursor; without it this is the initial page,
+    // whose tail must also cover everything unread (`since`).
+    let page = match query.before.as_deref() {
+        Some(before) => state.list_page(&id, Some(before), query.limit),
+        None => state.list_tail(&id, query.limit, query.since),
+    };
+    Json(page)
 }
 
 /// The body of a send request.

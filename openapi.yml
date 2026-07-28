@@ -262,7 +262,11 @@ paths:
     get:
       tags:
       - chat
-      summary: The full message history for a group, oldest first.
+      summary: |-
+        A page of a group's message history, oldest first. The initial open sends
+        `limit` (and `since`, the read mark, so the entire unread tail is included);
+        `before`+`limit` then walks earlier pages. With no query it returns the whole
+        log.
       operationId: list_messages
       parameters:
       - name: id
@@ -271,9 +275,42 @@ paths:
         required: true
         schema:
           type: string
+      - name: before
+        in: query
+        description: |-
+          Page upward: return only messages strictly older than this message id (the
+          oldest line already loaded). Takes precedence over `since`.
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: limit
+        in: query
+        description: |-
+          Cap the result to the newest N messages of the selected range, so the
+          default page is the tail of history.
+        required: false
+        schema:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+      - name: since
+        in: query
+        description: |-
+          The client's read mark (epoch millis). On the initial page (no `before`)
+          the tail is extended back far enough to include every message newer than
+          this, so the whole unread run is loaded even when it exceeds `limit`.
+        required: false
+        schema:
+          type:
+          - integer
+          - 'null'
+          format: int64
       responses:
         '200':
-          description: Message history
+          description: Message history page, oldest first
           content:
             application/json:
               schema:

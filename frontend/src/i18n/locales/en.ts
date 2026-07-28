@@ -46,6 +46,7 @@ export const en = {
     send: 'Send',
     empty: 'No messages yet — say hi 👋',
     loading: 'Loading…',
+    loadEarlier: 'Load earlier messages',
     noGroup: 'Create a group to start chatting.',
     members: 'Members',
     speakingAs: 'Speaking as',

@@ -8,6 +8,7 @@ import type {
   ChatApi,
   DebugHandler,
   DebugUsage,
+  HistoryPage,
   MessageHandler,
   ReadHandler,
   ServerMeta,
@@ -40,8 +41,8 @@ class RoutingChatApi implements ChatApi {
   probe(): Promise<ServerMeta | null> {
     return this.impl().probe();
   }
-  listMessages(groupId: string): Promise<Message[]> {
-    return this.impl().listMessages(groupId);
+  listMessages(groupId: string, opts?: HistoryPage): Promise<Message[]> {
+    return this.impl().listMessages(groupId, opts);
   }
   sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {
     return this.impl().sendMessage(groupId, text, personaId);
