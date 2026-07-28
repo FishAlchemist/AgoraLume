@@ -407,7 +407,10 @@ struct SuggestArgs {
 /// How the model is told to produce conversation-starter suggestions. It writes
 /// openers *as the user*, short and time-appropriate, in the user's language — so
 /// each one can be sent verbatim. The data (roster, summary, recent lines, time)
-/// arrives in the tagged input; this preamble is the standing instruction.
+/// arrives in the tagged input; this preamble is the standing instruction. It
+/// holds one harm floor — never voice contempt for another participant — but
+/// stops there: it declines the cruel line without mandating a virtuous one, so
+/// the openers stay natural and the user keeps the choice.
 const SUGGEST_GUIDANCE: &str = "\
 You help a user who isn't sure what to say next in a group text chat. You are \
 given who is in the room in <group_members> (the human is marked \"(the user)\"), \
@@ -417,7 +420,11 @@ Propose a few short messages THE USER could send next to start or revive the \
 conversation. Rules: write in the first person AS the user (not as any AI \
 member); keep each to one short, natural sentence that can be sent verbatim; fit \
 the part of day (never ask about the evening in the morning, or vice versa); and \
-prefer variety — a question, a fresh topic, a follow-up on what was just said. \
+prefer variety — a question, a fresh topic, and a follow-up that acknowledges or \
+builds on what someone just said. Never put a line in the user's mouth that \
+mocks, belittles, threatens, or shows contempt for another participant — leave \
+it out even if the recent tone invites it. Stay natural, not preachy: you offer \
+openers the user may pick or ignore, never a lesson. \
 Write them in the user's language when <language> is given, otherwise match the \
 conversation's language. Output only the response schema.";
 
