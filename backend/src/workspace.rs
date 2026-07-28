@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::models::{Department, Group, Organization, Persona, PersonaKind, Settings};
+use crate::models::{
+    Department, Group, Organization, Persona, PersonaKind, PromptLabel, Settings,
+};
 
 /// A serializable snapshot of the whole workspace — the on-disk persistence
 /// format. Kept distinct from [`Workspace`] so the live type stays free to hold
@@ -28,6 +30,10 @@ pub struct WorkspaceSnapshot {
     pub personas: Vec<Persona>,
     pub groups: Vec<Group>,
     pub settings: Settings,
+    /// User-assigned names for persona identity hashes (hash → label). Absent in
+    /// snapshots written before persona versioning existed.
+    #[serde(default)]
+    pub prompt_labels: HashMap<String, String>,
 }
 
 /// The id of the default user identity, matching the frontend seed.
@@ -41,6 +47,9 @@ pub struct Workspace {
     pub personas: Vec<Persona>,
     pub groups: Vec<Group>,
     pub settings: Settings,
+    /// User-assigned names for persona identity hashes (hash → label). Kept off
+    /// [`Persona`] so naming a version never mutates the persona.
+    pub prompt_labels: HashMap<String, String>,
 }
 
 /// One member of a group, as an agent sees it: a name, an optional blurb, and
@@ -109,13 +118,16 @@ where
 
 impl Workspace {
     pub fn seeded() -> Self {
-        Self {
+        let mut workspace = Self {
             organizations: seed_organizations(),
             departments: seed_departments(),
             personas: seed_personas(),
             groups: seed_groups(),
             settings: seed_settings(),
-        }
+            prompt_labels: HashMap::new(),
+        };
+        workspace.refresh_prompt_hashes();
+        workspace
     }
 
     /// Rebuilds a workspace from a persisted snapshot (loaded from disk).
@@ -128,9 +140,21 @@ impl Workspace {
             personas: snapshot.personas,
             groups: snapshot.groups,
             settings: snapshot.settings,
+            prompt_labels: snapshot.prompt_labels,
         };
         workspace.enforce_single_user();
+        // Recompute hashes from the loaded prompts: a snapshot may predate
+        // versioning, or have been hand-edited, so the stored value isn't trusted.
+        workspace.refresh_prompt_hashes();
         workspace
+    }
+
+    /// Recomputes every persona's identity hash from its current system prompt,
+    /// so the stored value is authoritative regardless of what a snapshot carried.
+    fn refresh_prompt_hashes(&mut self) {
+        for persona in &mut self.personas {
+            persona.refresh_prompt_hash();
+        }
     }
 
     /// Collapses to exactly one user identity: keeps the first user persona,
@@ -182,6 +206,7 @@ impl Workspace {
             personas: self.personas.clone(),
             groups: self.groups.clone(),
             settings: self.settings.clone(),
+            prompt_labels: self.prompt_labels.clone(),
         }
     }
 
@@ -272,6 +297,7 @@ impl Workspace {
             return Err(PersonaError::NameTaken);
         }
         persona.id = resolve_id(persona.id, self.personas.iter().map(|p| p.id.as_str()));
+        persona.refresh_prompt_hash();
         self.personas.push(persona.clone());
         Ok(persona)
     }
@@ -281,7 +307,9 @@ impl Workspace {
     /// yield a second user identity ([`PersonaError::UserExists`]).
     pub fn update_persona(&mut self, id: &str, patch: Value) -> Result<Persona, PersonaError> {
         let persona = self.personas.iter().find(|p| p.id == id).ok_or(PersonaError::NotFound)?;
-        let updated = apply_patch(persona, patch).ok_or(PersonaError::NotFound)?;
+        let mut updated = apply_patch(persona, patch).ok_or(PersonaError::NotFound)?;
+        // The prompt may have changed; the client can't set the hash — recompute.
+        updated.refresh_prompt_hash();
         if self.name_taken(&updated.name, Some(id)) {
             return Err(PersonaError::NameTaken);
         }
@@ -326,6 +354,31 @@ impl Workspace {
             }
         }
         true
+    }
+
+    // --- Prompt identity labels ---------------------------------------------
+
+    /// Every named identity hash, sorted by hash for a stable listing.
+    pub fn prompt_labels(&self) -> Vec<PromptLabel> {
+        let mut labels: Vec<PromptLabel> = self
+            .prompt_labels
+            .iter()
+            .map(|(hash, label)| PromptLabel { hash: hash.clone(), label: label.clone() })
+            .collect();
+        labels.sort_by(|a, b| a.hash.cmp(&b.hash));
+        labels
+    }
+
+    /// Names an identity hash, or clears its name when `label` is blank (trimmed).
+    /// Returns the resulting label — an empty string when cleared.
+    pub fn set_prompt_label(&mut self, hash: &str, label: &str) -> PromptLabel {
+        let label = label.trim();
+        if label.is_empty() {
+            self.prompt_labels.remove(hash);
+        } else {
+            self.prompt_labels.insert(hash.to_string(), label.to_string());
+        }
+        PromptLabel { hash: hash.to_string(), label: label.to_string() }
     }
 
     // --- Groups -------------------------------------------------------------
@@ -498,6 +551,7 @@ fn default_user_persona() -> Persona {
         department_id: None,
         system_prompt: None,
         variables: None,
+        prompt_hash: None,
     }
 }
 
@@ -519,6 +573,7 @@ fn seed_personas() -> Vec<Persona> {
                 "You are {{persona_name}} in {{department_name}}, a warm and curious host in {{setting}}. Always reply in {{user_language}}.".into(),
             ),
             variables: None,
+            prompt_hash: None,
         },
         Persona {
             id: "nox".into(),
@@ -535,6 +590,7 @@ fn seed_personas() -> Vec<Persona> {
                 "You are {{persona_name}} of {{department_name}}, a dry, analytical strategist in {{setting}}. Always reply in {{user_language}}.".into(),
             ),
             variables: None,
+            prompt_hash: None,
         },
         Persona {
             id: "sol".into(),
@@ -551,6 +607,7 @@ fn seed_personas() -> Vec<Persona> {
                 "You are {{persona_name}} in {{department_name}}, an upbeat, energetic cheerleader in {{setting}}. Always reply in {{user_language}}.".into(),
             ),
             variables: None,
+            prompt_hash: None,
         },
     ]
 }
@@ -598,6 +655,7 @@ mod tests {
             department_id: None,
             system_prompt: None,
             variables: None,
+            prompt_hash: None,
         }
     }
 
@@ -646,6 +704,7 @@ mod tests {
                 self_persona_id: "alter-ego".into(),
             }],
             settings: seed_settings(),
+            prompt_labels: HashMap::new(),
         };
         let ws = Workspace::from_snapshot(snapshot);
 
@@ -659,5 +718,61 @@ mod tests {
         assert_eq!(group.self_persona_id, DEFAULT_USER_PERSONA_ID);
         assert!(!group.persona_ids.iter().any(|id| id == "alter-ego"));
         assert!(group.persona_ids.iter().any(|id| id == "aria"));
+    }
+
+    /// A persona with a system prompt gets a content hash; one without stays
+    /// hashless, and any hash a client tries to supply is overwritten.
+    #[test]
+    fn create_persona_computes_prompt_hash() {
+        let mut ws = Workspace::seeded();
+
+        let mut p = ai("scribe", "Scribe");
+        p.system_prompt = Some("You are Scribe, a careful note-taker.".into());
+        p.prompt_hash = Some("client-supplied-garbage".into());
+        let created = ws.create_persona(p).unwrap();
+        assert_eq!(
+            created.prompt_hash,
+            crate::models::prompt_hash(Some("You are Scribe, a careful note-taker."))
+        );
+        assert!(created.prompt_hash.is_some());
+
+        // No prompt → no hash (the user identity, and this AI without one).
+        assert!(ws.create_persona(ai("blank", "Blank")).unwrap().prompt_hash.is_none());
+    }
+
+    /// Editing the prompt changes the hash; pasting the exact earlier text back
+    /// resolves to the same hash (content-addressing, not a counter).
+    #[test]
+    fn update_persona_hash_tracks_and_restores_prompt() {
+        let mut ws = Workspace::seeded();
+        let original = ws.persona("aria").unwrap().prompt_hash.unwrap();
+
+        let edited = ws
+            .update_persona("aria", serde_json::json!({ "systemPrompt": "A brand new Aria." }))
+            .unwrap();
+        let edited_hash = edited.prompt_hash.unwrap();
+        assert_ne!(edited_hash, original);
+
+        // Re-resolve the seeded prompt text and paste it back verbatim.
+        let seeded_text = "You are {{persona_name}} in {{department_name}}, a warm and curious host in {{setting}}. Always reply in {{user_language}}.";
+        let restored = ws
+            .update_persona("aria", serde_json::json!({ "systemPrompt": seeded_text }))
+            .unwrap();
+        assert_eq!(restored.prompt_hash, Some(original));
+    }
+
+    #[test]
+    fn set_prompt_label_names_and_clears() {
+        let mut ws = Workspace::seeded();
+        let hash = ws.persona("aria").unwrap().prompt_hash.unwrap();
+
+        let named = ws.set_prompt_label(&hash, "  bar 版  ");
+        assert_eq!(named.label, "bar 版"); // trimmed
+        assert_eq!(ws.prompt_labels(), vec![PromptLabel { hash: hash.clone(), label: "bar 版".into() }]);
+
+        // A blank label clears the entry.
+        let cleared = ws.set_prompt_label(&hash, "   ");
+        assert_eq!(cleared.label, "");
+        assert!(ws.prompt_labels().is_empty());
     }
 }

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 /// The two persona roles: a user's own identity vs. an AI agent.
@@ -78,6 +79,59 @@ pub struct Persona {
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variables: Option<HashMap<String, String>>,
+    /// Content hash of the raw `system_prompt` template — the persona's identity
+    /// "version". Server-computed and effectively read-only on the wire: it is
+    /// recomputed on every create/update (and on load) and any value a client
+    /// sends is ignored. `None` when there is no prompt (user identities). Full
+    /// lowercase-hex SHA-256; the UI shows a truncated prefix. See [`prompt_hash`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_hash: Option<String>,
+}
+
+impl Persona {
+    /// Recomputes [`Persona::prompt_hash`] from the current `system_prompt`, so
+    /// the stored hash is never trusted from client input or a stale snapshot.
+    pub fn refresh_prompt_hash(&mut self) {
+        self.prompt_hash = prompt_hash(self.system_prompt.as_deref());
+    }
+}
+
+/// The identity hash of a raw system-prompt template: the unresolved text only —
+/// not the resolved variables, not the assembled `<group_members>`/`<directory>`
+/// roster — so it changes exactly when the author rewrites who the character is,
+/// and not when unrelated context (group membership, inherited variables) shifts.
+/// `None` for an empty or absent prompt. Content-addressed, so pasting earlier
+/// exact text back resolves to the same hash a counter would treat as new.
+pub fn prompt_hash(system_prompt: Option<&str>) -> Option<String> {
+    let text = system_prompt?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(text.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(hex)
+}
+
+/// A user-assigned, git-tag-style name for a persona identity hash
+/// ([`Persona::prompt_hash`]). Held in a side table so naming a version never
+/// mutates the persona itself; content-addressing means reverting to earlier
+/// exact prompt text resolves back to the same (possibly already-named) hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptLabel {
+    pub hash: String,
+    pub label: String,
+}
+
+/// Request body for naming a prompt identity hash. A blank label clears the name.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptLabelInput {
+    pub label: String,
 }
 
 /// A chat room: the AI personas that may speak, plus the user identity that

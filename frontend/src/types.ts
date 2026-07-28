@@ -60,6 +60,23 @@ export interface Persona {
   systemPrompt?: string;
   /** Persona-level template variables; override organization variables. */
   variables?: Record<string, string>;
+  /**
+   * Content hash of the raw `systemPrompt` template — the persona's identity
+   * "version". Server-computed and read-only: the backend recomputes it on every
+   * write and ignores any value sent by the client. Absent for personas with no
+   * prompt (user identities). Full hex SHA-256; show a truncated prefix.
+   */
+  promptHash?: string;
+}
+
+/**
+ * A user-assigned, git-tag-style name for a persona identity hash
+ * (`Persona.promptHash`). Kept in a side table on the backend so naming a
+ * version never mutates the persona itself.
+ */
+export interface PromptLabel {
+  hash: string;
+  label: string;
 }
 
 export interface Group {

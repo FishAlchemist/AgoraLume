@@ -16,7 +16,9 @@ use serde_json::Value;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::models::{Department, Group, Organization, Persona, Settings};
+use crate::models::{
+    Department, Group, Organization, Persona, PromptLabel, PromptLabelInput, Settings,
+};
 use crate::state::AppState;
 use crate::workspace::PersonaError;
 
@@ -28,6 +30,8 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(get_dept, update_dept, delete_dept))
         .routes(routes!(list_personas, create_persona))
         .routes(routes!(get_persona, update_persona, delete_persona))
+        .routes(routes!(list_prompt_labels))
+        .routes(routes!(set_prompt_label))
         .routes(routes!(list_groups, create_group))
         .routes(routes!(get_group, update_group, delete_group))
         .routes(routes!(get_settings, update_settings))
@@ -252,6 +256,32 @@ async fn delete_persona(State(s): State<Arc<AppState>>, Path(id): Path<String>) 
         // Found but refused: it's the last remaining user identity.
         StatusCode::CONFLICT
     }
+}
+
+// --- Prompt identity labels -------------------------------------------------
+
+/// All user-assigned names for persona identity hashes. The memory UI reads this
+/// to show a friendly label (e.g. "bar 版") next to a persona's prompt version.
+#[utoipa::path(get, path = "/prompt-labels", tag = "personas",
+    responses((status = 200, body = Vec<PromptLabel>)))]
+async fn list_prompt_labels(State(s): State<Arc<AppState>>) -> Json<Vec<PromptLabel>> {
+    Json(s.workspace().prompt_labels())
+}
+
+/// Names an identity hash, or clears its name when the label is blank. Idempotent
+/// (PUT), keyed by the full hash the client already holds from the persona.
+#[utoipa::path(put, path = "/prompt-labels/{hash}", tag = "personas",
+    params(("hash" = String, Path)),
+    request_body = PromptLabelInput,
+    responses((status = 200, body = PromptLabel)))]
+async fn set_prompt_label(
+    State(s): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+    Json(body): Json<PromptLabelInput>,
+) -> Json<PromptLabel> {
+    let label = s.workspace().set_prompt_label(&hash, &body.label);
+    s.persist_workspace();
+    Json(label)
 }
 
 // --- Groups -----------------------------------------------------------------

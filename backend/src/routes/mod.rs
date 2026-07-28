@@ -59,7 +59,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // credentials, so a wildcard origin is safe.
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
         .allow_headers(Any);
 
     let (router, _) = api().split_for_parts();

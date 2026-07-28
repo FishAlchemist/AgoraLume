@@ -576,6 +576,50 @@ paths:
           description: ''
         '409':
           description: 'Refused: name already in use, or a second user identity'
+  /prompt-labels:
+    get:
+      tags:
+      - personas
+      summary: |-
+        All user-assigned names for persona identity hashes. The memory UI reads this
+        to show a friendly label (e.g. "bar 版") next to a persona's prompt version.
+      operationId: list_prompt_labels
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PromptLabel'
+  /prompt-labels/{hash}:
+    put:
+      tags:
+      - personas
+      summary: |-
+        Names an identity hash, or clears its name when the label is blank. Idempotent
+        (PUT), keyed by the full hash the client already holds from the persona.
+      operationId: set_prompt_label
+      parameters:
+      - name: hash
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromptLabelInput'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromptLabel'
   /settings:
     get:
       tags:
@@ -976,6 +1020,16 @@ components:
           type:
           - string
           - 'null'
+        promptHash:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Content hash of the raw `system_prompt` template — the persona's identity
+            "version". Server-computed and effectively read-only on the wire: it is
+            recomputed on every create/update (and on load) and any value a client
+            sends is ignored. `None` when there is no prompt (user identities). Full
+            lowercase-hex SHA-256; the UI shows a truncated prefix. See [`prompt_hash`].
         systemPrompt:
           type:
           - string
@@ -994,6 +1048,29 @@ components:
       enum:
       - user
       - ai
+    PromptLabel:
+      type: object
+      description: |-
+        A user-assigned, git-tag-style name for a persona identity hash
+        ([`Persona::prompt_hash`]). Held in a side table so naming a version never
+        mutates the persona itself; content-addressing means reverting to earlier
+        exact prompt text resolves back to the same (possibly already-named) hash.
+      required:
+      - hash
+      - label
+      properties:
+        hash:
+          type: string
+        label:
+          type: string
+    PromptLabelInput:
+      type: object
+      description: Request body for naming a prompt identity hash. A blank label clears the name.
+      required:
+      - label
+      properties:
+        label:
+          type: string
     ReadReceipt:
       type: object
       description: |-

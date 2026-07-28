@@ -121,6 +121,20 @@ export interface paths {
      */
     patch: operations["update_persona"];
   };
+  "/prompt-labels": {
+    /**
+     * All user-assigned names for persona identity hashes. The memory UI reads this
+     * to show a friendly label (e.g. "bar 版") next to a persona's prompt version.
+     */
+    get: operations["list_prompt_labels"];
+  };
+  "/prompt-labels/{hash}": {
+    /**
+     * Names an identity hash, or clears its name when the label is blank. Idempotent
+     * (PUT), keyed by the full hash the client already holds from the persona.
+     */
+    put: operations["set_prompt_label"];
+  };
   "/settings": {
     get: operations["get_settings"];
     patch: operations["update_settings"];
@@ -313,6 +327,14 @@ export interface components {
       kind: components["schemas"]["PersonaKind"];
       name: string;
       organizationId?: string | null;
+      /**
+       * @description Content hash of the raw `system_prompt` template — the persona's identity
+       * "version". Server-computed and effectively read-only on the wire: it is
+       * recomputed on every create/update (and on load) and any value a client
+       * sends is ignored. `None` when there is no prompt (user identities). Full
+       * lowercase-hex SHA-256; the UI shows a truncated prefix. See [`prompt_hash`].
+       */
+      promptHash?: string | null;
       systemPrompt?: string | null;
       variables?: {
         [key: string]: string;
@@ -323,6 +345,20 @@ export interface components {
      * @enum {string}
      */
     PersonaKind: "user" | "ai";
+    /**
+     * @description A user-assigned, git-tag-style name for a persona identity hash
+     * ([`Persona::prompt_hash`]). Held in a side table so naming a version never
+     * mutates the persona itself; content-addressing means reverting to earlier
+     * exact prompt text resolves back to the same (possibly already-named) hash.
+     */
+    PromptLabel: {
+      hash: string;
+      label: string;
+    };
+    /** @description Request body for naming a prompt identity hash. A blank label clears the name. */
+    PromptLabelInput: {
+      label: string;
+    };
     /**
      * @description A single AI persona acknowledging it successfully processed a message —
      * whether or not it chose to reply (agents may read without replying).
@@ -920,6 +956,42 @@ export interface operations {
       /** @description Refused: name already in use, or a second user identity */
       409: {
         content: never;
+      };
+    };
+  };
+  /**
+   * All user-assigned names for persona identity hashes. The memory UI reads this
+   * to show a friendly label (e.g. "bar 版") next to a persona's prompt version.
+   */
+  list_prompt_labels: {
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["PromptLabel"][];
+        };
+      };
+    };
+  };
+  /**
+   * Names an identity hash, or clears its name when the label is blank. Idempotent
+   * (PUT), keyed by the full hash the client already holds from the persona.
+   */
+  set_prompt_label: {
+    parameters: {
+      path: {
+        hash: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["PromptLabelInput"];
+      };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["PromptLabel"];
+        };
       };
     };
   };
