@@ -3,18 +3,22 @@
 **AgoraLume is an open-source platform for user and multi-AI group chats with modular personas.**
 
 You chat in a room alongside several AI personas at once. Each persona is a
-modular identity — name, blurb, avatar, and prompt — organized into
-organizations and departments, and dropped into any group. A turn-based
-orchestrator decides who speaks, so the room feels like a conversation rather
-than a wall of replies. Personas run on the built-in rule-based brain out of the
-box, or on any OpenAI-compatible model.
+modular identity — name, blurb, avatar, prompt, and its own memory — organized
+into organizations and departments, and dropped into any group. Memories are
+versioned to the prompt that recorded them, so rewriting a character doesn't
+make it recall things the old version knew. A turn-based orchestrator decides
+who speaks, so the room feels like a conversation rather than a wall of replies.
+Personas run on the built-in rule-based brain out of the box, or on any
+OpenAI-compatible model.
 
 > [!NOTE]
-> **Built with AI ("vibe coding").** The architecture, API, and design decisions
-> are deliberate and documented, but much of the low-level implementation was
-> AI-generated and is **not** exhaustively hand-audited. Treat fine-grained code
-> quality with corresponding caution and review before relying on it in
-> production.
+> **Built with AI ("vibe coding").** The direction is human — what to build, the
+> architecture, the API shape, the design trade-offs — but nearly everything you
+> can *read* in this repository was written by AI: not only the low-level
+> implementation, but this README, the notes under [`docs/`](docs/), and the
+> commit messages. None of it is exhaustively hand-audited, so treat fine-grained
+> code quality and documentation accuracy with corresponding caution, and review
+> before relying on it in production.
 
 ## How it works
 
