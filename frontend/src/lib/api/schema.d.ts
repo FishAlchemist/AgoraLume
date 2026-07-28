@@ -121,6 +121,26 @@ export interface paths {
      */
     patch: operations["update_persona"];
   };
+  "/personas/{personaId}/memories": {
+    /**
+     * Every memory a persona has accumulated, across all of its identity versions,
+     * newest first. The memory-management UI groups the result by `promptHash`/label.
+     */
+    get: operations["list_memories"];
+    /**
+     * Writes a memory for a persona, tagged with its current identity hash. 404 for
+     * an unknown persona; 409 when the persona has no prompt to scope a memory to,
+     * or the content is blank.
+     */
+    post: operations["create_memory"];
+  };
+  "/personas/{personaId}/memories/{memoryId}": {
+    /**
+     * Deletes one of a persona's memories. 404 when no such memory belongs to that
+     * persona.
+     */
+    delete: operations["delete_memory"];
+  };
   "/prompt-labels": {
     /**
      * All user-assigned names for persona identity hashes. The memory UI reads this
@@ -256,6 +276,33 @@ export interface components {
       name: string;
       personaIds: string[];
       selfPersonaId: string;
+    };
+    /**
+     * @description One persona-scoped memory: a fact a character chose to remember. Tagged with
+     * the persona identity hash ([`Persona::prompt_hash`]) that was in force when it
+     * was written, so a later rewrite of the persona never recalls a previous
+     * version's memories out of character. Persisted in the workspace snapshot
+     * alongside the personas the memories belong to.
+     */
+    Memory: {
+      content: string;
+      /**
+       * Format: int64
+       * @description Milliseconds since the Unix epoch when the memory was written.
+       */
+      createdAt: number;
+      id: string;
+      personaId: string;
+      /**
+       * @description The persona identity hash in force when this memory was written — the
+       * scope key that keeps recall in-character. Always a real hash: a persona
+       * with no prompt (no hash) can hold no memories.
+       */
+      promptHash: string;
+    };
+    /** @description Request body for writing a memory: just the text to remember. */
+    MemoryInput: {
+      content: string;
     };
     /** @description One chat line. Tagged by `kind`, matching the TypeScript `Message` union. */
     Message: OneOf<[{
@@ -955,6 +1002,78 @@ export interface operations {
       };
       /** @description Refused: name already in use, or a second user identity */
       409: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * Every memory a persona has accumulated, across all of its identity versions,
+   * newest first. The memory-management UI groups the result by `promptHash`/label.
+   */
+  list_memories: {
+    parameters: {
+      path: {
+        personaId: string;
+      };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["Memory"][];
+        };
+      };
+      404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * Writes a memory for a persona, tagged with its current identity hash. 404 for
+   * an unknown persona; 409 when the persona has no prompt to scope a memory to,
+   * or the content is blank.
+   */
+  create_memory: {
+    parameters: {
+      path: {
+        personaId: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["MemoryInput"];
+      };
+    };
+    responses: {
+      201: {
+        content: {
+          "application/json": components["schemas"]["Memory"];
+        };
+      };
+      404: {
+        content: never;
+      };
+      /** @description Refused: persona has no prompt to scope a memory to, or blank content */
+      409: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * Deletes one of a persona's memories. 404 when no such memory belongs to that
+   * persona.
+   */
+  delete_memory: {
+    parameters: {
+      path: {
+        personaId: string;
+        memoryId: string;
+      };
+    };
+    responses: {
+      204: {
+        content: never;
+      };
+      404: {
         content: never;
       };
     };

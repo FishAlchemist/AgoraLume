@@ -17,7 +17,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::models::{
-    Department, Group, Organization, Persona, PromptLabel, PromptLabelInput, Settings,
+    Department, Group, Memory, MemoryInput, Organization, Persona, PromptLabel, PromptLabelInput,
+    Settings,
 };
 use crate::state::AppState;
 use crate::workspace::PersonaError;
@@ -32,6 +33,8 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(get_persona, update_persona, delete_persona))
         .routes(routes!(list_prompt_labels))
         .routes(routes!(set_prompt_label))
+        .routes(routes!(list_memories, create_memory))
+        .routes(routes!(delete_memory))
         .routes(routes!(list_groups, create_group))
         .routes(routes!(get_group, update_group, delete_group))
         .routes(routes!(get_settings, update_settings))
@@ -282,6 +285,74 @@ async fn set_prompt_label(
     let label = s.workspace().set_prompt_label(&hash, &body.label);
     s.persist_workspace();
     Json(label)
+}
+
+// --- Persona memory ---------------------------------------------------------
+
+/// Every memory a persona has accumulated, across all of its identity versions,
+/// newest first. The memory-management UI groups the result by `promptHash`/label.
+#[utoipa::path(get, path = "/personas/{personaId}/memories", tag = "personas",
+    params(("personaId" = String, Path)),
+    responses((status = 200, body = Vec<Memory>), (status = 404)))]
+async fn list_memories(
+    State(s): State<Arc<AppState>>,
+    Path(persona_id): Path<String>,
+) -> Result<Json<Vec<Memory>>, StatusCode> {
+    let ws = s.workspace();
+    if !ws.personas.iter().any(|p| p.id == persona_id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(ws.persona_memories(&persona_id)))
+}
+
+/// Writes a memory for a persona, tagged with its current identity hash. 404 for
+/// an unknown persona; 409 when the persona has no prompt to scope a memory to,
+/// or the content is blank.
+#[utoipa::path(post, path = "/personas/{personaId}/memories", tag = "personas",
+    params(("personaId" = String, Path)),
+    request_body = MemoryInput,
+    responses(
+        (status = 201, body = Memory),
+        (status = 404),
+        (status = 409, description = "Refused: persona has no prompt to scope a memory to, or blank content")))]
+async fn create_memory(
+    State(s): State<Arc<AppState>>,
+    Path(persona_id): Path<String>,
+    Json(body): Json<MemoryInput>,
+) -> Result<(StatusCode, Json<Memory>), StatusCode> {
+    let outcome = {
+        let mut ws = s.workspace();
+        if !ws.personas.iter().any(|p| p.id == persona_id) {
+            None
+        } else {
+            Some(ws.add_memory(&persona_id, &body.content))
+        }
+    };
+    match outcome {
+        None => Err(StatusCode::NOT_FOUND),
+        Some(None) => Err(StatusCode::CONFLICT),
+        Some(Some(memory)) => {
+            s.persist_workspace();
+            Ok((StatusCode::CREATED, Json(memory)))
+        }
+    }
+}
+
+/// Deletes one of a persona's memories. 404 when no such memory belongs to that
+/// persona.
+#[utoipa::path(delete, path = "/personas/{personaId}/memories/{memoryId}", tag = "personas",
+    params(("personaId" = String, Path), ("memoryId" = String, Path)),
+    responses((status = 204), (status = 404)))]
+async fn delete_memory(
+    State(s): State<Arc<AppState>>,
+    Path((persona_id, memory_id)): Path<(String, String)>,
+) -> StatusCode {
+    if s.workspace().delete_memory(&persona_id, &memory_id) {
+        s.persist_workspace();
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 // --- Groups -----------------------------------------------------------------

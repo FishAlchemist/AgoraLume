@@ -15,7 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::models::{
-    Department, Group, Organization, Persona, PersonaKind, PromptLabel, Settings,
+    Department, Group, Memory, Organization, Persona, PersonaKind, PromptLabel, Settings, now_ms,
 };
 
 /// A serializable snapshot of the whole workspace — the on-disk persistence
@@ -34,6 +34,10 @@ pub struct WorkspaceSnapshot {
     /// snapshots written before persona versioning existed.
     #[serde(default)]
     pub prompt_labels: HashMap<String, String>,
+    /// Persona-scoped memories, each tagged with the identity hash that wrote it.
+    /// Absent in snapshots written before memory existed.
+    #[serde(default)]
+    pub memories: Vec<Memory>,
 }
 
 /// The id of the default user identity, matching the frontend seed.
@@ -50,6 +54,12 @@ pub struct Workspace {
     /// User-assigned names for persona identity hashes (hash → label). Kept off
     /// [`Persona`] so naming a version never mutates the persona.
     pub prompt_labels: HashMap<String, String>,
+    /// Persona-scoped memories, each stamped on write with the persona's identity
+    /// hash. Keeping that stamp lets a later recall path scope reads to the
+    /// persona's *current* hash, so a rewritten character never recalls an earlier
+    /// version's memories — while nothing is silently deleted when a persona is
+    /// edited.
+    pub memories: Vec<Memory>,
 }
 
 /// One member of a group, as an agent sees it: a name, an optional blurb, and
@@ -125,6 +135,7 @@ impl Workspace {
             groups: seed_groups(),
             settings: seed_settings(),
             prompt_labels: HashMap::new(),
+            memories: Vec::new(),
         };
         workspace.refresh_prompt_hashes();
         workspace
@@ -141,6 +152,7 @@ impl Workspace {
             groups: snapshot.groups,
             settings: snapshot.settings,
             prompt_labels: snapshot.prompt_labels,
+            memories: snapshot.memories,
         };
         workspace.enforce_single_user();
         // Recompute hashes from the loaded prompts: a snapshot may predate
@@ -207,6 +219,7 @@ impl Workspace {
             groups: self.groups.clone(),
             settings: self.settings.clone(),
             prompt_labels: self.prompt_labels.clone(),
+            memories: self.memories.clone(),
         }
     }
 
@@ -347,6 +360,8 @@ impl Workspace {
             .map(|p| p.id.clone());
 
         self.personas.retain(|p| p.id != id);
+        // A deleted persona's memories have nothing left to belong to.
+        self.memories.retain(|m| m.persona_id != id);
         for g in &mut self.groups {
             g.persona_ids.retain(|pid| pid != id);
             if g.self_persona_id == id && let Some(fallback) = &fallback_self {
@@ -379,6 +394,54 @@ impl Workspace {
             self.prompt_labels.insert(hash.to_string(), label.to_string());
         }
         PromptLabel { hash: hash.to_string(), label: label.to_string() }
+    }
+
+    // --- Persona memory -----------------------------------------------------
+
+    /// A persona's current identity hash, if it has a prompt. The scope key for
+    /// its memories.
+    fn persona_hash(&self, persona_id: &str) -> Option<String> {
+        self.personas.iter().find(|p| p.id == persona_id).and_then(|p| p.prompt_hash.clone())
+    }
+
+    /// Every memory a persona has accumulated, across all of its identity
+    /// versions, newest first. The memory-management UI reads this and groups the
+    /// result by `prompt_hash`/label.
+    pub fn persona_memories(&self, persona_id: &str) -> Vec<Memory> {
+        let mut mems: Vec<Memory> =
+            self.memories.iter().filter(|m| m.persona_id == persona_id).cloned().collect();
+        mems.sort_by_key(|m| std::cmp::Reverse(m.created_at));
+        mems
+    }
+
+    /// Records a memory for a persona, stamped with the persona's current identity
+    /// hash so a later recall can keep it in-character. Returns `None` when the
+    /// persona is unknown, has no prompt (no hash to scope to), or the content is
+    /// blank.
+    pub fn add_memory(&mut self, persona_id: &str, content: &str) -> Option<Memory> {
+        let content = content.trim();
+        if content.is_empty() {
+            return None;
+        }
+        let prompt_hash = self.persona_hash(persona_id)?;
+        let memory = Memory {
+            id: new_id(),
+            persona_id: persona_id.to_string(),
+            prompt_hash,
+            content: content.to_string(),
+            created_at: now_ms(),
+        };
+        self.memories.push(memory.clone());
+        Some(memory)
+    }
+
+    /// Deletes one of a persona's memories by id. Scoped to the persona so a
+    /// memory id belonging to someone else can't be removed through its endpoint.
+    /// Returns whether a memory was removed.
+    pub fn delete_memory(&mut self, persona_id: &str, memory_id: &str) -> bool {
+        let before = self.memories.len();
+        self.memories.retain(|m| !(m.id == memory_id && m.persona_id == persona_id));
+        self.memories.len() != before
     }
 
     // --- Groups -------------------------------------------------------------
@@ -705,6 +768,7 @@ mod tests {
             }],
             settings: seed_settings(),
             prompt_labels: HashMap::new(),
+            memories: Vec::new(),
         };
         let ws = Workspace::from_snapshot(snapshot);
 
@@ -774,5 +838,72 @@ mod tests {
         let cleared = ws.set_prompt_label(&hash, "   ");
         assert_eq!(cleared.label, "");
         assert!(ws.prompt_labels().is_empty());
+    }
+
+    /// A memory is tagged with the persona's current hash; blank content and
+    /// prompt-less personas are refused (nothing to scope a memory to).
+    #[test]
+    fn add_memory_tags_current_hash_and_refuses_hashless() {
+        let mut ws = Workspace::seeded();
+        let hash = ws.persona("aria").unwrap().prompt_hash.unwrap();
+
+        let mem = ws.add_memory("aria", "  the user prefers tea over coffee  ").unwrap();
+        assert_eq!(mem.prompt_hash, hash);
+        assert_eq!(mem.content, "the user prefers tea over coffee"); // trimmed
+        assert_eq!(mem.persona_id, "aria");
+
+        // Blank content and a prompt-less persona (the user identity) get nothing.
+        assert!(ws.add_memory("aria", "   ").is_none());
+        assert!(ws.add_memory(DEFAULT_USER_PERSONA_ID, "anything").is_none());
+        assert!(ws.add_memory("ghost", "anything").is_none());
+    }
+
+    /// Each memory is stamped with the identity version live when it was written,
+    /// so rewriting the persona partitions old from new by `prompt_hash` while the
+    /// management listing still shows everything. This is what lets a later recall
+    /// path (the memory tool) keep an old version's memories out of character
+    /// without deleting them.
+    #[test]
+    fn memories_are_tagged_per_identity_version() {
+        let mut ws = Workspace::seeded();
+        let v1 = ws.persona("aria").unwrap().prompt_hash.unwrap();
+        ws.add_memory("aria", "remembered under the original Aria").unwrap();
+
+        // Redefine the character; a memory written now carries the new hash.
+        ws.update_persona("aria", serde_json::json!({ "systemPrompt": "A brand new Aria." }))
+            .unwrap();
+        let v2 = ws.persona("aria").unwrap().prompt_hash.unwrap();
+        assert_ne!(v1, v2);
+        ws.add_memory("aria", "remembered under the new Aria").unwrap();
+
+        // Both are retained and listed; each is scoped to the version that wrote it.
+        let all = ws.persona_memories("aria");
+        assert_eq!(all.len(), 2);
+        let under_v1: Vec<&str> =
+            all.iter().filter(|m| m.prompt_hash == v1).map(|m| m.content.as_str()).collect();
+        let under_v2: Vec<&str> =
+            all.iter().filter(|m| m.prompt_hash == v2).map(|m| m.content.as_str()).collect();
+        assert_eq!(under_v1, ["remembered under the original Aria"]);
+        assert_eq!(under_v2, ["remembered under the new Aria"]);
+    }
+
+    /// Deletion is scoped to the owning persona, and dropping a persona takes its
+    /// memories with it.
+    #[test]
+    fn delete_memory_is_scoped_and_cascades_with_persona() {
+        let mut ws = Workspace::seeded();
+        let aria_mem = ws.add_memory("aria", "aria's note").unwrap();
+        ws.add_memory("nox", "nox's note").unwrap();
+
+        // Nox's endpoint can't delete Aria's memory.
+        assert!(!ws.delete_memory("nox", &aria_mem.id));
+        assert_eq!(ws.persona_memories("aria").len(), 1);
+        // The owner can.
+        assert!(ws.delete_memory("aria", &aria_mem.id));
+        assert!(ws.persona_memories("aria").is_empty());
+
+        // Deleting Nox removes its remaining memory too.
+        ws.delete_persona("nox");
+        assert!(ws.persona_memories("nox").is_empty());
     }
 }

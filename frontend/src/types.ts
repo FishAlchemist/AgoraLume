@@ -79,6 +79,23 @@ export interface PromptLabel {
   label: string;
 }
 
+/**
+ * One persona-scoped memory: a fact a character chose to remember. Stamped with
+ * the persona identity hash (`Persona.promptHash`) that was in force when it was
+ * written, so a later rewrite of the persona can keep old memories out of
+ * character without deleting them. The memory-management UI groups a persona's
+ * memories by `promptHash`/label.
+ */
+export interface Memory {
+  id: string;
+  personaId: string;
+  /** Identity hash in force when written — the scope key that keeps recall in-character. */
+  promptHash: string;
+  content: string;
+  /** Milliseconds since the Unix epoch when the memory was written. */
+  createdAt: number;
+}
+
 export interface Group {
   id: string;
   name: string;

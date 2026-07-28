@@ -576,6 +576,86 @@ paths:
           description: ''
         '409':
           description: 'Refused: name already in use, or a second user identity'
+  /personas/{personaId}/memories:
+    get:
+      tags:
+      - personas
+      summary: |-
+        Every memory a persona has accumulated, across all of its identity versions,
+        newest first. The memory-management UI groups the result by `promptHash`/label.
+      operationId: list_memories
+      parameters:
+      - name: personaId
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Memory'
+        '404':
+          description: ''
+    post:
+      tags:
+      - personas
+      summary: |-
+        Writes a memory for a persona, tagged with its current identity hash. 404 for
+        an unknown persona; 409 when the persona has no prompt to scope a memory to,
+        or the content is blank.
+      operationId: create_memory
+      parameters:
+      - name: personaId
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryInput'
+        required: true
+      responses:
+        '201':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Memory'
+        '404':
+          description: ''
+        '409':
+          description: 'Refused: persona has no prompt to scope a memory to, or blank content'
+  /personas/{personaId}/memories/{memoryId}:
+    delete:
+      tags:
+      - personas
+      summary: |-
+        Deletes one of a persona's memories. 404 when no such memory belongs to that
+        persona.
+      operationId: delete_memory
+      parameters:
+      - name: personaId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: memoryId
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: ''
+        '404':
+          description: ''
   /prompt-labels:
     get:
       tags:
@@ -842,6 +922,45 @@ components:
           items:
             type: string
         selfPersonaId:
+          type: string
+    Memory:
+      type: object
+      description: |-
+        One persona-scoped memory: a fact a character chose to remember. Tagged with
+        the persona identity hash ([`Persona::prompt_hash`]) that was in force when it
+        was written, so a later rewrite of the persona never recalls a previous
+        version's memories out of character. Persisted in the workspace snapshot
+        alongside the personas the memories belong to.
+      required:
+      - id
+      - personaId
+      - promptHash
+      - content
+      - createdAt
+      properties:
+        content:
+          type: string
+        createdAt:
+          type: integer
+          format: int64
+          description: Milliseconds since the Unix epoch when the memory was written.
+        id:
+          type: string
+        personaId:
+          type: string
+        promptHash:
+          type: string
+          description: |-
+            The persona identity hash in force when this memory was written — the
+            scope key that keeps recall in-character. Always a real hash: a persona
+            with no prompt (no hash) can hold no memories.
+    MemoryInput:
+      type: object
+      description: 'Request body for writing a memory: just the text to remember.'
+      required:
+      - content
+      properties:
+        content:
           type: string
     Message:
       oneOf:

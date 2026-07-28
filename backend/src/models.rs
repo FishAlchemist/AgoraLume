@@ -134,6 +134,32 @@ pub struct PromptLabelInput {
     pub label: String,
 }
 
+/// One persona-scoped memory: a fact a character chose to remember. Tagged with
+/// the persona identity hash ([`Persona::prompt_hash`]) that was in force when it
+/// was written, so a later rewrite of the persona never recalls a previous
+/// version's memories out of character. Persisted in the workspace snapshot
+/// alongside the personas the memories belong to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Memory {
+    pub id: String,
+    pub persona_id: String,
+    /// The persona identity hash in force when this memory was written — the
+    /// scope key that keeps recall in-character. Always a real hash: a persona
+    /// with no prompt (no hash) can hold no memories.
+    pub prompt_hash: String,
+    pub content: String,
+    /// Milliseconds since the Unix epoch when the memory was written.
+    pub created_at: i64,
+}
+
+/// Request body for writing a memory: just the text to remember.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryInput {
+    pub content: String,
+}
+
 /// A chat room: the AI personas that may speak, plus the user identity that
 /// represents "you" here.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
