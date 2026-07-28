@@ -75,3 +75,6 @@ jobs:
           path: dist-bundle/AgoraLume
           retention-days: 1
           if-no-files-found: error
+          # `.env.example` is a dotfile, and upload-artifact drops hidden files by
+          # default — without this the bundle ships with no settings template.
+          include-hidden-files: true
