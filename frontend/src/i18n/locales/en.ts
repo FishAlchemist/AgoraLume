@@ -62,6 +62,8 @@ export const en = {
     retry: 'Retry',
     suggestRegenerate: 'Suggest other ideas',
     suggestLoading: 'Thinking of ideas…',
+    today: 'Today',
+    yesterday: 'Yesterday',
   },
   readonly: {
     badge: 'Read-only',

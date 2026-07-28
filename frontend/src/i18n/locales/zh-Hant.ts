@@ -64,6 +64,8 @@ export const zhHant: TranslationSchema = {
     retry: '重試',
     suggestRegenerate: '換一批建議',
     suggestLoading: '想想別的說法…',
+    today: '今天',
+    yesterday: '昨天',
   },
   readonly: {
     badge: '唯讀',

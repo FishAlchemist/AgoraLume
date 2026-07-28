@@ -69,8 +69,34 @@ function compareMessages(a: Message, b: Message): number {
   return a.ts - b.ts || seqOf(a.id) - seqOf(b.id);
 }
 
+/** Local midnight for a timestamp, so two messages compare equal iff same calendar day. */
+function startOfDay(ts: number): number {
+  const d = new Date(ts);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+/**
+ * A day-separator label for the divider between messages that cross midnight:
+ * "Today"/"Yesterday" for the two most recent days, otherwise a full local date
+ * (year dropped when it's the current year) so the reader can place each message.
+ */
+function formatDayLabel(ts: number, locale: string, t: (key: string) => string): string {
+  const day = startOfDay(ts);
+  const today = startOfDay(Date.now());
+  const diffDays = Math.round((today - day) / 86_400_000);
+  if (diffDays === 0) return t('chat.today');
+  if (diffDays === 1) return t('chat.yesterday');
+  const d = new Date(ts);
+  return d.toLocaleDateString(locale, {
+    year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'long',
+  });
+}
+
 export function ChatView({ group, personas }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const fontSize = useWorkspace((s) => s.settings.chatFontSize ?? 15);
   const readOnly = useReadOnly((s) => s.readOnly);
   // Re-bind history + streams when the active data source changes.
@@ -267,41 +293,55 @@ export function ChatView({ group, personas }: Props) {
     return map;
   }, [ordered, selfId, aiMembers]);
 
+  // Bucket the ordered lines into consecutive same-day runs. Each run renders as
+  // its own block with a sticky date header, so the day stays pinned at the top
+  // of the viewport the whole time you're reading that day — and is handed off to
+  // the next day only once you scroll its block away.
+  const dayGroups = useMemo(() => {
+    if (!ordered) return null;
+    const groups: { day: number; ts: number; items: Message[] }[] = [];
+    for (const m of ordered) {
+      const day = startOfDay(m.ts);
+      const last = groups.at(-1);
+      if (last && last.day === day) last.items.push(m);
+      else groups.push({ day, ts: m.ts, items: [m] });
+    }
+    return groups;
+  }, [ordered]);
+  // The id of the very last line overall — the only one that may offer a retry.
+  const lastId = ordered?.at(-1)?.id;
+
   return (
     <Stack h="100%" gap={0}>
       <ScrollArea flex={1} viewportRef={viewport} p="md">
-        {ordered === null ? (
+        {dayGroups === null ? (
           <Center h={200}>
             <Loader />
           </Center>
-        ) : ordered.length === 0 ? (
+        ) : dayGroups.length === 0 ? (
           <Center h={200}>
             <Text c="dimmed">No messages yet — say hi 👋</Text>
           </Center>
         ) : (
           <Stack gap="md">
-            {ordered.map((message, index) => {
-              const persona = personas.get(message.personaId);
-              if (!persona) return null;
-              const replied = replyMap.get(message.id);
-              // A retry is only offered on the latest line while the loop is idle:
-              // sending a new message pushes a newer line, which both hides the
-              // button here and voids the pending retry on the backend.
-              const isLast = index === ordered.length - 1;
-              return (
-                <MessageItem
-                  key={message.id}
-                  message={message}
-                  persona={persona}
-                  isSelf={message.personaId === selfId}
-                  fontSize={fontSize}
-                  aiMembers={aiMembers}
-                  repliedBy={replied ? [...replied] : undefined}
-                  onRetry={message.kind === 'system' ? handleRetry : undefined}
-                  canRetry={isLast && !busy}
-                />
-              );
-            })}
+            {dayGroups.map((group) => (
+              <Stack key={group.day} gap="md" pos="relative">
+                <DayHeader label={formatDayLabel(group.ts, i18n.language, t)} />
+                {group.items.map((message) => (
+                  <ChatMessage
+                    key={message.id}
+                    message={message}
+                    persona={personas.get(message.personaId)}
+                    selfId={selfId}
+                    fontSize={fontSize}
+                    aiMembers={aiMembers}
+                    repliedBy={replyMap.get(message.id)}
+                    canRetry={message.id === lastId && !busy}
+                    onRetry={handleRetry}
+                  />
+                ))}
+              </Stack>
+            ))}
           </Stack>
         )}
       </ScrollArea>
@@ -330,5 +370,71 @@ export function ChatView({ group, personas }: Props) {
         )}
       </Box>
     </Stack>
+  );
+}
+
+interface ChatMessageProps {
+  message: Message;
+  persona: Persona | undefined;
+  selfId: string | undefined;
+  fontSize: number;
+  aiMembers: Persona[];
+  repliedBy: Set<string> | undefined;
+  /** This is the latest line and the loop is idle — a `system` error may retry. */
+  canRetry: boolean;
+  onRetry: () => void;
+}
+
+/** A single chat line: resolves its persona and derives the display-only props. */
+function ChatMessage({
+  message,
+  persona,
+  selfId,
+  fontSize,
+  aiMembers,
+  repliedBy,
+  canRetry,
+  onRetry,
+}: ChatMessageProps) {
+  if (!persona) return null;
+  return (
+    <MessageItem
+      message={message}
+      persona={persona}
+      isSelf={message.personaId === selfId}
+      fontSize={fontSize}
+      aiMembers={aiMembers}
+      repliedBy={repliedBy ? [...repliedBy] : undefined}
+      onRetry={message.kind === 'system' ? onRetry : undefined}
+      canRetry={canRetry}
+    />
+  );
+}
+
+/**
+ * The date label for a day's block. It sticks to the top of the scroll viewport
+ * so the day you're reading stays visible the whole time, and is pushed off only
+ * when its block scrolls away and the next day's header takes over. `pointer-events`
+ * is off so the floating pill never swallows clicks on the message beneath it.
+ */
+function DayHeader({ label }: { label: string }) {
+  return (
+    <Center pos="sticky" top={4} style={{ zIndex: 2, pointerEvents: 'none' }}>
+      <Box
+        style={{
+          fontSize: 12,
+          fontWeight: 600,
+          color: 'var(--mantine-color-dimmed)',
+          background: 'color-mix(in srgb, var(--mantine-color-body) 82%, transparent)',
+          backdropFilter: 'blur(6px)',
+          border: '1px solid var(--mantine-color-default-border)',
+          borderRadius: 999,
+          padding: '2px 12px',
+          boxShadow: '0 2px 8px rgba(0, 0, 0, 0.08)',
+        }}
+      >
+        {label}
+      </Box>
+    </Center>
   );
 }
