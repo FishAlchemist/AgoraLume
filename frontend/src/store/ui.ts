@@ -16,6 +16,8 @@ export interface ConfirmRequest {
 interface UiState {
   /** Persona whose read-only info card is shown, or null when closed. */
   cardPersonaId: string | null;
+  /** Persona whose memory drawer is open, or null when closed. */
+  memoryPersonaId: string | null;
   /** Whether the persona editor modal is open. */
   editorOpen: boolean;
   /** Persona being edited; null means "create new". */
@@ -27,6 +29,8 @@ interface UiState {
 
   openCard: (personaId: string) => void;
   closeCard: () => void;
+  openMemory: (personaId: string) => void;
+  closeMemory: () => void;
   openEditor: (personaId?: string | null, kind?: PersonaKind) => void;
   closeEditor: () => void;
   askConfirm: (request: ConfirmRequest) => void;
@@ -40,6 +44,7 @@ interface UiState {
  */
 export const useUi = create<UiState>((set) => ({
   cardPersonaId: null,
+  memoryPersonaId: null,
   editorOpen: false,
   editorPersonaId: null,
   editorKind: 'ai',
@@ -47,6 +52,8 @@ export const useUi = create<UiState>((set) => ({
 
   openCard: (personaId) => set({ cardPersonaId: personaId }),
   closeCard: () => set({ cardPersonaId: null }),
+  openMemory: (personaId) => set({ memoryPersonaId: personaId }),
+  closeMemory: () => set({ memoryPersonaId: null }),
   openEditor: (personaId = null, kind = 'ai') =>
     set({ editorOpen: true, editorPersonaId: personaId, editorKind: kind }),
   closeEditor: () => set({ editorOpen: false }),

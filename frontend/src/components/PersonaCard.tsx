@@ -10,7 +10,7 @@ import {
   Stack,
   Text,
 } from '@mantine/core';
-import { IconDownload, IconPencil } from '@tabler/icons-react';
+import { IconBrain, IconDownload, IconPencil } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { resolveSystemPrompt, resolveVariables } from '../lib/prompt';
 import { buildBundle, downloadBundle, slugify } from '../lib/transfer';
@@ -27,6 +27,7 @@ export function PersonaCard() {
   const cardPersonaId = useUi((s) => s.cardPersonaId);
   const closeCard = useUi((s) => s.closeCard);
   const openEditor = useUi((s) => s.openEditor);
+  const openMemory = useUi((s) => s.openMemory);
   const readOnly = useReadOnly((s) => s.readOnly);
   const personas = useWorkspace((s) => s.personas);
   const organizations = useWorkspace((s) => s.organizations);
@@ -44,6 +45,12 @@ export function PersonaCard() {
     if (!persona) return;
     closeCard();
     openEditor(persona.id);
+  };
+
+  const handleMemory = () => {
+    if (!persona) return;
+    closeCard();
+    openMemory(persona.id);
   };
 
   const handleExport = () => {
@@ -124,14 +131,23 @@ export function PersonaCard() {
             {persona.kind === 'user' ? (
               <span />
             ) : (
-              <Button
-                variant="light"
-                color="gray"
-                leftSection={<IconDownload size={16} />}
-                onClick={handleExport}
-              >
-                {t('transfer.exportOne')}
-              </Button>
+              <Group gap="xs">
+                <Button
+                  variant="light"
+                  leftSection={<IconBrain size={16} />}
+                  onClick={handleMemory}
+                >
+                  {t('memory.title')}
+                </Button>
+                <Button
+                  variant="light"
+                  color="gray"
+                  leftSection={<IconDownload size={16} />}
+                  onClick={handleExport}
+                >
+                  {t('transfer.exportOne')}
+                </Button>
+              </Group>
             )}
             {!readOnly && (
               <Button leftSection={<IconPencil size={16} />} onClick={handleEdit}>

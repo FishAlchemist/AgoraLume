@@ -7,6 +7,7 @@ import { AppNav } from './components/AppNav';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { DataSourceBadge } from './components/DataSourceBadge';
 import { HeaderControls } from './components/HeaderControls';
+import { MemoryDrawer } from './components/MemoryDrawer';
 import { PersonaCard } from './components/PersonaCard';
 import { PersonaFormModal } from './components/PersonaFormModal';
 import { ChatPage } from './pages/ChatPage';
@@ -85,6 +86,7 @@ function Shell() {
       </AppShell.Main>
 
       <PersonaCard />
+      <MemoryDrawer />
       <PersonaEditorHost />
       <ConfirmDialog />
     </AppShell>

@@ -1,4 +1,12 @@
-import type { Department, Group, Organization, Persona, Settings } from '../../types';
+import type {
+  Department,
+  Group,
+  Memory,
+  Organization,
+  Persona,
+  PromptLabel,
+  Settings,
+} from '../../types';
 
 /** A full read of the backend-owned workspace (the SSOT). */
 export interface WorkspaceSnapshot {
@@ -36,6 +44,17 @@ export class HttpWorkspaceApi {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`${method} ${path} failed: ${res.status}`);
+  }
+
+  /** Like `send`, but for endpoints that return the created/updated record. */
+  private async sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`${method} ${path} failed: ${res.status}`);
+    return (await res.json()) as T;
   }
 
   /** Reads the whole workspace in one shot (used to hydrate the store). */
@@ -92,6 +111,28 @@ export class HttpWorkspaceApi {
 
   updateSettings(patch: Partial<Settings>): Promise<void> {
     return this.send('PATCH', '/settings', patch);
+  }
+
+  // Persona memory. Backend-only: the mock has no agent loop to record it, and
+  // memories live in the SSOT rather than the client-cached workspace, so the
+  // management UI reads them on demand instead of holding them in the store.
+  listMemories(personaId: string): Promise<Memory[]> {
+    return this.get<Memory[]>(`/personas/${personaId}/memories`);
+  }
+  createMemory(personaId: string, content: string): Promise<Memory> {
+    return this.sendJson<Memory>('POST', `/personas/${personaId}/memories`, { content });
+  }
+  deleteMemory(personaId: string, memoryId: string): Promise<void> {
+    return this.send('DELETE', `/personas/${personaId}/memories/${memoryId}`);
+  }
+
+  // Prompt-version labels: git-tag-style names for persona identity hashes,
+  // shown by the memory UI to tell one character version from another.
+  listPromptLabels(): Promise<PromptLabel[]> {
+    return this.get<PromptLabel[]>('/prompt-labels');
+  }
+  setPromptLabel(hash: string, label: string): Promise<PromptLabel> {
+    return this.sendJson<PromptLabel>('PUT', `/prompt-labels/${hash}`, { label });
   }
 }
 
