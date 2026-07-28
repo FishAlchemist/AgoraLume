@@ -50,7 +50,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::brain::{
-    AgentBrain, AgentPrompt, BrainError, Decision, Outcome, Respond, Summary, SummaryRequest,
+    AgentBrain, AgentPrompt, BrainError, Decision, Outcome, Respond, SuggestionRequest, Suggestions,
+    Summary, SummaryRequest,
 };
 use crate::agent::ratelimit::RateLimiter;
 use crate::models::TokenUsage;
@@ -395,6 +396,40 @@ Write compact plain notes (short bullet points or a few short paragraphs), in \
 the conversation's own language — not a message addressed to anyone. Output only \
 the summary.";
 
+/// The suggestion generator's structured output: the opener lines the model
+/// proposes. A plain list schema — no tools — so it stays a single request.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct SuggestArgs {
+    /// A few short, first-person messages the user could send next.
+    suggestions: Vec<String>,
+}
+
+/// How the model is told to produce conversation-starter suggestions. It writes
+/// openers *as the user*, short and time-appropriate, in the user's language — so
+/// each one can be sent verbatim. The data (roster, summary, recent lines, time)
+/// arrives in the tagged input; this preamble is the standing instruction.
+const SUGGEST_GUIDANCE: &str = "\
+You help a user who isn't sure what to say next in a group text chat. You are \
+given who is in the room in <group_members> (the human is marked \"(the user)\"), \
+an optional <summary> of earlier talk, the recent <conversation>, the user's \
+language in <language>, and the current <time> with a coarse part of day. \
+Propose a few short messages THE USER could send next to start or revive the \
+conversation. Rules: write in the first person AS the user (not as any AI \
+member); keep each to one short, natural sentence that can be sent verbatim; fit \
+the part of day (never ask about the evening in the morning, or vice versa); and \
+prefer variety — a question, a fresh topic, a follow-up on what was just said. \
+Write them in the user's language when <language> is given, otherwise match the \
+conversation's language. Output only the response schema.";
+
+/// Output-token ceiling for one suggestion pass — a short list, so far under a
+/// reply's cap. Kept local (not a config knob) since the payload is tiny and
+/// fixed in shape.
+const SUGGEST_MAX_TOKENS: u64 = 300;
+
+/// How many suggestions to keep at most, however many the model returns — enough
+/// for variety without crowding the composer.
+const SUGGEST_MAX_ITEMS: usize = 6;
+
 /// An upper bound on any single retry backoff, so a misconfigured base or a
 /// large retry count can't park an agent (and its turn) for minutes.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -633,6 +668,33 @@ where
     Ok((response, remembered))
 }
 
+/// Runs one structured-output completion for a suggestion pass: the [`SuggestArgs`]
+/// schema and *no tools*, so — like the summary path but with a schema —
+/// `OutputMode::Auto` stays a single native request. Generic over the provider so
+/// the OpenAI and Gemini arms share one body. Returns rig's raw response for the
+/// caller to parse and account for.
+async fn prompt_suggestions<C>(
+    client: &C,
+    model: &str,
+    preamble: &str,
+    max_tokens: u64,
+    text: String,
+) -> Result<PromptResponse, PromptError>
+where
+    C: CompletionClient,
+    C::CompletionModel: 'static,
+{
+    client
+        .agent(model)
+        .preamble(preamble)
+        .max_tokens(max_tokens)
+        .output_schema::<SuggestArgs>()
+        .build()
+        .prompt(text)
+        .extended_details()
+        .await
+}
+
 /// Whether a base URL points at Gemini's OpenAI-compatibility endpoint
 /// (`https://generativelanguage.googleapis.com/…/openai/`). Such a URL is the
 /// signal to drive rig's *native* Gemini provider instead: the OpenAI wire format
@@ -717,6 +779,21 @@ impl LlmBrain {
                 prompt_completion(c, &self.model, preamble, max_tokens, structured, recall, text)
                     .await
             }
+        }
+    }
+
+    /// Dispatches one suggestion completion to whichever provider backs this
+    /// brain, mirroring [`Self::prompt_once`] but for the tool-free
+    /// [`prompt_suggestions`] path so the provider choice stays named in one place.
+    async fn suggest_once(
+        &self,
+        preamble: &str,
+        max_tokens: u64,
+        text: String,
+    ) -> Result<PromptResponse, PromptError> {
+        match &self.client {
+            Provider::OpenAi(c) => prompt_suggestions(c, &self.model, preamble, max_tokens, text).await,
+            Provider::Gemini(c) => prompt_suggestions(c, &self.model, preamble, max_tokens, text).await,
         }
     }
 
@@ -924,6 +1001,86 @@ impl AgentBrain for LlmBrain {
             Err(e) => {
                 let (status, reason) = classify_failure(&e);
                 tracing::warn!(error = %e, ?status, "context compression failed");
+                Err(BrainError { status, reason })
+            }
+        }
+    }
+
+    async fn suggest(&self, request: &SuggestionRequest) -> Result<Suggestions, BrainError> {
+        use std::fmt::Write as _;
+
+        // The context, in the XML-tagged framing the guidance names, so the model
+        // can tell the roster, the summary, and the live tail apart. Only the
+        // sections that carry something are emitted.
+        let mut input = String::new();
+        if !request.members.is_empty() {
+            input.push_str("<group_members>\n");
+            for member in &request.members {
+                let marker = if member.is_user { " (the user)" } else { "" };
+                match member.blurb.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                    Some(blurb) => {
+                        let _ = writeln!(input, "- {}{marker}: {blurb}", member.name);
+                    }
+                    None => {
+                        let _ = writeln!(input, "- {}{marker}", member.name);
+                    }
+                }
+            }
+            input.push_str("</group_members>\n\n");
+        }
+        if let Some(summary) = request.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let _ = write!(input, "<summary>\n{summary}\n</summary>\n\n");
+        }
+        if !request.recent.is_empty() {
+            input.push_str("<conversation>\n");
+            for line in &request.recent {
+                let _ = writeln!(input, "{line}");
+            }
+            input.push_str("</conversation>\n\n");
+        }
+        if let Some(language) = request.language.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+            let _ = write!(input, "<language>{language}</language>\n\n");
+        }
+        let _ = write!(input, "<time>\n{} ({})\n</time>\n\n", request.now, request.time_of_day);
+        let _ = write!(input, "Suggest at least {} messages.", request.min_count.max(1));
+
+        // Throttled like a decision so the suggestion pass counts against the same
+        // per-minute quota. Best-effort: a failure surfaces to the caller, which
+        // simply keeps whatever was already cached rather than retrying and
+        // spending more quota on a non-critical payload.
+        if let Some(limiter) = &self.limiter {
+            limiter.acquire().await;
+        }
+        match self.suggest_once(SUGGEST_GUIDANCE, SUGGEST_MAX_TOKENS, input).await {
+            Ok(response) => {
+                let usage = Some(to_token_usage(response.usage));
+                // The model returns the schema as a JSON string; parse it, then
+                // drop blank or runaway-repetitive lines and cap the count.
+                let parsed = serde_json::from_str::<SuggestArgs>(response.output.trim())
+                    .map_err(|_| BrainError {
+                        status: None,
+                        reason: "model returned an unparseable suggestion list".to_string(),
+                    })?;
+                let mut prompts: Vec<String> = Vec::new();
+                for line in parsed.suggestions {
+                    let line = line.trim();
+                    if line.is_empty() || looks_repetitive(line) {
+                        continue;
+                    }
+                    // De-duplicate so a model that repeats itself doesn't fill the
+                    // list with the same opener.
+                    if !prompts.iter().any(|existing| existing == line) {
+                        prompts.push(line.to_string());
+                    }
+                    if prompts.len() >= SUGGEST_MAX_ITEMS {
+                        break;
+                    }
+                }
+                Ok(Suggestions { prompts, usage })
+            }
+            Err(e) => {
+                let (status, reason) = classify_failure(&e);
+                tracing::warn!(error = %e, ?status, "suggestion generation failed");
                 Err(BrainError { status, reason })
             }
         }

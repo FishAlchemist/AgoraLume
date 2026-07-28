@@ -80,6 +80,27 @@ export interface paths {
      */
     get: operations["stream"];
   };
+  "/groups/{id}/suggestions": {
+    /**
+     * Cached conversation-starter suggestions for a group. Returned immediately from
+     * the server-side cache; if they're stale (the conversation moved on, or the
+     * part of day changed) a fresh generation is kicked off in the background and
+     * arrives on the group's `suggestions` SSE frame. The frontend only fetches and
+     * displays — it never generates. Empty (`generatedAt == 0`) before the first
+     * generation completes.
+     */
+    get: operations["get_suggestions"];
+  };
+  "/groups/{id}/suggestions/regenerate": {
+    /**
+     * Forces a fresh suggestion generation for a group (the composer's "give me
+     * other ideas" action). Accepted and generated in the background; the result
+     * arrives on the group's `suggestions` SSE frame. Rate-limited server-side: a
+     * call inside the cooldown window, or while a generation is already running, is
+     * quietly ignored — so the button can't be used to hammer the model.
+     */
+    post: operations["regenerate_suggestions"];
+  };
   "/health": {
     /** Liveness probe — cheap "is the server up" check. */
     get: operations["health"];
@@ -276,6 +297,38 @@ export interface components {
       name: string;
       personaIds: string[];
       selfPersonaId: string;
+    };
+    /**
+     * @description Conversation-starter suggestions for a group: a few short first-person
+     * messages the user could send next when they aren't sure what to say. Generated
+     * server-side and cached (and persisted) so they aren't recomputed on every
+     * open — the frontend only fetches and displays them. Time-aware via
+     * [`GroupSuggestions::time_of_day`] so an evening opener isn't offered in the
+     * morning. `GET /groups/{id}/suggestions`.
+     */
+    GroupSuggestions: {
+      /**
+       * Format: int64
+       * @description When these were generated (epoch ms); `0` before the first generation.
+       */
+      generatedAt: number;
+      /**
+       * @description The suggested opener lines, in the user's language. Empty until the first
+       * generation for this group completes.
+       */
+      prompts: string[];
+      /**
+       * @description Id of the last conversation message present when these were generated — the
+       * conversation-staleness key. Server bookkeeping the UI can ignore; absent
+       * when the group had no messages yet.
+       */
+      throughId?: string | null;
+      /**
+       * @description The coarse time-of-day bucket the suggestions were tuned for
+       * (`morning` / `afternoon` / `evening` / `night`) — lets the server tell when
+       * they've gone stale against the clock, and the UI hint the framing.
+       */
+      timeOfDay?: string;
     };
     /**
      * @description One persona-scoped memory: a fact a character chose to remember. Tagged with
@@ -796,8 +849,61 @@ export interface operations {
       };
     };
     responses: {
-      /** @description text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace */
+      /** @description text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions */
       200: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * Cached conversation-starter suggestions for a group. Returned immediately from
+   * the server-side cache; if they're stale (the conversation moved on, or the
+   * part of day changed) a fresh generation is kicked off in the background and
+   * arrives on the group's `suggestions` SSE frame. The frontend only fetches and
+   * displays — it never generates. Empty (`generatedAt == 0`) before the first
+   * generation completes.
+   */
+  get_suggestions: {
+    parameters: {
+      path: {
+        /** @description Group id */
+        id: string;
+      };
+    };
+    responses: {
+      /** @description The cached suggestions (a background refresh may follow on the stream) */
+      200: {
+        content: {
+          "application/json": components["schemas"]["GroupSuggestions"];
+        };
+      };
+      /** @description Unknown group */
+      404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * Forces a fresh suggestion generation for a group (the composer's "give me
+   * other ideas" action). Accepted and generated in the background; the result
+   * arrives on the group's `suggestions` SSE frame. Rate-limited server-side: a
+   * call inside the cooldown window, or while a generation is already running, is
+   * quietly ignored — so the button can't be used to hammer the model.
+   */
+  regenerate_suggestions: {
+    parameters: {
+      path: {
+        /** @description Group id */
+        id: string;
+      };
+    };
+    responses: {
+      /** @description Regeneration accepted (or coalesced with a recent one) */
+      202: {
+        content: never;
+      };
+      /** @description Unknown group */
+      404: {
         content: never;
       };
     };

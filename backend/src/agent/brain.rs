@@ -187,6 +187,42 @@ pub struct Summary {
     pub usage: Option<TokenUsage>,
 }
 
+/// A request to generate conversation-starter suggestions for a group — the
+/// short first-person messages the user could send next when they're unsure what
+/// to say. Assembled by the orchestrator from the same context a decision sees
+/// (roster, running summary, recent tail) plus the current time, so the openers
+/// fit both the conversation and the moment.
+#[derive(Clone, Debug)]
+pub struct SuggestionRequest {
+    /// Who is in the room, the human flagged, so an opener can address people.
+    pub members: Vec<MemberInfo>,
+    /// The running summary of older history, if any, for continuity.
+    pub summary: Option<String>,
+    /// The recent transcript tail, each line already rendered `"Name: text"`,
+    /// oldest first — what the openers should follow on from.
+    pub recent: Vec<String>,
+    /// The current local time as RFC 3339 with offset, so suggestions fit "now".
+    pub now: String,
+    /// The coarse part of day (`morning` / `afternoon` / `evening` / `night`), so
+    /// the model doesn't offer an evening opener in the morning.
+    pub time_of_day: String,
+    /// The user's own language, in their words (e.g. "繁體中文"), so the openers
+    /// are written in a language they can actually send. `None` when unset.
+    pub language: Option<String>,
+    /// Produce at least this many suggestions.
+    pub min_count: usize,
+}
+
+/// The result of a suggestion pass: the opener lines plus the usage the call
+/// cost, so the orchestrator can account for it exactly as it does a decision.
+/// Empty `prompts` means "keep whatever was already cached" (a brain with no
+/// model, or a pass that produced nothing usable).
+#[derive(Clone, Debug, Default)]
+pub struct Suggestions {
+    pub prompts: Vec<String>,
+    pub usage: Option<TokenUsage>,
+}
+
 /// The single inference seam. A real implementation sends the prompt to an LLM
 /// and parses its `respond` tool call; the mock applies deterministic rules.
 /// Implementations must be cancel-safe: dropping the returned future aborts the
@@ -204,5 +240,15 @@ pub trait AgentBrain: Send + Sync {
     /// summarize with the model.
     async fn summarize(&self, request: &SummaryRequest) -> Result<Summary, BrainError> {
         Ok(Summary { text: request.prior.clone().unwrap_or_default(), usage: None })
+    }
+
+    /// Produces conversation-starter suggestions for the group described by
+    /// `request`. The default returns nothing (empty `prompts`), so a brain with
+    /// no real model — the test brains — offers no suggestions; the bundled
+    /// [`crate::agent::mock::RuleBrain`] overrides it with canned time-aware
+    /// openers, and [`crate::agent::llm::LlmBrain`] with a model call. An empty
+    /// result tells the orchestrator to keep whatever was already cached.
+    async fn suggest(&self, _request: &SuggestionRequest) -> Result<Suggestions, BrainError> {
+        Ok(Suggestions::default())
     }
 }

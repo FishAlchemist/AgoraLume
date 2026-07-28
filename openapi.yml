@@ -350,7 +350,58 @@ paths:
           type: string
       responses:
         '200':
-          description: 'text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace'
+          description: 'text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions'
+  /groups/{id}/suggestions:
+    get:
+      tags:
+      - chat
+      summary: |-
+        Cached conversation-starter suggestions for a group. Returned immediately from
+        the server-side cache; if they're stale (the conversation moved on, or the
+        part of day changed) a fresh generation is kicked off in the background and
+        arrives on the group's `suggestions` SSE frame. The frontend only fetches and
+        displays — it never generates. Empty (`generatedAt == 0`) before the first
+        generation completes.
+      operationId: get_suggestions
+      parameters:
+      - name: id
+        in: path
+        description: Group id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The cached suggestions (a background refresh may follow on the stream)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupSuggestions'
+        '404':
+          description: Unknown group
+  /groups/{id}/suggestions/regenerate:
+    post:
+      tags:
+      - chat
+      summary: |-
+        Forces a fresh suggestion generation for a group (the composer's "give me
+        other ideas" action). Accepted and generated in the background; the result
+        arrives on the group's `suggestions` SSE frame. Rate-limited server-side: a
+        call inside the cooldown window, or while a generation is already running, is
+        quietly ignored — so the button can't be used to hammer the model.
+      operationId: regenerate_suggestions
+      parameters:
+      - name: id
+        in: path
+        description: Group id
+        required: true
+        schema:
+          type: string
+      responses:
+        '202':
+          description: Regeneration accepted (or coalesced with a recent one)
+        '404':
+          description: Unknown group
   /health:
     get:
       tags:
@@ -923,6 +974,44 @@ components:
             type: string
         selfPersonaId:
           type: string
+    GroupSuggestions:
+      type: object
+      description: |-
+        Conversation-starter suggestions for a group: a few short first-person
+        messages the user could send next when they aren't sure what to say. Generated
+        server-side and cached (and persisted) so they aren't recomputed on every
+        open — the frontend only fetches and displays them. Time-aware via
+        [`GroupSuggestions::time_of_day`] so an evening opener isn't offered in the
+        morning. `GET /groups/{id}/suggestions`.
+      required:
+      - prompts
+      - generatedAt
+      properties:
+        generatedAt:
+          type: integer
+          format: int64
+          description: When these were generated (epoch ms); `0` before the first generation.
+        prompts:
+          type: array
+          items:
+            type: string
+          description: |-
+            The suggested opener lines, in the user's language. Empty until the first
+            generation for this group completes.
+        throughId:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Id of the last conversation message present when these were generated — the
+            conversation-staleness key. Server bookkeeping the UI can ignore; absent
+            when the group had no messages yet.
+        timeOfDay:
+          type: string
+          description: |-
+            The coarse time-of-day bucket the suggestions were tuned for
+            (`morning` / `afternoon` / `evening` / `night`) — lets the server tell when
+            they've gone stale against the clock, and the UI hint the framing.
     Memory:
       type: object
       description: |-

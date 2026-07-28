@@ -13,15 +13,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Timelike as _;
 use tokio::sync::mpsc;
 
 use crate::agent::brain::{
     Action, AgentBrain, AgentPersona, AgentPrompt, BrainError, Decision, MemberInfo, Outcome,
-    Respond, SummaryRequest,
+    Respond, SuggestionRequest, SummaryRequest,
 };
 use crate::agent::event::{Event, Salience, appraise};
 use crate::agent::mock::RuleBrain;
-use crate::models::{AgentTrace, Message, now_ms};
+use crate::models::{AgentTrace, GroupSuggestions, Message, now_ms};
 use crate::state::{AppState, GroupSummary};
 use crate::workspace::RosterMember;
 
@@ -592,6 +593,130 @@ fn local_now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
+/// How many suggestions the generator aims for — the user's "at least 3".
+pub const SUGGEST_MIN: usize = 3;
+
+/// How many of the most recent transcript lines to hand the suggestion generator
+/// as context — enough to follow the thread without resending the whole history.
+const SUGGEST_CONTEXT_LINES: usize = 12;
+
+/// Generates conversation-starter suggestions for a group and stores them.
+/// Spawned off the request path by [`AppState::request_suggestions`] so the HTTP
+/// GET never blocks on the model; the result is persisted and pushed on the
+/// group's `suggestions` SSE frame. On failure — or an empty result — the
+/// previous suggestions are kept and only the in-flight gate is cleared.
+/// Assembles the same context a decision sees, plus the current local time and
+/// part of day so the openers fit the moment.
+pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
+    let runtime = &state.runtime;
+
+    // The room's members (name + blurb + who's the user), for addressing.
+    let members: Vec<MemberInfo> = state
+        .workspace()
+        .group_roster(&group_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| MemberInfo { name: m.name, blurb: m.blurb, is_user: m.is_self })
+        .collect();
+    // The user's own language, so openers are written in something they can send.
+    let language = {
+        let ws = state.workspace();
+        let lang = ws.settings.native_language.trim().to_string();
+        (!lang.is_empty()).then_some(lang)
+    };
+
+    // The running summary + recent tail, exactly as a turn would build them.
+    let summary = state.summary(&group_id);
+    let transcript = build_transcript(&state, &group_id);
+    let tail = tail_after(&transcript, summary.through_id.as_deref());
+    let recent: Vec<String> = tail
+        .iter()
+        .rev()
+        .take(SUGGEST_CONTEXT_LINES)
+        .rev()
+        .map(|line| format!("{}: {}", line.name, line.text))
+        .collect();
+    // The staleness key: the last conversation line these suggestions follow.
+    let through_id = transcript.last().map(|line| line.id.clone());
+
+    let now = local_now();
+    let time_of_day = current_time_of_day();
+
+    let request = SuggestionRequest {
+        members,
+        summary: (!summary.text.trim().is_empty()).then(|| summary.text.clone()),
+        recent,
+        now,
+        time_of_day: time_of_day.to_string(),
+        language,
+        min_count: SUGGEST_MIN,
+    };
+
+    match runtime.brain.suggest(&request).await {
+        Ok(result) => {
+            if result.prompts.is_empty() {
+                // Nothing usable — keep whatever was cached, just release the gate.
+                state.finish_suggestions(&group_id, None);
+                return;
+            }
+            // A suggestion pass that actually called a model is a real request:
+            // record it so its tokens land in the usage/cost panel, under the same
+            // synthetic "system" persona a compression uses. The mock reports no
+            // usage, so it is never counted as an inference.
+            if let Some(usage) = result.usage {
+                state.record_trace(
+                    &group_id,
+                    AgentTrace {
+                        ts: now_ms(),
+                        group_id: group_id.clone(),
+                        persona_id: "system".to_string(),
+                        persona_name: "Chat suggestions".to_string(),
+                        system: String::new(),
+                        conversation: String::new(),
+                        action: "suggest".to_string(),
+                        message: Some(result.prompts.join("\n")),
+                        mood: None,
+                        usage: Some(usage),
+                    },
+                );
+            }
+            let suggestions = GroupSuggestions {
+                prompts: result.prompts,
+                generated_at: now_ms(),
+                time_of_day: time_of_day.to_string(),
+                through_id,
+            };
+            state.finish_suggestions(&group_id, Some(suggestions));
+        }
+        Err(error) => {
+            tracing::warn!(
+                group = %group_id,
+                status = ?error.status,
+                reason = %error.reason,
+                "suggestion generation failed; keeping the previous suggestions"
+            );
+            state.finish_suggestions(&group_id, None);
+        }
+    }
+}
+
+/// The current part of day, from the server's local clock — the bucket the
+/// suggestion generator tunes openers to, and the staleness key that forces a
+/// regeneration when the day moves on (e.g. morning → evening).
+pub fn current_time_of_day() -> &'static str {
+    time_of_day(chrono::Local::now().hour())
+}
+
+/// Buckets a 24-hour clock hour into a coarse part of day.
+fn time_of_day(hour: u32) -> &'static str {
+    match hour {
+        5..=10 => "morning",
+        11..=16 => "afternoon",
+        17..=21 => "evening",
+        _ => "night",
+    }
+}
+
 /// Formats an epoch-millisecond send time in the same local RFC 3339 form as
 /// [`local_now`], so a message's `time` attribute compares directly against the
 /// `<time>` "now". Falls back to the raw millis if the value is out of range.
@@ -797,8 +922,11 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    use crate::agent::brain::{AgentPrompt, Decision, Summary, SummaryRequest};
+    use crate::agent::brain::{
+        AgentPrompt, Decision, SuggestionRequest, Suggestions, Summary, SummaryRequest,
+    };
     use crate::agent::mock::RuleBrain;
+    use crate::models::TokenUsage;
     use crate::state::StreamEvent;
 
     /// Deterministic, delay-free config so tests are reproducible and fast.
@@ -999,7 +1127,7 @@ mod tests {
             match event {
                 StreamEvent::Message(_) => messages += 1,
                 StreamEvent::Read(_) => reads += 1,
-                StreamEvent::Activity(_) | StreamEvent::Debug(_) => {}
+                StreamEvent::Activity(_) | StreamEvent::Debug(_) | StreamEvent::Suggestions(_) => {}
             }
         }
         assert_eq!(messages, 0);
@@ -1334,5 +1462,137 @@ mod tests {
         maybe_compress(&state, "lab").await;
 
         assert!(state.summary("lab").through_id.is_none());
+    }
+
+    /// A brain that returns scripted suggestions and counts how often it is asked,
+    /// to exercise the generation + gating paths without a model.
+    struct SuggestBrain {
+        calls: Arc<AtomicUsize>,
+        prompts: Vec<String>,
+        usage: Option<TokenUsage>,
+    }
+    #[async_trait]
+    impl AgentBrain for SuggestBrain {
+        async fn decide(&self, _prompt: &AgentPrompt) -> Decision {
+            Respond::read().into()
+        }
+        async fn suggest(&self, _request: &SuggestionRequest) -> Result<Suggestions, BrainError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Suggestions { prompts: self.prompts.clone(), usage: self.usage })
+        }
+    }
+
+    /// Yields until the group's suggestions cache is populated (the spawned
+    /// generation ran), or panics if it never does.
+    async fn wait_for_suggestions(state: &Arc<AppState>, group: &str) {
+        for _ in 0..1000 {
+            if state.suggestions(group).generated_at != 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("suggestions were never generated");
+    }
+
+    #[test]
+    fn time_of_day_buckets_the_clock() {
+        assert_eq!(time_of_day(5), "morning");
+        assert_eq!(time_of_day(10), "morning");
+        assert_eq!(time_of_day(11), "afternoon");
+        assert_eq!(time_of_day(16), "afternoon");
+        assert_eq!(time_of_day(17), "evening");
+        assert_eq!(time_of_day(21), "evening");
+        // The night bucket wraps midnight and covers any out-of-range hour.
+        assert_eq!(time_of_day(22), "night");
+        assert_eq!(time_of_day(4), "night");
+        assert_eq!(time_of_day(0), "night");
+    }
+
+    #[tokio::test]
+    async fn mock_suggests_time_aware_openers() {
+        let brain = RuleBrain::seeded(1);
+        let request = |bucket: &str| SuggestionRequest {
+            members: Vec::new(),
+            summary: None,
+            recent: Vec::new(),
+            now: String::new(),
+            time_of_day: bucket.to_string(),
+            language: None,
+            min_count: 3,
+        };
+        // Every bucket yields at least three openers, and they differ by time.
+        let morning = brain.suggest(&request("morning")).await.unwrap().prompts;
+        let evening = brain.suggest(&request("evening")).await.unwrap().prompts;
+        assert!(morning.len() >= 3);
+        assert!(evening.len() >= 3);
+        assert_ne!(morning, evening);
+        // An unknown bucket falls back to the night set rather than empty.
+        assert!(!brain.suggest(&request("weird")).await.unwrap().prompts.is_empty());
+        // The mock makes no LLM call, so it reports no usage.
+        assert!(brain.suggest(&request("morning")).await.unwrap().usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_stores_streams_and_records_usage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let brain = Arc::new(SuggestBrain {
+            calls: calls.clone(),
+            prompts: vec!["What's new?".into(), "How's everyone?".into(), "Any plans?".into()],
+            usage: Some(TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cached_prompt_tokens: 0 }),
+        });
+        let state = app(brain, cfg());
+        state.emit("lab", Message::conversation("lab", "aria", "hi there", None));
+        let mut stream = state.channel("lab").subscribe();
+
+        generate_suggestions(state.clone(), "lab".to_string()).await;
+
+        // The cache now holds the openers, stamped with a time and the last line.
+        let cached = state.suggestions("lab");
+        assert_eq!(cached.prompts.len(), 3);
+        assert_ne!(cached.generated_at, 0);
+        assert!(!cached.time_of_day.is_empty());
+        assert!(cached.through_id.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A `suggestions` frame was pushed for open composers.
+        let mut streamed = false;
+        while let Ok(event) = stream.try_recv() {
+            if let StreamEvent::Suggestions(s) = event {
+                assert_eq!(s.prompts.len(), 3);
+                streamed = true;
+            }
+        }
+        assert!(streamed, "a suggestions frame should have been broadcast");
+
+        // The usage-bearing pass counted as one request (feeds the cost panel).
+        assert_eq!(state.debug_totals().requests, 1);
+    }
+
+    #[tokio::test]
+    async fn request_suggestions_skips_when_fresh_and_rate_limits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let brain = Arc::new(SuggestBrain {
+            calls: calls.clone(),
+            prompts: vec!["a".into(), "b".into(), "c".into()],
+            usage: None,
+        });
+        let state = app(brain, cfg());
+        state.emit("lab", Message::conversation("lab", "aria", "hello", None));
+
+        // First request (stale: nothing cached) generates once.
+        state.request_suggestions("lab", false);
+        wait_for_suggestions(&state, "lab").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The conversation hasn't moved and the bucket is the same, so a
+        // non-forced request is a no-op — no second generation.
+        state.request_suggestions("lab", false);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Even a forced regenerate is rate-limited inside the cooldown window.
+        state.request_suggestions("lab", true);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

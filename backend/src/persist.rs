@@ -3,9 +3,10 @@
 //! Layout under the data directory (`AGORALUME_DATA_DIR`):
 //!
 //! ```text
-//! workspace.json             the whole editable workspace (small; loaded at startup)
-//! messages/<group_id>.json   one group's chat log (loaded lazily, saved on change)
-//! summaries/<group_id>.json  one group's compressed older history (loaded with its log)
+//! workspace.json               the whole editable workspace (small; loaded at startup)
+//! messages/<group_id>.json     one group's chat log (loaded lazily, saved on change)
+//! summaries/<group_id>.json    one group's compressed older history (loaded with its log)
+//! suggestions/<group_id>.json  one group's cached conversation starters (loaded with its log)
 //! ```
 //!
 //! Splitting the message logs off the workspace means a running server only
@@ -19,7 +20,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::models::Message;
+use crate::models::{GroupSuggestions, Message};
 use crate::state::GroupSummary;
 use crate::workspace::WorkspaceSnapshot;
 
@@ -44,6 +45,10 @@ impl Persistence {
 
     fn summary_path(&self, group_id: &str) -> PathBuf {
         self.dir.join("summaries").join(format!("{}.json", sanitize(group_id)))
+    }
+
+    fn suggestions_path(&self, group_id: &str) -> PathBuf {
+        self.dir.join("suggestions").join(format!("{}.json", sanitize(group_id)))
     }
 
     /// Loads the persisted workspace, or `None` when there is no saved file yet
@@ -125,6 +130,33 @@ impl Persistence {
     pub fn save_summary(&self, group_id: &str, summary: &GroupSummary) {
         if let Err(e) = write_atomic(&self.summary_path(group_id), summary) {
             tracing::warn!(group = %group_id, error = %e, "failed to persist a context summary");
+        }
+    }
+
+    /// Loads one group's cached suggestions, or `None` when none have been
+    /// generated yet (or the file is unreadable/corrupt) — in which case the group
+    /// starts with no suggestions and regenerates on first request.
+    pub fn load_suggestions(&self, group_id: &str) -> Option<GroupSuggestions> {
+        let path = self.suggestions_path(group_id);
+        let bytes = std::fs::read(&path).ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(suggestions) => Some(suggestions),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ignoring corrupt cached suggestions; regenerating on next request"
+                );
+                None
+            }
+        }
+    }
+
+    /// Writes one group's cached suggestions out. Called after each successful
+    /// generation; failures are logged, not fatal.
+    pub fn save_suggestions(&self, group_id: &str, suggestions: &GroupSuggestions) {
+        if let Err(e) = write_atomic(&self.suggestions_path(group_id), suggestions) {
+            tracing::warn!(group = %group_id, error = %e, "failed to persist cached suggestions");
         }
     }
 }

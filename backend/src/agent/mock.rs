@@ -9,7 +9,9 @@
 
 use async_trait::async_trait;
 
-use crate::agent::brain::{AgentBrain, AgentPrompt, Decision, Respond};
+use crate::agent::brain::{
+    AgentBrain, AgentPrompt, BrainError, Decision, Respond, SuggestionRequest, Suggestions,
+};
 use crate::models::now_ms;
 
 const MOODS: [&str; 4] = ["🙂 pleased", "🤔 thinking", "✨ inspired", "😆 amused"];
@@ -63,6 +65,46 @@ impl AgentBrain for RuleBrain {
             _ => Respond::read(),
         }
         .into()
+    }
+
+    /// Canned, time-aware openers so the suggestion UI is usable without a model.
+    /// The list is picked purely from the part of day (the mock makes no LLM
+    /// call, so it reports no usage and ignores language/roster). A real model
+    /// tailors these to the actual conversation; this just keeps the feature alive
+    /// in mock mode.
+    async fn suggest(&self, request: &SuggestionRequest) -> Result<Suggestions, BrainError> {
+        let prompts = canned_openers(&request.time_of_day)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        Ok(Suggestions { prompts, usage: None })
+    }
+}
+
+/// A small fixed set of conversation starters for a part of day. Kept generic and
+/// friendly; the `night` set doubles as the fallback for any unknown bucket.
+fn canned_openers(time_of_day: &str) -> &'static [&'static str] {
+    match time_of_day {
+        "morning" => &[
+            "Good morning! What's everyone up to today?",
+            "Morning — any plans for the day?",
+            "Hey, how did everyone sleep?",
+        ],
+        "afternoon" => &[
+            "How's your afternoon going?",
+            "What's everyone working on right now?",
+            "Anyone up for a quick chat?",
+        ],
+        "evening" => &[
+            "Evening! How was your day?",
+            "What's everyone doing tonight?",
+            "Any highlights from today?",
+        ],
+        _ => &[
+            "Still up? What's on your mind?",
+            "Quiet night — what are you thinking about?",
+            "Anyone else awake right now?",
+        ],
     }
 }
 

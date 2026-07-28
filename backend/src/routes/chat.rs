@@ -16,7 +16,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::agent::event::Event as AgentEvent;
-use crate::models::{AgentTrace, DebugUsage, Message, ServerMeta};
+use crate::models::{AgentTrace, DebugUsage, GroupSuggestions, Message, ServerMeta};
 use crate::state::{AppState, StreamEvent};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
@@ -27,6 +27,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(list_messages, send_message))
         .routes(routes!(post_event))
         .routes(routes!(retry_turn))
+        .routes(routes!(get_suggestions, regenerate_suggestions))
         .routes(routes!(debug_traces))
         .routes(routes!(stream))
 }
@@ -205,6 +206,50 @@ async fn retry_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
     StatusCode::ACCEPTED
 }
 
+/// Cached conversation-starter suggestions for a group. Returned immediately from
+/// the server-side cache; if they're stale (the conversation moved on, or the
+/// part of day changed) a fresh generation is kicked off in the background and
+/// arrives on the group's `suggestions` SSE frame. The frontend only fetches and
+/// displays — it never generates. Empty (`generatedAt == 0`) before the first
+/// generation completes.
+#[utoipa::path(get, path = "/groups/{id}/suggestions", tag = "chat",
+    params(("id" = String, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "The cached suggestions (a background refresh may follow on the stream)", body = GroupSuggestions),
+        (status = 404, description = "Unknown group")))]
+async fn get_suggestions(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<GroupSuggestions>, StatusCode> {
+    if state.workspace().turn_members(&id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // Return the cache now; regenerate in the background only if stale.
+    state.request_suggestions(&id, false);
+    Ok(Json(state.suggestions(&id)))
+}
+
+/// Forces a fresh suggestion generation for a group (the composer's "give me
+/// other ideas" action). Accepted and generated in the background; the result
+/// arrives on the group's `suggestions` SSE frame. Rate-limited server-side: a
+/// call inside the cooldown window, or while a generation is already running, is
+/// quietly ignored — so the button can't be used to hammer the model.
+#[utoipa::path(post, path = "/groups/{id}/suggestions/regenerate", tag = "chat",
+    params(("id" = String, Path, description = "Group id")),
+    responses(
+        (status = 202, description = "Regeneration accepted (or coalesced with a recent one)"),
+        (status = 404, description = "Unknown group")))]
+async fn regenerate_suggestions(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    if state.workspace().turn_members(&id).is_none() {
+        return StatusCode::NOT_FOUND;
+    }
+    state.request_suggestions(&id, true);
+    StatusCode::ACCEPTED
+}
+
 /// A turn-activity SSE frame: `true` while the group's agent loop runs a turn,
 /// `false` when it goes idle.
 #[derive(Serialize)]
@@ -218,7 +263,7 @@ struct ActivityFrame {
 #[utoipa::path(get, path = "/groups/{id}/stream", tag = "chat",
     params(("id" = String, Path, description = "Group id")),
     responses((status = 200,
-        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace")))]
+        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions")))]
 async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     // Subscribe before reading the activity flag: any change that races this
     // arrives on `live` afterwards, so the seed can only be stale, never lost.
@@ -252,6 +297,9 @@ fn to_sse_event(
             Event::default().event("activity").json_data(ActivityFrame { active }).ok()?
         }
         StreamEvent::Debug(trace) => Event::default().event("debug").json_data(trace).ok()?,
+        StreamEvent::Suggestions(suggestions) => {
+            Event::default().event("suggestions").json_data(suggestions).ok()?
+        }
     };
     Some(Ok(event))
 }

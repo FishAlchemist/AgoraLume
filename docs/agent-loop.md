@@ -161,6 +161,33 @@ Two rules follow from the cost model above:
 
 ---
 
+## Conversation suggestions
+
+A separate, small generation helps a user who doesn't know what to say: a few
+short first-person openers they can send verbatim. It is **not** part of a turn —
+no persona speaks them — so it lives beside the loop rather than in it (`suggest`
+on the `AgentBrain` seam; the mock returns canned time-aware lines, the LLM brain
+a single tool-free structured-output request).
+
+The cost discipline above shapes when it runs. Suggestions are **generated
+server-side, cached, and persisted** (`suggestions/<group>.json`, loaded with the
+group's log); the frontend only *fetches and displays* them. A `GET` returns the
+cache immediately and kicks a background regeneration **only when stale** — no
+cache yet, the conversation advanced since they were made, or the part of day
+changed (so a morning opener doesn't linger into the evening). The current
+**time** is injected into the prompt for exactly that reason, and its coarse
+bucket (`morning`/`afternoon`/`evening`/`night`) doubles as the clock-staleness
+key. The result is pushed on a `suggestions` SSE frame so an open composer
+updates live.
+
+Regeneration is also explicit — a "give me other ideas" action `POST`s — but both
+paths pass one gate: a per-group **cooldown plus single-flight guard**, so a
+client can't spam the (LLM-costing) generator, and two generations never overlap.
+This is the same principle as the pull tools: spend a request only when the cached
+answer can't serve, and never more than the work is worth.
+
+---
+
 ## Testing without an LLM
 
 The whole loop is orchestration _except_ the single inference in step 3, so the

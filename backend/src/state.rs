@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::event::Event;
-use crate::agent::turn::{AgentRuntime, coordinator_loop};
+use crate::agent::turn::{AgentRuntime, coordinator_loop, current_time_of_day, generate_suggestions};
 use crate::config::Pricing;
-use crate::models::{AgentTrace, Message, ReadReceipt};
+use crate::models::{AgentTrace, GroupSuggestions, Message, ReadReceipt};
 use crate::persist::Persistence;
 use crate::workspace::Workspace;
 
@@ -30,6 +30,13 @@ const CHANNEL_CAPACITY: usize = 256;
 /// How many recent agent traces to keep per group for the debug panel. Old
 /// traces fall off the front; the running usage totals are unaffected.
 const DEBUG_TRACE_CAP: usize = 50;
+
+/// Minimum gap between suggestion generations for one group. A GET that finds the
+/// suggestions stale, or an explicit regenerate, is dropped inside this window —
+/// the server-side rate limit that stops a client hammering the (LLM-costing)
+/// generator. Paired with a single-flight guard so overlapping requests never run
+/// two generations at once.
+const SUGGEST_COOLDOWN_MS: i64 = 6_000;
 
 /// A live event pushed to a group's SSE subscribers.
 #[derive(Clone, Debug)]
@@ -46,6 +53,19 @@ pub enum StreamEvent {
     /// token usage). Delivered as a named `debug` SSE event; drives the debug
     /// panel. Never affects the chat itself.
     Debug(AgentTrace),
+    /// Freshly generated conversation suggestions for the group. Delivered as a
+    /// named `suggestions` SSE event so an open composer updates its starter chips
+    /// the moment a background generation finishes.
+    Suggestions(GroupSuggestions),
+}
+
+/// Per-group generation gate for suggestions: enforces both the cooldown (via
+/// `last_started_ms`) and single-flight (via `in_flight`), so a burst of GETs or
+/// regenerate calls can't launch overlapping or too-frequent generations.
+#[derive(Default)]
+struct SuggestGate {
+    in_flight: bool,
+    last_started_ms: i64,
 }
 
 /// Cumulative LLM usage since startup, plus recent per-group traces — the data
@@ -89,6 +109,14 @@ pub struct AppState {
     /// Per-group compressed older history (the running summary + how far it
     /// reaches). Loaded from disk alongside a group's messages on first touch.
     summaries: Mutex<HashMap<String, GroupSummary>>,
+    /// Per-group cached conversation suggestions, generated server-side and
+    /// persisted so they survive a restart. Loaded alongside a group's messages
+    /// on first touch; regenerated only when stale (see [`AppState::request_suggestions`]).
+    suggestions: Mutex<HashMap<String, GroupSuggestions>>,
+    /// Per-group suggestion-generation gate (cooldown + single-flight). Purely
+    /// in-memory: a restart starts with a clean gate, which at worst allows one
+    /// early regeneration.
+    suggest_gates: Mutex<HashMap<String, SuggestGate>>,
     channels: Mutex<HashMap<String, broadcast::Sender<StreamEvent>>>,
     /// The swappable agent runtime (brain + memory + loop config).
     pub runtime: AgentRuntime,
@@ -143,6 +171,8 @@ impl AppState {
             workspace: Mutex::new(workspace),
             messages: Mutex::new(messages),
             summaries: Mutex::new(HashMap::new()),
+            suggestions: Mutex::new(HashMap::new()),
+            suggest_gates: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             runtime,
             coordinators: Mutex::new(HashMap::new()),
@@ -237,6 +267,11 @@ impl AppState {
         if let Some(summary) = persistence.load_summary(group_id) {
             self.summaries.lock().unwrap().entry(group_id.to_string()).or_insert(summary);
         }
+        // Cached suggestions likewise — so a restart shows the stored openers
+        // immediately instead of regenerating (and spending the LLM) on first open.
+        if let Some(suggestions) = persistence.load_suggestions(group_id) {
+            self.suggestions.lock().unwrap().entry(group_id.to_string()).or_insert(suggestions);
+        }
         loaded.insert(group_id.to_string());
     }
 
@@ -276,6 +311,84 @@ impl AppState {
         if let Some(persistence) = &self.persistence {
             persistence.save_summary(group_id, &summary);
         }
+    }
+
+    /// A group's cached conversation suggestions (empty — `generatedAt == 0` —
+    /// before the first generation). The GET handler returns this immediately;
+    /// generation, when needed, happens in the background via
+    /// [`Self::request_suggestions`].
+    pub fn suggestions(&self, group_id: &str) -> GroupSuggestions {
+        self.ensure_loaded(group_id);
+        self.suggestions.lock().unwrap().get(group_id).cloned().unwrap_or_default()
+    }
+
+    /// Kicks a background suggestion generation for a group when warranted, and
+    /// returns at once — the caller reads the current cache with [`Self::suggestions`].
+    ///
+    /// Generation is gated three ways: it never overlaps a run already in flight;
+    /// it is rate-limited to one start per [`SUGGEST_COOLDOWN_MS`] (so a client
+    /// can't hammer the LLM by spamming); and, unless `force` is set, it only runs
+    /// when the cache is *stale* — no suggestions yet, the conversation has moved
+    /// on since they were made, or the part of day has changed (so morning openers
+    /// don't linger into the evening). `force` (the explicit regenerate) still
+    /// respects the cooldown and single-flight guard.
+    pub fn request_suggestions(self: &Arc<Self>, group_id: &str, force: bool) {
+        // Read the inputs to the staleness check outside the gate lock (each takes
+        // its own mutex); the gate then guards the actual decision to launch.
+        let last_id = self.last_conversation_id(group_id);
+        let bucket = current_time_of_day();
+        let cached = self.suggestions(group_id);
+        let now = crate::models::now_ms();
+
+        let mut gates = self.suggest_gates.lock().unwrap();
+        let gate = gates.entry(group_id.to_string()).or_default();
+        if gate.in_flight || now - gate.last_started_ms < SUGGEST_COOLDOWN_MS {
+            return;
+        }
+        let stale = cached.generated_at == 0
+            || cached.through_id.as_deref() != last_id.as_deref()
+            || cached.time_of_day != bucket;
+        if !force && !stale {
+            return;
+        }
+        gate.in_flight = true;
+        gate.last_started_ms = now;
+        drop(gates);
+
+        tokio::spawn(generate_suggestions(self.clone(), group_id.to_string()));
+    }
+
+    /// Releases the generation gate for a group and, when `result` is `Some`,
+    /// stores the fresh suggestions, persists them, and pushes them on the group's
+    /// `suggestions` SSE frame. `None` (a failed or empty pass) keeps the previous
+    /// cache and only clears the in-flight flag. Called by [`generate_suggestions`].
+    pub fn finish_suggestions(&self, group_id: &str, result: Option<GroupSuggestions>) {
+        if let Some(gate) = self.suggest_gates.lock().unwrap().get_mut(group_id) {
+            gate.in_flight = false;
+        }
+        let Some(suggestions) = result else {
+            return;
+        };
+        self.ensure_loaded(group_id);
+        self.suggestions.lock().unwrap().insert(group_id.to_string(), suggestions.clone());
+        if let Some(persistence) = &self.persistence {
+            persistence.save_suggestions(group_id, &suggestions);
+        }
+        let _ = self.channel(group_id).send(StreamEvent::Suggestions(suggestions));
+    }
+
+    /// The id of the most recent conversation line in a group's log (skipping
+    /// moods and system notices), or `None` when the group has no chat yet. The
+    /// suggestion staleness key: when it changes, cached openers no longer follow
+    /// the latest message.
+    fn last_conversation_id(&self, group_id: &str) -> Option<String> {
+        self.ensure_loaded(group_id);
+        self.messages.lock().unwrap().get(group_id).and_then(|list| {
+            list.iter().rev().find_map(|m| match m {
+                Message::Conversation { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+        })
     }
 
     /// Hands an event to a group's coordinator, spawning the coordinator task on

@@ -172,6 +172,32 @@ pub struct Group {
     pub self_persona_id: String,
 }
 
+/// Conversation-starter suggestions for a group: a few short first-person
+/// messages the user could send next when they aren't sure what to say. Generated
+/// server-side and cached (and persisted) so they aren't recomputed on every
+/// open — the frontend only fetches and displays them. Time-aware via
+/// [`GroupSuggestions::time_of_day`] so an evening opener isn't offered in the
+/// morning. `GET /groups/{id}/suggestions`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSuggestions {
+    /// The suggested opener lines, in the user's language. Empty until the first
+    /// generation for this group completes.
+    pub prompts: Vec<String>,
+    /// When these were generated (epoch ms); `0` before the first generation.
+    pub generated_at: i64,
+    /// The coarse time-of-day bucket the suggestions were tuned for
+    /// (`morning` / `afternoon` / `evening` / `night`) — lets the server tell when
+    /// they've gone stale against the clock, and the UI hint the framing.
+    #[serde(default)]
+    pub time_of_day: String,
+    /// Id of the last conversation message present when these were generated — the
+    /// conversation-staleness key. Server bookkeeping the UI can ignore; absent
+    /// when the group had no messages yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_id: Option<String>,
+}
+
 /// What the running server offers — lets the client tell a mock build (no LLM,
 /// in-memory only) apart from a production one, independently of whether the
 /// server is reachable at all.

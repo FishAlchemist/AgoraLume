@@ -159,3 +159,22 @@ export interface SystemMessage extends BaseMessage {
 }
 
 export type Message = ConversationMessage | MoodMessage | SystemMessage;
+
+/**
+ * Conversation-starter suggestions for a group: a few short first-person
+ * messages the user could send next when unsure what to say. Generated and
+ * cached server-side (the frontend only fetches and displays), and tuned to the
+ * time of day so an evening opener isn't shown in the morning. Empty
+ * (`generatedAt === 0`) until the first generation for the group completes; a
+ * background refresh arrives on the stream's `suggestions` frame.
+ */
+export interface GroupSuggestions {
+  /** Suggested opener lines, in the user's language. Empty until first generated. */
+  prompts: string[];
+  /** When these were generated (epoch ms); 0 before the first generation. */
+  generatedAt: number;
+  /** Part of day the openers were tuned for: morning | afternoon | evening | night. */
+  timeOfDay: string;
+  /** Server bookkeeping (last message id at generation); the UI can ignore it. */
+  throughId?: string;
+}
