@@ -1,10 +1,11 @@
-import { Badge, Button, Group, Modal, Paper, Stack, Text, UnstyledButton } from '@mantine/core';
+import { Badge, Button, Group, Paper, Stack, Text, UnstyledButton } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import { IconAlertTriangle, IconChecks, IconRefresh } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { useUi } from '../store/ui';
 import type { Message, Persona, SystemMessage } from '../types';
 import { PersonaAvatar } from './PersonaAvatar';
+import { ReadReceiptsModal } from './ReadReceiptsModal';
 
 interface Props {
   message: Message;
@@ -191,17 +192,12 @@ interface ReadReceiptsProps {
 
 /**
  * Read-receipt badge for your own message. Clicking it opens a persistent modal
- * listing who read it — a modal rather than a hover card so it survives the chat
- * scrolling while you compare names against who's in the room.
+ * listing who read it. The same modal is reused by the pinned read-progress bar.
  */
 function ReadReceipts({ readBy, aiMembers, repliedBy }: ReadReceiptsProps) {
   const { t } = useTranslation();
   const [opened, { open, close }] = useDisclosure(false);
-  const readSet = new Set(readBy ?? []);
-  const repliedSet = new Set(repliedBy ?? []);
-  const replied = aiMembers.filter((p) => repliedSet.has(p.id));
-  const readSilent = aiMembers.filter((p) => readSet.has(p.id) && !repliedSet.has(p.id));
-  const unread = aiMembers.filter((p) => !readSet.has(p.id) && !repliedSet.has(p.id));
+  const readCount = new Set(readBy ?? []).size;
 
   return (
     <>
@@ -209,36 +205,17 @@ function ReadReceipts({ readBy, aiMembers, repliedBy }: ReadReceiptsProps) {
         <Group gap={4} pr={6} wrap="nowrap" c="dimmed">
           <IconChecks size={13} />
           <Text size="xs">
-            {t('chat.readCount', { count: readSet.size, total: aiMembers.length })}
+            {t('chat.readCount', { count: readCount, total: aiMembers.length })}
           </Text>
         </Group>
       </UnstyledButton>
-      <Modal opened={opened} onClose={close} title={t('chat.readReceiptsTitle')} size="sm" centered>
-        <Stack gap="sm">
-          <ReaderGroup label={t('chat.readReplied')} list={replied} />
-          <ReaderGroup label={t('chat.readSilent')} list={readSilent} />
-          <ReaderGroup label={t('chat.readUnread')} list={unread} dim />
-        </Stack>
-      </Modal>
+      <ReadReceiptsModal
+        opened={opened}
+        onClose={close}
+        readBy={readBy}
+        aiMembers={aiMembers}
+        repliedBy={repliedBy}
+      />
     </>
-  );
-}
-
-function ReaderGroup({ label, list, dim }: { label: string; list: Persona[]; dim?: boolean }) {
-  if (list.length === 0) return null;
-  return (
-    <Stack gap={4}>
-      <Text size="xs" fw={700} c="dimmed">
-        {label} · {list.length}
-      </Text>
-      {list.map((p) => (
-        <Group key={p.id} gap={6} wrap="nowrap" style={{ opacity: dim ? 0.5 : 1 }}>
-          <PersonaAvatar persona={p} size={20} />
-          <Text size="xs" truncate>
-            {p.name}
-          </Text>
-        </Group>
-      ))}
-    </Stack>
   );
 }

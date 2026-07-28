@@ -1,13 +1,16 @@
-import { Box, Center, Loader, ScrollArea, Stack, Text } from '@mantine/core';
+import { Box, Center, Loader, ScrollArea, Stack, Text, UnstyledButton } from '@mantine/core';
+import { IconArrowDown } from '@tabler/icons-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
+import { useChatReadTracking } from '../lib/useChatReadTracking';
 import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
 import { useWorkspace } from '../store/workspace';
-import type { Group, Message, Persona } from '../types';
+import type { ConversationMessage, Group, Message, Persona } from '../types';
 import { Composer } from './Composer';
 import { MessageItem } from './MessageItem';
+import { ReadProgressBar } from './ReadProgressBar';
 import { SuggestionChips } from './SuggestionChips';
 
 interface Props {
@@ -67,6 +70,30 @@ function seqOf(id: string): number {
  */
 function compareMessages(a: Message, b: Message): number {
   return a.ts - b.ts || seqOf(a.id) - seqOf(b.id);
+}
+
+/**
+ * For the anchor line (your latest message), the id of each AI member's first
+ * reply — walking forward until your next line closes the window. Members who
+ * only read silently get no entry, so the progress bar knows which avatars have
+ * somewhere to jump to.
+ */
+function firstRepliesAfter(
+  ordered: Message[],
+  anchorId: string,
+  aiIds: Set<string>,
+  selfId: string | undefined,
+): Map<string, string> {
+  const targets = new Map<string, string>();
+  const start = ordered.findIndex((m) => m.id === anchorId);
+  if (start === -1) return targets;
+  for (let i = start + 1; i < ordered.length; i++) {
+    const m = ordered[i];
+    if (m.kind !== 'conversation') continue;
+    if (m.personaId === selfId) break;
+    if (aiIds.has(m.personaId) && !targets.has(m.personaId)) targets.set(m.personaId, m.id);
+  }
+  return targets;
 }
 
 /** Local midnight for a timestamp, so two messages compare equal iff same calendar day. */
@@ -130,10 +157,28 @@ export function ChatView({ group, personas }: Props) {
   // The in-flight manual regenerate: when it started, the openers to restore if it
   // yields nothing, and its safety timer. null when no manual refresh is pending.
   const regen = useRef<{ startedAt: number; prev: string[]; timer: number } | null>(null);
-  const viewport = useRef<HTMLDivElement>(null);
   // Buffered read receipts, keyed by message id — decouples receipts from the
   // arrival of their target message so none are lost to the SSE/POST race.
   const reads = useRef<Map<string, Set<string>>>(new Map());
+
+  const ordered = useMemo(
+    () => (messages ? [...messages].sort(compareMessages) : messages),
+    [messages],
+  );
+
+  // Owns the scroll viewport and the user's unread state (divider, jump button,
+  // read watermark). Never auto-scrolls on incoming lines — catching up is always
+  // an explicit act — which is the "don't yank me down mid-read" behaviour.
+  const {
+    viewport,
+    atBottom,
+    firstUnreadId,
+    unreadCount,
+    handleScrollPosition,
+    followToBottom,
+    jumpToMessage,
+    resetForReload,
+  } = useChatReadTracking(group.id, ordered, selfId);
 
   // Ends an in-flight manual regenerate: cancels its safety timer and drops the
   // loader. Leaves whatever suggestions are currently shown in place.
@@ -191,6 +236,8 @@ export function ChatView({ group, personas }: Props) {
     setSuggestions([]);
     finishRegen();
     reads.current = new Map();
+    // Re-anchor the view when history reloads for a new data source.
+    resetForReload();
 
     void api.listMessages(group.id).then((initial) => {
       if (active) setMessages(applyReads(initial, reads.current));
@@ -245,11 +292,6 @@ export function ChatView({ group, personas }: Props) {
     wasBusy.current = busy;
   }, [busy, group.id]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: messages is the intended trigger — scroll to the bottom whenever the list changes.
-  useEffect(() => {
-    viewport.current?.scrollTo({ top: viewport.current.scrollHeight, behavior: 'smooth' });
-  }, [messages]);
-
   const handleSend = async (text: string) => {
     if (locked || busy) return;
     // Lock immediately; the backend's idle activity signal clears it once the
@@ -258,6 +300,9 @@ export function ChatView({ group, personas }: Props) {
     try {
       const message = await api.sendMessage(group.id, text, selfId);
       setMessages((prev) => applyReads(appendMessage(prev, message), reads.current));
+      // The user just acted, so follow their own line down and mark caught up —
+      // the replies it triggers then stream in beneath, without dragging the view.
+      followToBottom();
     } catch {
       setBusy(false);
     }
@@ -271,10 +316,15 @@ export function ChatView({ group, personas }: Props) {
     void api.retry(group.id).catch(() => {});
   };
 
-  const ordered = useMemo(
-    () => (messages ? [...messages].sort(compareMessages) : messages),
-    [messages],
-  );
+  // The newest line you sent — the one the pinned progress bar tracks.
+  const lastSelfMessage = useMemo(() => {
+    if (!ordered) return undefined;
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      const m = ordered[i];
+      if (m.kind === 'conversation' && m.personaId === selfId) return m as ConversationMessage;
+    }
+    return undefined;
+  }, [ordered, selfId]);
 
   // For each of your messages, which AI ids replied to it (until the next of yours).
   const replyMap = useMemo(() => {
@@ -292,6 +342,20 @@ export function ChatView({ group, personas }: Props) {
     }
     return map;
   }, [ordered, selfId, aiMembers]);
+
+  // Which AI ids replied to your latest line — passed to the pinned progress bar.
+  const lastSelfReplied = useMemo(() => {
+    const set = lastSelfMessage ? replyMap.get(lastSelfMessage.id) : undefined;
+    return set ? [...set] : undefined;
+  }, [replyMap, lastSelfMessage]);
+
+  // For your latest line, each replying member's first reply id — the target the
+  // progress bar's avatar jumps to. Silent readers get no entry (nothing to jump to).
+  const lastSelfReplyTargets = useMemo(() => {
+    if (!ordered || !lastSelfMessage) return new Map<string, string>();
+    const aiIds = new Set(aiMembers.map((p) => p.id));
+    return firstRepliesAfter(ordered, lastSelfMessage.id, aiIds, selfId);
+  }, [ordered, lastSelfMessage, aiMembers, selfId]);
 
   // Bucket the ordered lines into consecutive same-day runs. Each run renders as
   // its own block with a sticky date header, so the day stays pinned at the top
@@ -313,38 +377,47 @@ export function ChatView({ group, personas }: Props) {
 
   return (
     <Stack h="100%" gap={0}>
-      <ScrollArea flex={1} viewportRef={viewport} p="md">
-        {dayGroups === null ? (
-          <Center h={200}>
-            <Loader />
-          </Center>
-        ) : dayGroups.length === 0 ? (
-          <Center h={200}>
-            <Text c="dimmed">No messages yet — say hi 👋</Text>
-          </Center>
-        ) : (
-          <Stack gap="md">
-            {dayGroups.map((group) => (
-              <Stack key={group.day} gap="md" pos="relative">
-                <DayHeader label={formatDayLabel(group.ts, i18n.language, t)} />
-                {group.items.map((message) => (
-                  <ChatMessage
-                    key={message.id}
-                    message={message}
-                    persona={personas.get(message.personaId)}
-                    selfId={selfId}
-                    fontSize={fontSize}
-                    aiMembers={aiMembers}
-                    repliedBy={replyMap.get(message.id)}
-                    canRetry={message.id === lastId && !busy}
-                    onRetry={handleRetry}
-                  />
-                ))}
-              </Stack>
-            ))}
-          </Stack>
+      <Box flex={1} mih={0} pos="relative">
+        <ScrollArea
+          h="100%"
+          viewportRef={viewport}
+          p="md"
+          onScrollPositionChange={handleScrollPosition}
+        >
+          <MessageList
+            dayGroups={dayGroups}
+            firstUnreadId={firstUnreadId}
+            personas={personas}
+            selfId={selfId}
+            fontSize={fontSize}
+            aiMembers={aiMembers}
+            replyMap={replyMap}
+            lastId={lastId}
+            busy={busy}
+            onRetry={handleRetry}
+            locale={i18n.language}
+          />
+        </ScrollArea>
+        {!atBottom && (
+          <JumpToLatest
+            label={
+              unreadCount > 0
+                ? t('chat.newMessages', { count: unreadCount })
+                : t('chat.jumpToLatest')
+            }
+            onClick={followToBottom}
+          />
         )}
-      </ScrollArea>
+      </Box>
+      {lastSelfMessage && aiMembers.length > 0 && (
+        <ReadProgressBar
+          message={lastSelfMessage}
+          aiMembers={aiMembers}
+          repliedBy={lastSelfReplied}
+          replyTargets={lastSelfReplyTargets}
+          onJumpToMessage={jumpToMessage}
+        />
+      )}
       <Box p="md" style={{ borderTop: '1px solid var(--mantine-color-default-border)' }}>
         {readOnly ? (
           <Text size="sm" c="dimmed" ta="center">
@@ -369,6 +442,77 @@ export function ChatView({ group, personas }: Props) {
           </>
         )}
       </Box>
+    </Stack>
+  );
+}
+
+interface MessageListProps {
+  /** Consecutive same-day runs, or null while history is still loading. */
+  dayGroups: { day: number; ts: number; items: Message[] }[] | null;
+  /** Id the "new messages" divider is dropped in front of, or null. */
+  firstUnreadId: string | null;
+  personas: Map<string, Persona>;
+  selfId: string | undefined;
+  fontSize: number;
+  aiMembers: Persona[];
+  replyMap: Map<string, Set<string>>;
+  lastId: string | undefined;
+  busy: boolean;
+  onRetry: () => void;
+  locale: string;
+}
+
+/** The scrollable conversation body: day-grouped lines with the unread divider. */
+function MessageList({
+  dayGroups,
+  firstUnreadId,
+  personas,
+  selfId,
+  fontSize,
+  aiMembers,
+  replyMap,
+  lastId,
+  busy,
+  onRetry,
+  locale,
+}: MessageListProps) {
+  const { t } = useTranslation();
+  if (dayGroups === null) {
+    return (
+      <Center h={200}>
+        <Loader />
+      </Center>
+    );
+  }
+  if (dayGroups.length === 0) {
+    return (
+      <Center h={200}>
+        <Text c="dimmed">{t('chat.empty')}</Text>
+      </Center>
+    );
+  }
+  return (
+    <Stack gap="md">
+      {dayGroups.map((day) => (
+        <Stack key={day.day} gap="md" pos="relative">
+          <DayHeader label={formatDayLabel(day.ts, locale, t)} />
+          {day.items.map((message) => (
+            <div key={message.id} id={`msg-${message.id}`}>
+              {message.id === firstUnreadId && <UnreadDivider label={t('chat.unreadDivider')} />}
+              <ChatMessage
+                message={message}
+                persona={personas.get(message.personaId)}
+                selfId={selfId}
+                fontSize={fontSize}
+                aiMembers={aiMembers}
+                repliedBy={replyMap.get(message.id)}
+                canRetry={message.id === lastId && !busy}
+                onRetry={onRetry}
+              />
+            </div>
+          ))}
+        </Stack>
+      ))}
     </Stack>
   );
 }
@@ -436,5 +580,62 @@ function DayHeader({ label }: { label: string }) {
         {label}
       </Box>
     </Center>
+  );
+}
+
+/**
+ * The "new messages" marker: a full-width rule with a centered label, dropped in
+ * front of the first line the user hasn't seen. Unlike the day header it does not
+ * stick — it stays anchored to its place in the log, so scrolling past it reads
+ * as crossing into what arrived while you were away.
+ */
+function UnreadDivider({ label }: { label: string }) {
+  return (
+    <Box
+      id="chat-unread-divider"
+      my={8}
+      c="red"
+      style={{ display: 'flex', alignItems: 'center', gap: 12 }}
+    >
+      <Box style={{ flex: 1, height: 1, background: 'var(--mantine-color-red-4)' }} />
+      <Text size="xs" fw={700} tt="uppercase" style={{ letterSpacing: 0.4 }}>
+        {label}
+      </Text>
+      <Box style={{ flex: 1, height: 1, background: 'var(--mantine-color-red-4)' }} />
+    </Box>
+  );
+}
+
+/**
+ * The catch-up affordance: a pill floating at the bottom of the log while the
+ * reader is scrolled up. It shows how many unseen lines wait below, and clicking
+ * it drops back to the newest line and marks everything read.
+ */
+function JumpToLatest({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <UnstyledButton
+      onClick={onClick}
+      style={{
+        position: 'absolute',
+        bottom: 16,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 3,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '6px 14px',
+        borderRadius: 999,
+        color: 'white',
+        fontSize: 13,
+        fontWeight: 600,
+        background:
+          'linear-gradient(135deg, var(--mantine-color-indigo-6), var(--mantine-color-cyan-5))',
+        boxShadow: '0 6px 18px rgba(0, 0, 0, 0.22)',
+      }}
+    >
+      {label}
+      <IconArrowDown size={15} />
+    </UnstyledButton>
   );
 }
