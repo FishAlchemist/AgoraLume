@@ -140,20 +140,30 @@ pub enum Outcome {
     Failed(BrainError),
 }
 
-/// A brain's output: the outcome plus optional telemetry. Keeping usage
-/// alongside the outcome lets the orchestrator record token cost without the
-/// brain reaching into app state — it stays a pure prompt-in/decision-out
-/// function. The mock and providers that report nothing leave `usage` `None`.
+/// A brain's output: the outcome, optional telemetry, and anything the agent
+/// chose to remember this turn. Keeping usage alongside the outcome lets the
+/// orchestrator record token cost without the brain reaching into app state — it
+/// stays a pure prompt-in/decision-out function. The mock and providers that
+/// report nothing leave `usage` `None`.
+///
+/// `remembered` is the counterpart to [`AgentPrompt::recallable_memories`]: the
+/// in-character facts the model saved via its `remember` pull tool, for the
+/// orchestrator to persist under the persona's current identity (the brain never
+/// writes app state itself). Empty when the agent remembered nothing this turn —
+/// which is every turn it doesn't call the tool — and always empty from a
+/// non-LLM brain.
 #[derive(Clone, Debug)]
 pub struct Decision {
     pub outcome: Outcome,
     pub usage: Option<TokenUsage>,
+    pub remembered: Vec<String>,
 }
 
 impl From<Respond> for Decision {
-    /// A decision with no usage telemetry — for the mock and test brains.
+    /// A decision with no usage telemetry and nothing remembered — for the mock
+    /// and test brains.
     fn from(respond: Respond) -> Self {
-        Self { outcome: Outcome::Responded(respond), usage: None }
+        Self { outcome: Outcome::Responded(respond), usage: None, remembered: Vec::new() }
     }
 }
 

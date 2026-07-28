@@ -16,23 +16,28 @@
 //! so anything that relies on it (a tool / thought-carrying turn) works only on
 //! the native client, not the compat one.
 //!
-//! A decision is one structured-output completion by default: with no callable
-//! tools rig resolves `OutputMode::Auto` to native structured output — a single
-//! request, no function-call round-trip — so a silent "read" is always the
-//! model's own choice, not a swallowed tool-call error. Member lookups are handed
-//! to the agent up front in the prompt's `<directory>` section rather than a tool.
+//! Persona memory is two pull tools rig exposes to the model. Writing is always
+//! available: every decision registers a `remember` tool so the agent can save an
+//! in-character fact when one comes up. Reading is conditional: when the
+//! orchestrator resolves recallable memories for the persona
+//! ([`AgentPrompt::recallable_memories`]) a `recall_memory` tool holding them is
+//! registered too, so the model can look them up *on demand*. Member lookups, by
+//! contrast, are handed to the agent up front in the prompt's `<directory>`
+//! section rather than a tool.
 //!
-//! The one exception is persona memory: when the orchestrator resolves recallable
-//! memories for the persona ([`AgentPrompt::recallable_memories`]), a
-//! `recall_memory` pull tool is registered so the model can look them up *on
-//! demand*. Adding a tool flips `OutputMode::Auto` to `Tool` mode (the response
-//! schema becomes a synthetic `final_result` tool the model calls to finalize) on
-//! providers whose native constraint would otherwise suppress tool calls —
-//! `RespondArgs`/`validate_decision` are unchanged, rig handles the mode switch. A
-//! turn that never calls the tool still costs a single request; only an actual
-//! recall spends the extra round-trip, so the tool is attached only when the
-//! persona has memories to recall.
+//! Because a decision always carries the `remember` tool, `OutputMode::Auto`
+//! resolves to `Tool` mode (the response schema becomes a synthetic `final_result`
+//! tool the model calls to finalize) on providers whose native constraint would
+//! otherwise suppress tool calls — `RespondArgs`/`validate_decision` are
+//! unchanged, rig handles the mode switch. Crucially this costs nothing when the
+//! tools go unused: rig finalizes the moment the model calls `final_result`, so a
+//! turn that neither remembers nor recalls is still a single request. Only an
+//! actual tool call spends an extra round-trip, which is why the decision budget
+//! is raised past rig's default of one call (see `MEMORY_MAX_TURNS`). A silent
+//! "read" therefore stays the model's own choice, not a swallowed tool-call error.
+//! The summary path registers no tools, so it keeps native single-request output.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -211,20 +216,31 @@ adding; otherwise choose `read` to stay silent. Moods are UI-only flavour and \
 are never shown to other participants as text. Keep any reply to one short chat \
 message.";
 
-/// Appended to the preamble only when a `recall_memory` tool is registered, so a
-/// persona with no memories is never told about a tool it doesn't have. Short by
-/// design: the tool's own description carries the detail; this just points at it.
+/// Appended to every decision preamble, since the `remember` tool is always
+/// offered. Short by design: the tool's own description carries the detail; this
+/// just tells the model when saving is worthwhile and to keep it invisible.
+const REMEMBER_GUIDANCE: &str = "\
+You have a remember tool that saves a durable fact about this conversation for \
+your future self as this character. Use it sparingly, only for something worth \
+recalling in a later conversation (a stated preference, a commitment, a lasting \
+detail) — not passing chit-chat. Never mention the tool itself to the group.";
+
+/// Appended to the preamble only when a `recall_memory` tool is also registered,
+/// so a persona with no memories is never told about a tool it doesn't have. Short
+/// by design: the tool's own description carries the detail; this just points at it.
 const RECALL_GUIDANCE: &str = "\
-You have a recall_memory tool holding things you were asked to remember as this \
+You also have a recall_memory tool holding things you have remembered as this \
 character. Use it only when recalling a saved detail would actually change your \
 reply — most turns need no lookup. Never mention the tool itself to the group.";
 
-/// The model-call budget for a turn that can recall. rig's default is a single
-/// call (all a no-tool decision needs); a recall needs more — the initial call,
-/// the continuation after the tool runs, and the `final_result` call that carries
-/// the decision. A small ceiling covers that while capping how many requests one
-/// turn can spend if the model over-uses the tool.
-const RECALL_MAX_TURNS: usize = 3;
+/// The model-call budget for a decision. rig's default is a single call, but a
+/// decision always carries the `remember` tool (and often `recall_memory` too), so
+/// a turn that uses one needs the continuation after the tool runs, and the turn
+/// that uses both needs a second — plus the `final_result` call that carries the
+/// decision. This ceiling covers remember + recall + finalize while capping how
+/// many requests one turn can spend if the model over-uses a tool. A turn that
+/// calls no tool still finalizes in one request, well under the ceiling.
+const MEMORY_MAX_TURNS: usize = 3;
 
 /// The persona's recallable memory, exposed to the model as a pull tool. It holds
 /// the contents the orchestrator already resolved (current identity only), so
@@ -290,6 +306,77 @@ impl Tool for RecallMemory {
             None => self.memories.clone(),
         };
         Ok(found)
+    }
+}
+
+/// The `remember` tool: the model's write path into persona memory. It collects
+/// what the model chose to remember into a shared `sink`, which the caller drains
+/// after the prompt loop and hands back on the [`Decision`] for the orchestrator
+/// to persist — the tool never touches app state, so the brain stays a pure
+/// function. Blank or duplicate content is dropped here so a confused model can't
+/// spam the store. Registered on every decision (writing is always available).
+struct RememberMemory {
+    sink: Arc<Mutex<Vec<String>>>,
+}
+
+/// The remember tool's arguments: the single fact to save, in the model's words.
+#[derive(Debug, Deserialize)]
+struct RememberArgs {
+    content: String,
+}
+
+/// Remembering never actually fails — it only appends to an in-memory sink — but
+/// [`Tool`] requires an error type. This unit satisfies the bound and is never
+/// returned.
+#[derive(Debug)]
+struct RememberError;
+
+impl std::fmt::Display for RememberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("memory write failed")
+    }
+}
+
+impl std::error::Error for RememberError {}
+
+impl Tool for RememberMemory {
+    const NAME: &'static str = "remember";
+    type Error = RememberError;
+    type Args = RememberArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "Save one durable fact about this conversation for your future self as this \
+         character — a stated preference, a commitment, a lasting detail worth \
+         recalling in a later conversation. Pass the fact as `content`. Use it \
+         sparingly; do not save passing chit-chat."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The single fact to remember, in your own words."
+                }
+            },
+            "required": ["content"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let content = args.content.trim();
+        if !content.is_empty() {
+            let mut sink = self.sink.lock().unwrap();
+            // Drop a duplicate so a model that calls the tool twice in one turn
+            // doesn't store the same fact twice.
+            if !sink.iter().any(|existing| existing == content) {
+                sink.push(content.to_string());
+            }
+        }
+        Ok("Saved.".to_string())
     }
 }
 
@@ -496,12 +583,15 @@ impl Provider {
 }
 
 /// Builds and runs one completion against any rig client, handing rig's raw
-/// response (or error) back for the caller's retry and usage handling. Generic
-/// over the provider so the OpenAI and Gemini arms share a single body; the two
-/// concrete clients differ only in construction, never here. `structured` toggles
-/// the `respond` output schema (a decision) versus a plain-text completion (a
-/// summary). A non-empty `recall` registers the `recall_memory` pull tool for this
-/// turn. Extended details carry token usage, which feeds the debug/cost panel.
+/// response back — plus whatever the model chose to remember — for the caller's
+/// retry, usage, and persistence handling. Generic over the provider so the
+/// OpenAI and Gemini arms share a single body; the two concrete clients differ
+/// only in construction, never here. `structured` toggles the `respond` output
+/// schema (a decision) versus a plain-text completion (a summary). A decision
+/// always registers the `remember` tool and, when `recall` is non-empty, the
+/// `recall_memory` tool too. The returned `Vec` is what the model remembered this
+/// call (empty for a summary, or a decision that didn't remember). Extended
+/// details carry token usage, which feeds the debug/cost panel.
 async fn prompt_completion<C>(
     client: &C,
     model: &str,
@@ -510,28 +600,37 @@ async fn prompt_completion<C>(
     structured: bool,
     recall: &[String],
     text: String,
-) -> Result<PromptResponse, PromptError>
+) -> Result<(PromptResponse, Vec<String>), PromptError>
 where
     C: CompletionClient,
     C::CompletionModel: 'static,
 {
-    // `.tool()` changes the builder's type state, so the two cases build
-    // separately; they converge on the same `Agent`, differing only in whether a
-    // tool (and thus a larger call budget) is in play.
     let mut builder = client.agent(model).preamble(preamble).max_tokens(max_tokens);
     if structured {
         builder = builder.output_schema::<RespondArgs>();
     }
-    if recall.is_empty() {
-        // No tool: one model call is the whole turn (rig's default budget).
-        builder.build().prompt(text).extended_details().await
-    } else {
-        // A recall turn may need extra calls for the tool round-trip; bound them
-        // with `RECALL_MAX_TURNS`. A turn that never calls the tool still finishes
-        // in one call regardless of the ceiling.
-        let agent = builder.tool(RecallMemory { memories: recall.to_vec() }).build();
-        agent.prompt(text).max_turns(RECALL_MAX_TURNS).extended_details().await
+    // The summary path is not a decision, so it registers no tools: `OutputMode::
+    // Auto` stays native single-request output, no round-trip and nothing to
+    // remember.
+    if !structured {
+        let response = builder.build().prompt(text).extended_details().await?;
+        return Ok((response, Vec::new()));
     }
+    // A decision always offers `remember` (writing is always available) and adds
+    // `recall_memory` when the persona has something to recall. `remember` writes
+    // into `sink`, drained after the loop and returned for the orchestrator to
+    // persist. The budget is raised for a possible tool round-trip; a turn that
+    // calls neither tool still finalizes in one request (rig ends the moment the
+    // model calls `final_result`, so the ceiling only bounds actual tool use).
+    let sink = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut builder = builder.tool(RememberMemory { sink: Arc::clone(&sink) });
+    if !recall.is_empty() {
+        builder = builder.tool(RecallMemory { memories: recall.to_vec() });
+    }
+    let response =
+        builder.build().prompt(text).max_turns(MEMORY_MAX_TURNS).extended_details().await?;
+    let remembered = std::mem::take(&mut *sink.lock().unwrap());
+    Ok((response, remembered))
 }
 
 /// Whether a base URL points at Gemini's OpenAI-compatibility endpoint
@@ -599,6 +698,8 @@ impl LlmBrain {
     /// provider is named in exactly one place rather than duplicated per call site.
     /// `recall` is the persona's recallable memory (empty for a summary, or a
     /// decision with nothing to recall), registered as the `recall_memory` tool.
+    /// Returns rig's response alongside whatever the model chose to remember (see
+    /// [`prompt_completion`]).
     async fn prompt_once(
         &self,
         preamble: &str,
@@ -606,7 +707,7 @@ impl LlmBrain {
         structured: bool,
         recall: &[String],
         text: String,
-    ) -> Result<PromptResponse, PromptError> {
+    ) -> Result<(PromptResponse, Vec<String>), PromptError> {
         match &self.client {
             Provider::OpenAi(c) => {
                 prompt_completion(c, &self.model, preamble, max_tokens, structured, recall, text)
@@ -649,10 +750,11 @@ impl AgentBrain for LlmBrain {
         // The persona (system), with the group members and directory already
         // folded in by the orchestrator, becomes the agent preamble; the clean
         // transcript (plus <time>) is the text to reason over. Built per turn
-        // because the preamble is persona- and membership-specific. When the
-        // persona has recallable memories, the recall-tool note is appended so the
-        // model knows the tool exists (and only then — see `prompt_completion`).
-        let mut preamble = format!("{}\n\n{GUIDANCE}", prompt.system.trim());
+        // because the preamble is persona- and membership-specific. The remember
+        // note is always present (writing is always available); the recall note is
+        // appended only when the persona has memories to recall, so the model is
+        // never told about a tool it lacks (see `prompt_completion`).
+        let mut preamble = format!("{}\n\n{GUIDANCE}\n\n{REMEMBER_GUIDANCE}", prompt.system.trim());
         if !prompt.recallable_memories.is_empty() {
             preamble.push_str("\n\n");
             preamble.push_str(RECALL_GUIDANCE);
@@ -680,13 +782,13 @@ impl AgentBrain for LlmBrain {
                 limiter.acquire().await;
             }
 
-            // A structured-output completion with `RespondArgs` as the schema. With
-            // no recallable memories there are no tools, so `OutputMode::Auto`
-            // resolves to native structured output — one request, no round-trip;
-            // with memories the recall tool is registered and Auto composes it with
-            // the schema (see `prompt_completion`). Any correction from a prior
-            // unusable attempt rides along as its own tagged section so the model
-            // sees why its last reply was rejected.
+            // A structured-output completion with `RespondArgs` as the schema. The
+            // decision always carries the `remember` tool (and `recall_memory` when
+            // the persona has memories), so `OutputMode::Auto` resolves to Tool mode
+            // and `remember` may return facts to persist; a turn that calls no tool
+            // still finalizes in one request (see `prompt_completion`). Any
+            // correction from a prior unusable attempt rides along as its own tagged
+            // section so the model sees why its last reply was rejected.
             let text = match correction {
                 Some(hint) => {
                     format!("{}\n\n<retry_note>{hint}</retry_note>", prompt.conversation)
@@ -697,13 +799,17 @@ impl AgentBrain for LlmBrain {
                 .prompt_once(&preamble, self.max_tokens, true, &prompt.recallable_memories, text)
                 .await
             {
-                Ok(response) => {
+                Ok((response, remembered)) => {
                     usage_acc = add_usage(usage_acc, to_token_usage(response.usage));
                     match validate_decision(&response.output) {
                         Ok(respond) => {
+                            // Only the winning attempt's remembers propagate: a
+                            // discarded (retried) attempt's are dropped with it, so
+                            // a fact isn't stored twice across retries.
                             return Decision {
                                 outcome: Outcome::Responded(respond),
                                 usage: Some(usage_acc),
+                                remembered,
                             };
                         }
                         // The model answered, but the answer can't be used. This is
@@ -736,6 +842,7 @@ impl AgentBrain for LlmBrain {
                                     reason: bad.reason().to_string(),
                                 }),
                                 usage: Some(usage_acc),
+                                remembered: Vec::new(),
                             };
                         }
                     }
@@ -773,7 +880,11 @@ impl AgentBrain for LlmBrain {
                         "LLM decide failed; surfacing to chat"
                     );
                     let usage = (usage_acc.total_tokens > 0).then_some(usage_acc);
-                    return Decision { outcome: Outcome::Failed(BrainError { status, reason }), usage };
+                    return Decision {
+                        outcome: Outcome::Failed(BrainError { status, reason }),
+                        usage,
+                        remembered: Vec::new(),
+                    };
                 }
             }
         }
@@ -805,7 +916,8 @@ impl AgentBrain for LlmBrain {
         // A plain-text completion (no structured output/tools): the summary is
         // free-form notes, not a `respond` decision.
         match self.prompt_once(SUMMARY_GUIDANCE, self.summary_max_tokens, false, &[], input).await {
-            Ok(response) => Ok(Summary {
+            // A summary registers no tools, so nothing is ever remembered here.
+            Ok((response, _)) => Ok(Summary {
                 text: response.output.trim().to_string(),
                 usage: Some(to_token_usage(response.usage)),
             }),
@@ -1006,6 +1118,21 @@ mod tests {
 
         // No match yields an empty list, not an error.
         assert!(tool.call(RecallArgs { query: Some("weather".into()) }).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remember_tool_collects_trimmed_deduped_content() {
+        let sink = Arc::new(Mutex::new(Vec::<String>::new()));
+        let tool = RememberMemory { sink: Arc::clone(&sink) };
+
+        // A fact is saved (trimmed); a blank one is ignored; a duplicate is dropped.
+        tool.call(RememberArgs { content: "  prefers tea over coffee  ".into() }).await.unwrap();
+        tool.call(RememberArgs { content: "   ".into() }).await.unwrap();
+        tool.call(RememberArgs { content: "prefers tea over coffee".into() }).await.unwrap();
+        tool.call(RememberArgs { content: "has a cat named Mochi".into() }).await.unwrap();
+
+        let saved = sink.lock().unwrap().clone();
+        assert_eq!(saved, ["prefers tea over coffee", "has a cat named Mochi"]);
     }
 
     #[test]

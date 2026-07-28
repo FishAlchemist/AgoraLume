@@ -363,7 +363,7 @@ async fn run_turn(
                 }
             };
 
-            let Decision { outcome, usage } = decision;
+            let Decision { outcome, usage, remembered } = decision;
 
             // A failed inference is not a silent read: record it, surface a
             // sanitized notice to the chat, and suspend the turn at this agent
@@ -410,6 +410,21 @@ async fn run_turn(
                     usage,
                 },
             );
+
+            // Persist anything the agent chose to remember this turn, stamped with
+            // its current identity so a future turn can recall it (see
+            // `Workspace::add_memory`). The tool already ran inside the brain; this
+            // just commits its intent to the SSOT. A no-op when nothing was
+            // remembered — which is every turn the model doesn't use the tool.
+            if !remembered.is_empty() {
+                {
+                    let mut workspace = state.workspace();
+                    for content in &remembered {
+                        workspace.add_memory(&persona_id, content);
+                    }
+                }
+                state.persist_workspace();
+            }
 
             // Phase 4: route the decision to the two streams.
             match action {
@@ -860,6 +875,7 @@ mod tests {
                     reason: "Too Many Requests".into(),
                 }),
                 usage: None,
+                remembered: Vec::new(),
             }
         }
     }
@@ -881,8 +897,25 @@ mod tests {
                         reason: "Too Many Requests".into(),
                     }),
                     usage: None,
+                    remembered: Vec::new(),
                 },
                 _ => Respond::speak("resumed").into(),
+            }
+        }
+    }
+
+    /// Reads silently but reports a fact to remember every turn, to exercise the
+    /// orchestrator's write-back path.
+    struct RememberingBrain {
+        fact: String,
+    }
+    #[async_trait]
+    impl AgentBrain for RememberingBrain {
+        async fn decide(&self, _prompt: &AgentPrompt) -> Decision {
+            Decision {
+                outcome: Outcome::Responded(Respond::read()),
+                usage: None,
+                remembered: vec![self.fact.clone()],
             }
         }
     }
@@ -1022,6 +1055,22 @@ mod tests {
         assert_eq!(readers(&state, "lab", &mid).len(), 2);
         // No second error notice was raised.
         assert_eq!(system_count(&state, "lab"), 1);
+    }
+
+    #[tokio::test]
+    async fn remembered_facts_are_persisted_under_the_current_identity() {
+        let brain = Arc::new(RememberingBrain { fact: "the user prefers tea".into() });
+        let state = app(brain, cfg());
+        let mid = store_user(&state, "lab", "hi");
+
+        let outcome = run_once(&state, "lab", Event::User { message_id: mid }).await;
+        assert!(matches!(outcome, TurnOutcome::Done));
+
+        // Aria remembered the fact under its own identity, recallable immediately
+        // (stamped with the same hash recall filters on).
+        let aria = state.workspace().recallable_memories("aria");
+        assert_eq!(aria.len(), 1);
+        assert_eq!(aria[0].content, "the user prefers tea");
     }
 
     #[test]
