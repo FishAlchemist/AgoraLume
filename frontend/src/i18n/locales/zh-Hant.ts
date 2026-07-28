@@ -63,6 +63,7 @@ export const zhHant: TranslationSchema = {
     errorReplyFailed: '{{name}} 無法回覆',
     retry: '重試',
     suggestRegenerate: '換一批建議',
+    suggestLoading: '想想別的說法…',
   },
   readonly: {
     badge: '唯讀',

@@ -61,6 +61,7 @@ export const en = {
     errorReplyFailed: "{{name}} couldn't reply",
     retry: 'Retry',
     suggestRegenerate: 'Suggest other ideas',
+    suggestLoading: 'Thinking of ideas…',
   },
   readonly: {
     badge: 'Read-only',

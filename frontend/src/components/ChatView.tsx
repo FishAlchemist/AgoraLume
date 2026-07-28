@@ -1,5 +1,5 @@
 import { Box, Center, Loader, ScrollArea, Stack, Text } from '@mantine/core';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
 import { useConnection } from '../store/connection';
@@ -14,6 +14,14 @@ interface Props {
   group: Group;
   personas: Map<string, Persona>;
 }
+
+// A manual "suggest other ideas" always shows the loader for at least this long,
+// so a fast backend swap reads as a real refresh rather than an unchanged flicker.
+const REGEN_MIN_MS = 1000;
+// If no fresh set arrives within this window — the server coalesced the request
+// inside its cooldown, so no `suggestions` frame follows — restore what we cleared
+// rather than leaving the user on a spinner forever.
+const REGEN_TIMEOUT_MS = 8000;
 
 /** Appends a streamed message, replacing any existing entry with the same id. */
 function appendMessage(prev: Message[] | null, message: Message): Message[] {
@@ -90,10 +98,64 @@ export function ChatView({ group, personas }: Props) {
   // A chip click pushes its text into the composer (never sends). The nonce lets
   // the same suggestion re-fill after it was edited or cleared.
   const [fill, setFill] = useState<{ text: string; nonce: number }>();
+  // True while an explicit "suggest other ideas" is in flight: the old chips are
+  // cleared and a loader shows until the fresh set arrives (min REGEN_MIN_MS).
+  const [regenerating, setRegenerating] = useState(false);
+  // The in-flight manual regenerate: when it started, the openers to restore if it
+  // yields nothing, and its safety timer. null when no manual refresh is pending.
+  const regen = useRef<{ startedAt: number; prev: string[]; timer: number } | null>(null);
   const viewport = useRef<HTMLDivElement>(null);
   // Buffered read receipts, keyed by message id — decouples receipts from the
   // arrival of their target message so none are lost to the SSE/POST race.
   const reads = useRef<Map<string, Set<string>>>(new Map());
+
+  // Ends an in-flight manual regenerate: cancels its safety timer and drops the
+  // loader. Leaves whatever suggestions are currently shown in place.
+  const finishRegen = useCallback(() => {
+    const r = regen.current;
+    if (r) window.clearTimeout(r.timer);
+    regen.current = null;
+    setRegenerating(false);
+  }, []);
+
+  // Applies a freshly-arrived suggestion set (delivered on the SSE frame). When a
+  // manual refresh is pending, hold the loader for at least REGEN_MIN_MS so the
+  // swap is perceptible; otherwise (open/turn-end regen) apply it immediately.
+  const applySuggestions = useCallback(
+    (prompts: string[]) => {
+      const r = regen.current;
+      if (!r) {
+        setSuggestions(prompts);
+        return;
+      }
+      const wait = Math.max(0, REGEN_MIN_MS - (Date.now() - r.startedAt));
+      window.setTimeout(() => {
+        setSuggestions(prompts);
+        finishRegen();
+      }, wait);
+    },
+    [finishRegen],
+  );
+
+  // The refresh button: clear the current chips, show the loader, and ask the
+  // backend for a new set (rate-limited server-side). The fresh set arrives on the
+  // `suggestions` frame; a safety timer restores the old chips if none does.
+  const handleRegenerate = useCallback(() => {
+    if (regen.current) return; // one already pending
+    const timer = window.setTimeout(() => {
+      const r = regen.current;
+      if (r) setSuggestions(r.prev);
+      finishRegen();
+    }, REGEN_TIMEOUT_MS);
+    regen.current = { startedAt: Date.now(), prev: suggestions, timer };
+    setRegenerating(true);
+    setSuggestions([]);
+    void api.regenerateSuggestions(group.id).catch(() => {
+      const r = regen.current;
+      if (r) setSuggestions(r.prev);
+      finishRegen();
+    });
+  }, [suggestions, group.id, finishRegen]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: backendUrl is an intentional trigger — a change re-runs this so history and subscriptions rebind to the newly selected data source.
   useEffect(() => {
@@ -101,6 +163,7 @@ export function ChatView({ group, personas }: Props) {
     setMessages(null);
     setBusy(false);
     setSuggestions([]);
+    finishRegen();
     reads.current = new Map();
 
     void api.listMessages(group.id).then((initial) => {
@@ -114,7 +177,7 @@ export function ChatView({ group, personas }: Props) {
     });
 
     const unsubscribeSuggestions = api.subscribeSuggestions(group.id, (s) => {
-      setSuggestions(s.prompts);
+      applySuggestions(s.prompts);
     });
 
     const unsubscribe = api.subscribe(group.id, (message) => {
@@ -138,6 +201,7 @@ export function ChatView({ group, personas }: Props) {
       unsubscribeReads();
       unsubscribeActivity();
       unsubscribeSuggestions();
+      finishRegen();
     };
   }, [group.id, backendUrl]);
 
@@ -248,11 +312,12 @@ export function ChatView({ group, personas }: Props) {
           </Text>
         ) : (
           <>
-            {!locked && !busy && suggestions.length > 0 && (
+            {!locked && !busy && (regenerating || suggestions.length > 0) && (
               <SuggestionChips
                 prompts={suggestions}
+                loading={regenerating}
                 onPick={(text) => setFill({ text, nonce: Date.now() })}
-                onRegenerate={() => void api.regenerateSuggestions(group.id).catch(() => {})}
+                onRegenerate={handleRegenerate}
               />
             )}
             <Composer
