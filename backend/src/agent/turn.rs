@@ -300,6 +300,10 @@ async fn run_turn(
             let Some(persona) = build_persona(state, &persona_id) else {
                 continue;
             };
+            // The persona's in-character memory, resolved fresh: only what its
+            // current identity wrote. Handed to the brain as pull-tool data, not
+            // folded into the prompt text (see `AgentPrompt::recallable_memories`).
+            let recallable = recall_lines(state, &persona_id);
             let transcript = build_transcript(state, group_id);
             // Only the lines past the summary go in verbatim; the summary stands
             // in for everything before them.
@@ -308,8 +312,9 @@ async fn run_turn(
                 (!summary.text.trim().is_empty()).then_some(summary.text.as_str());
 
             // Assemble the prompt — the orchestrator owns context, so a brain is
-            // just prompt-in/decision-out (the LLM boundary).
-            let prompt = assemble_prompt(
+            // just prompt-in/decision-out (the LLM boundary). The persona's
+            // recallable memory rides alongside the text as pull-tool data.
+            let mut prompt = assemble_prompt(
                 &persona,
                 &roster,
                 &directory,
@@ -318,6 +323,7 @@ async fn run_turn(
                 &injected_events,
                 &now,
             );
+            prompt.recallable_memories = recallable;
             tracing::trace!(
                 target: "agent::prompt",
                 persona = %persona_id,
@@ -542,6 +548,14 @@ fn build_persona(state: &AppState, id: &str) -> Option<AgentPersona> {
     })
 }
 
+/// A persona's recallable memory contents (current identity only), newest first —
+/// the data an LLM brain exposes as a pull tool. Empty for a persona with no
+/// prompt or no memories under its current hash, in which case the brain attaches
+/// no tool and the turn stays a single completion.
+fn recall_lines(state: &AppState, persona_id: &str) -> Vec<String> {
+    state.workspace().recallable_memories(persona_id).into_iter().map(|m| m.content).collect()
+}
+
 /// Every persona in the workspace, as the member directory injected into each
 /// prompt. Cloned so the brain can hold it past the workspace lock.
 fn build_directory(state: &AppState) -> Vec<MemberInfo> {
@@ -719,6 +733,9 @@ fn assemble_prompt(
         conversation,
         persona_name: persona.name.clone(),
         last_line: transcript.last().map(|line| line.text.clone()),
+        // Recallable memories are not part of the prompt *text* — they ride
+        // alongside it as pull-tool data, set by the orchestrator after assembly.
+        recallable_memories: Vec::new(),
     }
 }
 

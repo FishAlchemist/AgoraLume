@@ -16,13 +16,22 @@
 //! so anything that relies on it (a tool / thought-carrying turn) works only on
 //! the native client, not the compat one.
 //!
-//! The decision itself is one structured-output completion: no callable tools, so
-//! rig resolves `OutputMode::Auto` to native structured output — a single
-//! request, no function-call round-trip. Member lookups the agent might have
-//! needed a tool for are handed to it up front in the prompt's `<directory>`
-//! section instead. Staying single-shot keeps every decision succeed-or-
-//! genuinely-fail, so a silent "read" is always the model's own choice rather
-//! than a swallowed tool-call error.
+//! A decision is one structured-output completion by default: with no callable
+//! tools rig resolves `OutputMode::Auto` to native structured output — a single
+//! request, no function-call round-trip — so a silent "read" is always the
+//! model's own choice, not a swallowed tool-call error. Member lookups are handed
+//! to the agent up front in the prompt's `<directory>` section rather than a tool.
+//!
+//! The one exception is persona memory: when the orchestrator resolves recallable
+//! memories for the persona ([`AgentPrompt::recallable_memories`]), a
+//! `recall_memory` pull tool is registered so the model can look them up *on
+//! demand*. Adding a tool flips `OutputMode::Auto` to `Tool` mode (the response
+//! schema becomes a synthetic `final_result` tool the model calls to finalize) on
+//! providers whose native constraint would otherwise suppress tool calls —
+//! `RespondArgs`/`validate_decision` are unchanged, rig handles the mode switch. A
+//! turn that never calls the tool still costs a single request; only an actual
+//! recall spends the extra round-trip, so the tool is attached only when the
+//! persona has memories to recall.
 
 use std::time::Duration;
 
@@ -31,6 +40,7 @@ use rig_core::agent::PromptResponse;
 use rig_core::client::completion::CompletionClient;
 use rig_core::completion::{Prompt, PromptError, Usage};
 use rig_core::providers::{gemini, openai};
+use rig_core::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -200,6 +210,88 @@ action using the response schema. Speak only when you have something worth \
 adding; otherwise choose `read` to stay silent. Moods are UI-only flavour and \
 are never shown to other participants as text. Keep any reply to one short chat \
 message.";
+
+/// Appended to the preamble only when a `recall_memory` tool is registered, so a
+/// persona with no memories is never told about a tool it doesn't have. Short by
+/// design: the tool's own description carries the detail; this just points at it.
+const RECALL_GUIDANCE: &str = "\
+You have a recall_memory tool holding things you were asked to remember as this \
+character. Use it only when recalling a saved detail would actually change your \
+reply — most turns need no lookup. Never mention the tool itself to the group.";
+
+/// The model-call budget for a turn that can recall. rig's default is a single
+/// call (all a no-tool decision needs); a recall needs more — the initial call,
+/// the continuation after the tool runs, and the `final_result` call that carries
+/// the decision. A small ceiling covers that while capping how many requests one
+/// turn can spend if the model over-uses the tool.
+const RECALL_MAX_TURNS: usize = 3;
+
+/// The persona's recallable memory, exposed to the model as a pull tool. It holds
+/// the contents the orchestrator already resolved (current identity only), so
+/// calling it touches no app state — the brain stays a pure prompt-in/decision-out
+/// function. Registered only when there is something to recall.
+struct RecallMemory {
+    memories: Vec<String>,
+}
+
+/// The recall tool's arguments: an optional free-text filter. Omitted (or blank)
+/// returns everything the persona currently remembers.
+#[derive(Debug, Deserialize)]
+struct RecallArgs {
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Recall never actually fails — its data is already in memory — but [`Tool`]
+/// requires an error type. This unit satisfies the bound and is never returned.
+#[derive(Debug)]
+struct RecallError;
+
+impl std::fmt::Display for RecallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("memory recall failed")
+    }
+}
+
+impl std::error::Error for RecallError {}
+
+impl Tool for RecallMemory {
+    const NAME: &'static str = "recall_memory";
+    type Error = RecallError;
+    type Args = RecallArgs;
+    type Output = Vec<String>;
+
+    fn description(&self) -> String {
+        "Look up what you have been asked to remember — durable facts, preferences, \
+         and details saved for you as this character. Optionally pass `query` with \
+         keywords to narrow the results; omit it to see everything you remember. \
+         Call this only when recalling would change your reply."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional keywords to filter memories; omit to return all."
+                }
+            }
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let found = match args.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+            Some(query) => {
+                let needle = query.to_lowercase();
+                self.memories.iter().filter(|m| m.to_lowercase().contains(&needle)).cloned().collect()
+            }
+            None => self.memories.clone(),
+        };
+        Ok(found)
+    }
+}
 
 /// How the model is told to compress older history. Deliberately narrow: produce
 /// *notes*, not a reply, and keep the facts that outlive small talk — so the
@@ -408,24 +500,38 @@ impl Provider {
 /// over the provider so the OpenAI and Gemini arms share a single body; the two
 /// concrete clients differ only in construction, never here. `structured` toggles
 /// the `respond` output schema (a decision) versus a plain-text completion (a
-/// summary). Extended details carry token usage, which feeds the debug/cost panel.
+/// summary). A non-empty `recall` registers the `recall_memory` pull tool for this
+/// turn. Extended details carry token usage, which feeds the debug/cost panel.
 async fn prompt_completion<C>(
     client: &C,
     model: &str,
     preamble: &str,
     max_tokens: u64,
     structured: bool,
+    recall: &[String],
     text: String,
 ) -> Result<PromptResponse, PromptError>
 where
     C: CompletionClient,
     C::CompletionModel: 'static,
 {
+    // `.tool()` changes the builder's type state, so the two cases build
+    // separately; they converge on the same `Agent`, differing only in whether a
+    // tool (and thus a larger call budget) is in play.
     let mut builder = client.agent(model).preamble(preamble).max_tokens(max_tokens);
     if structured {
         builder = builder.output_schema::<RespondArgs>();
     }
-    builder.build().prompt(text).extended_details().await
+    if recall.is_empty() {
+        // No tool: one model call is the whole turn (rig's default budget).
+        builder.build().prompt(text).extended_details().await
+    } else {
+        // A recall turn may need extra calls for the tool round-trip; bound them
+        // with `RECALL_MAX_TURNS`. A turn that never calls the tool still finishes
+        // in one call regardless of the ceiling.
+        let agent = builder.tool(RecallMemory { memories: recall.to_vec() }).build();
+        agent.prompt(text).max_turns(RECALL_MAX_TURNS).extended_details().await
+    }
 }
 
 /// Whether a base URL points at Gemini's OpenAI-compatibility endpoint
@@ -491,19 +597,24 @@ impl LlmBrain {
     /// Dispatches one completion to whichever provider backs this brain. Both the
     /// decision retry loop and the summary path go through here, so the choice of
     /// provider is named in exactly one place rather than duplicated per call site.
+    /// `recall` is the persona's recallable memory (empty for a summary, or a
+    /// decision with nothing to recall), registered as the `recall_memory` tool.
     async fn prompt_once(
         &self,
         preamble: &str,
         max_tokens: u64,
         structured: bool,
+        recall: &[String],
         text: String,
     ) -> Result<PromptResponse, PromptError> {
         match &self.client {
             Provider::OpenAi(c) => {
-                prompt_completion(c, &self.model, preamble, max_tokens, structured, text).await
+                prompt_completion(c, &self.model, preamble, max_tokens, structured, recall, text)
+                    .await
             }
             Provider::Gemini(c) => {
-                prompt_completion(c, &self.model, preamble, max_tokens, structured, text).await
+                prompt_completion(c, &self.model, preamble, max_tokens, structured, recall, text)
+                    .await
             }
         }
     }
@@ -538,8 +649,14 @@ impl AgentBrain for LlmBrain {
         // The persona (system), with the group members and directory already
         // folded in by the orchestrator, becomes the agent preamble; the clean
         // transcript (plus <time>) is the text to reason over. Built per turn
-        // because the preamble is persona- and membership-specific.
-        let preamble = format!("{}\n\n{GUIDANCE}", prompt.system.trim());
+        // because the preamble is persona- and membership-specific. When the
+        // persona has recallable memories, the recall-tool note is appended so the
+        // model knows the tool exists (and only then — see `prompt_completion`).
+        let mut preamble = format!("{}\n\n{GUIDANCE}", prompt.system.trim());
+        if !prompt.recallable_memories.is_empty() {
+            preamble.push_str("\n\n");
+            preamble.push_str(RECALL_GUIDANCE);
+        }
 
         // Retry loop. Two kinds of failure feed it: a transport/provider error
         // (rate limit, overload, network) is retried with exponential backoff; a
@@ -563,18 +680,23 @@ impl AgentBrain for LlmBrain {
                 limiter.acquire().await;
             }
 
-            // A structured-output completion: `RespondArgs` as the schema, no
-            // tools, so rig resolves `OutputMode::Auto` to native structured output
-            // — one request, no function-call round-trip. Any correction from a
-            // prior unusable attempt rides along as its own tagged section so the
-            // model sees why its last reply was rejected.
+            // A structured-output completion with `RespondArgs` as the schema. With
+            // no recallable memories there are no tools, so `OutputMode::Auto`
+            // resolves to native structured output — one request, no round-trip;
+            // with memories the recall tool is registered and Auto composes it with
+            // the schema (see `prompt_completion`). Any correction from a prior
+            // unusable attempt rides along as its own tagged section so the model
+            // sees why its last reply was rejected.
             let text = match correction {
                 Some(hint) => {
                     format!("{}\n\n<retry_note>{hint}</retry_note>", prompt.conversation)
                 }
                 None => prompt.conversation.clone(),
             };
-            match self.prompt_once(&preamble, self.max_tokens, true, text).await {
+            match self
+                .prompt_once(&preamble, self.max_tokens, true, &prompt.recallable_memories, text)
+                .await
+            {
                 Ok(response) => {
                     usage_acc = add_usage(usage_acc, to_token_usage(response.usage));
                     match validate_decision(&response.output) {
@@ -682,7 +804,7 @@ impl AgentBrain for LlmBrain {
         }
         // A plain-text completion (no structured output/tools): the summary is
         // free-form notes, not a `respond` decision.
-        match self.prompt_once(SUMMARY_GUIDANCE, self.summary_max_tokens, false, input).await {
+        match self.prompt_once(SUMMARY_GUIDANCE, self.summary_max_tokens, false, &[], input).await {
             Ok(response) => Ok(Summary {
                 text: response.output.trim().to_string(),
                 usage: Some(to_token_usage(response.usage)),
@@ -862,6 +984,28 @@ mod tests {
         // *not* an error — the model genuinely chose to say nothing usable.
         let read = validate_decision(r#"{"action":"speak"}"#).unwrap();
         assert_eq!(read.action, Action::Read);
+    }
+
+    #[tokio::test]
+    async fn recall_tool_filters_by_query_or_returns_all() {
+        let tool = RecallMemory {
+            memories: vec![
+                "Prefers tea over coffee".into(),
+                "Has a cat named Mochi".into(),
+                "Dislikes loud rooms".into(),
+            ],
+        };
+
+        // No query (and a blank one) returns everything the persona remembers.
+        assert_eq!(tool.call(RecallArgs { query: None }).await.unwrap().len(), 3);
+        assert_eq!(tool.call(RecallArgs { query: Some("  ".into()) }).await.unwrap().len(), 3);
+
+        // A query narrows to matching memories, case-insensitively.
+        let cat = tool.call(RecallArgs { query: Some("CAT".into()) }).await.unwrap();
+        assert_eq!(cat, ["Has a cat named Mochi"]);
+
+        // No match yields an empty list, not an error.
+        assert!(tool.call(RecallArgs { query: Some("weather".into()) }).await.unwrap().is_empty());
     }
 
     #[test]

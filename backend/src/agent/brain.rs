@@ -98,12 +98,21 @@ pub struct MemberInfo {
 /// group members, and the wider workspace `<directory>`); `conversation` carries
 /// the clean transcript plus injected environment events. `persona_name` and
 /// `last_line` are conveniences so a non-LLM brain need not re-parse the text.
+///
+/// `recallable_memories` is the persona's in-character memory — the contents the
+/// orchestrator resolved for *this* identity version (see
+/// [`crate::workspace::Workspace::recallable_memories`]). Unlike the directory or
+/// roster it is deliberately *not* folded into `system`: an LLM brain exposes it
+/// as a pull tool the model calls only when it needs to remember something, so a
+/// turn that doesn't recall pays no extra tokens or request. Empty when the
+/// persona has no memories under its current identity; a non-LLM brain ignores it.
 #[derive(Clone, Debug)]
 pub struct AgentPrompt {
     pub system: String,
     pub conversation: String,
     pub persona_name: String,
     pub last_line: Option<String>,
+    pub recallable_memories: Vec<String>,
 }
 
 /// A sanitized inference failure — the only error detail that leaves the brain.

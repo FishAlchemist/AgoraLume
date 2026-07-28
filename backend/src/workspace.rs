@@ -414,6 +414,26 @@ impl Workspace {
         mems
     }
 
+    /// The memories a persona may *recall* right now: only those written under its
+    /// current identity hash, newest first. This is the in-character subset of
+    /// [`Self::persona_memories`] — memories an earlier version wrote are retained
+    /// and still listed by the management UI, but held out of recall so a rewritten
+    /// character doesn't answer from a former self's notes. A persona with no prompt
+    /// (no hash to scope to) can recall nothing.
+    pub fn recallable_memories(&self, persona_id: &str) -> Vec<Memory> {
+        let Some(hash) = self.persona_hash(persona_id) else {
+            return Vec::new();
+        };
+        let mut mems: Vec<Memory> = self
+            .memories
+            .iter()
+            .filter(|m| m.persona_id == persona_id && m.prompt_hash == hash)
+            .cloned()
+            .collect();
+        mems.sort_by_key(|m| std::cmp::Reverse(m.created_at));
+        mems
+    }
+
     /// Records a memory for a persona, stamped with the persona's current identity
     /// hash so a later recall can keep it in-character. Returns `None` when the
     /// persona is unknown, has no prompt (no hash to scope to), or the content is
@@ -885,6 +905,44 @@ mod tests {
             all.iter().filter(|m| m.prompt_hash == v2).map(|m| m.content.as_str()).collect();
         assert_eq!(under_v1, ["remembered under the original Aria"]);
         assert_eq!(under_v2, ["remembered under the new Aria"]);
+    }
+
+    /// Recall is scoped to the *current* identity: a memory written before the
+    /// persona was rewritten stays listed by `persona_memories` but drops out of
+    /// `recallable_memories`, so the recall tool never feeds a former self's notes
+    /// back into a redefined character.
+    #[test]
+    fn recall_is_limited_to_the_current_identity() {
+        let mut ws = Workspace::seeded();
+        ws.add_memory("aria", "written under the original Aria").unwrap();
+
+        // Both the full listing and recall see the one memory while the identity
+        // is unchanged.
+        assert_eq!(ws.persona_memories("aria").len(), 1);
+        assert_eq!(ws.recallable_memories("aria").len(), 1);
+
+        // Redefine the character, then record a memory under the new identity.
+        ws.update_persona("aria", serde_json::json!({ "systemPrompt": "A brand new Aria." }))
+            .unwrap();
+        let v2 = ws.persona("aria").unwrap().prompt_hash.unwrap();
+        ws.add_memory("aria", "written under the new Aria").unwrap();
+
+        // The management listing still shows both; recall shows only the current one.
+        assert_eq!(ws.persona_memories("aria").len(), 2);
+        let recallable = ws.recallable_memories("aria");
+        assert_eq!(recallable.len(), 1);
+        assert_eq!(recallable[0].content, "written under the new Aria");
+        assert!(recallable.iter().all(|m| m.prompt_hash == v2));
+    }
+
+    /// A persona with no system prompt has no identity hash to scope memories to,
+    /// so it can recall nothing even if rows somehow exist for it.
+    #[test]
+    fn recall_is_empty_without_a_prompt() {
+        let ws = Workspace::seeded();
+        // The seeded user identity ("me") carries no system prompt.
+        assert!(ws.persona("user-me").and_then(|p| p.prompt_hash).is_none());
+        assert!(ws.recallable_memories("user-me").is_empty());
     }
 
     /// Deletion is scoped to the owning persona, and dropping a persona takes its
