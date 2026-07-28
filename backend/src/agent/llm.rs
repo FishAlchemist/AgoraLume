@@ -1051,7 +1051,7 @@ impl AgentBrain for LlmBrain {
         if let Some(limiter) = &self.limiter {
             limiter.acquire().await;
         }
-        match self.suggest_once(SUGGEST_GUIDANCE, SUGGEST_MAX_TOKENS, input).await {
+        match self.suggest_once(SUGGEST_GUIDANCE, SUGGEST_MAX_TOKENS, input.clone()).await {
             Ok(response) => {
                 let usage = Some(to_token_usage(response.usage));
                 // The model returns the schema as a JSON string; parse it, then
@@ -1076,7 +1076,10 @@ impl AgentBrain for LlmBrain {
                         break;
                     }
                 }
-                Ok(Suggestions { prompts, usage })
+                // Report the exact prompt back so the orchestrator can record it
+                // in the trace — the debug panel then shows what informed the
+                // openers, not just the openers themselves.
+                Ok(Suggestions { prompts, usage, system: SUGGEST_GUIDANCE.to_string(), context: input })
             }
             Err(e) => {
                 let (status, reason) = classify_failure(&e);

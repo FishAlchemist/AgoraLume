@@ -77,7 +77,8 @@ impl AgentBrain for RuleBrain {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        Ok(Suggestions { prompts, usage: None })
+        // No model ran, so there's no prompt to trace — the openers are canned.
+        Ok(Suggestions { prompts, usage: None, ..Default::default() })
     }
 }
 

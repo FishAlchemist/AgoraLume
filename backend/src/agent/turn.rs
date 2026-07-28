@@ -671,8 +671,10 @@ pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
                         group_id: group_id.clone(),
                         persona_id: "system".to_string(),
                         persona_name: "Chat suggestions".to_string(),
-                        system: String::new(),
-                        conversation: String::new(),
+                        // The exact prompt the pass ran on, so the debug panel shows
+                        // what informed the openers beyond the standing instruction.
+                        system: result.system,
+                        conversation: result.context,
                         action: "suggest".to_string(),
                         message: Some(result.prompts.join("\n")),
                         mood: None,
@@ -1476,9 +1478,16 @@ mod tests {
         async fn decide(&self, _prompt: &AgentPrompt) -> Decision {
             Respond::read().into()
         }
-        async fn suggest(&self, _request: &SuggestionRequest) -> Result<Suggestions, BrainError> {
+        async fn suggest(&self, request: &SuggestionRequest) -> Result<Suggestions, BrainError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Suggestions { prompts: self.prompts.clone(), usage: self.usage })
+            // Echo the context back the way the real brain reports it, so the test
+            // can prove the recent transcript reaches the trace.
+            Ok(Suggestions {
+                prompts: self.prompts.clone(),
+                usage: self.usage,
+                system: "suggest-guidance".to_string(),
+                context: request.recent.join("\n"),
+            })
         }
     }
 
@@ -1566,6 +1575,17 @@ mod tests {
 
         // The usage-bearing pass counted as one request (feeds the cost panel).
         assert_eq!(state.debug_totals().requests, 1);
+
+        // The trace carries the exact prompt the pass ran on — its system guidance
+        // and the recent context — so the debug panel shows what informed the
+        // openers, not an empty "public messages" box.
+        let trace = state
+            .debug_traces("lab")
+            .into_iter()
+            .find(|t| t.action == "suggest")
+            .expect("the suggestion pass should record a trace");
+        assert_eq!(trace.system, "suggest-guidance");
+        assert!(trace.conversation.contains("Aria: hi there"), "context was {:?}", trace.conversation);
     }
 
     #[tokio::test]

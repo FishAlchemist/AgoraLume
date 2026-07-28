@@ -221,6 +221,14 @@ pub struct SuggestionRequest {
 pub struct Suggestions {
     pub prompts: Vec<String>,
     pub usage: Option<TokenUsage>,
+    /// The standing instruction the model was given (the guidance preamble), so
+    /// the debug panel can show the suggestion pass's "system" prompt. Empty for
+    /// a brain that runs no model.
+    pub system: String,
+    /// The tagged context actually sent — roster, summary, recent tail, time — so
+    /// the debug panel shows what informed the openers beyond the system prompt.
+    /// Empty for a brain that runs no model.
+    pub context: String,
 }
 
 /// The single inference seam. A real implementation sends the prompt to an LLM
