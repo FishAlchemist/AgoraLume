@@ -1,6 +1,6 @@
 import { Box, Center, Loader, ScrollArea, Stack, Text, UnstyledButton } from '@mantine/core';
 import { IconArrowDown } from '@tabler/icons-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
 import { useChatReadTracking } from '../lib/useChatReadTracking';
@@ -311,10 +311,10 @@ export function ChatView({ group, personas }: Props) {
   // Resumes a turn suspended by a failed agent. We don't lock optimistically:
   // the backend's `activity` signal locks the composer only if there is actually
   // something to resume, so a stale retry (already voided) can't wedge the UI.
-  const handleRetry = () => {
+  const handleRetry = useCallback(() => {
     if (busy) return;
     void api.retry(group.id).catch(() => {});
-  };
+  }, [busy, group.id]);
 
   // The newest line you sent — the one the pinned progress bar tracks.
   const lastSelfMessage = useMemo(() => {
@@ -462,8 +462,13 @@ interface MessageListProps {
   locale: string;
 }
 
-/** The scrollable conversation body: day-grouped lines with the unread divider. */
-function MessageList({
+/**
+ * The scrollable conversation body: day-grouped lines with the unread divider.
+ * Memoized so unrelated app re-renders (notably toggling the mobile navbar, which
+ * re-renders the whole shell) don't re-render every message — its props are all
+ * stable references, so it bails unless the conversation itself changes.
+ */
+const MessageList = memo(function MessageList({
   dayGroups,
   firstUnreadId,
   personas,
@@ -515,7 +520,7 @@ function MessageList({
       ))}
     </Stack>
   );
-}
+});
 
 interface ChatMessageProps {
   message: Message;
@@ -565,12 +570,11 @@ function DayHeader({ label }: { label: string }) {
   return (
     <Center pos="sticky" top={4} style={{ zIndex: 2, pointerEvents: 'none' }}>
       <Box
+        className="agora-day-pill"
         style={{
           fontSize: 12,
           fontWeight: 600,
           color: 'var(--mantine-color-dimmed)',
-          background: 'color-mix(in srgb, var(--mantine-color-body) 82%, transparent)',
-          backdropFilter: 'blur(6px)',
           border: '1px solid var(--mantine-color-default-border)',
           borderRadius: 999,
           padding: '2px 12px',

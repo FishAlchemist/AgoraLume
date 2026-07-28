@@ -44,6 +44,9 @@ function Shell() {
     <AppShell
       header={{ height: HEADER_HEIGHT }}
       navbar={{ width: 280, breakpoint: 'sm', collapsed: { mobile: !opened } }}
+      // Snappier than the 200ms default — the mobile navbar should read as an
+      // instant open/close, not a drawer that eases in.
+      transitionDuration={150}
       padding={0}
     >
       <AppShell.Header>
