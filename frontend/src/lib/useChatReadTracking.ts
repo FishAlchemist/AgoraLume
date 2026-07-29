@@ -112,7 +112,9 @@ export function useChatReadTracking(
   // (the watermark only advances at the bottom), so the divider stays put.
   const firstUnreadId = useMemo(() => {
     if (!ordered || lastReadTs == null) return null;
-    const idx = ordered.findIndex((m) => m.ts > lastReadTs && m.personaId !== selfId);
+    const idx = ordered.findIndex(
+      (m) => m.kind === 'conversation' && m.ts > lastReadTs && m.personaId !== selfId,
+    );
     if (idx === -1) return null;
     // If that first unread line is the oldest one loaded and more unread sits
     // above (a capped backlog), the real read boundary is out of the window:
@@ -125,7 +127,11 @@ export function useChatReadTracking(
 
   const unreadCount = useMemo(() => {
     if (!ordered || lastReadTs == null) return 0;
-    return ordered.reduce((n, m) => (m.ts > lastReadTs && m.personaId !== selfId ? n + 1 : n), 0);
+    return ordered.reduce(
+      (n, m) =>
+        m.kind === 'conversation' && m.ts > lastReadTs && m.personaId !== selfId ? n + 1 : n,
+      0,
+    );
   }, [ordered, lastReadTs, selfId]);
 
   // Places the view once history first loads: land on the divider if unread
@@ -137,7 +143,8 @@ export function useChatReadTracking(
     const stored = useReadState.getState().lastRead[groupId];
     const newestTs = ordered.at(-1)?.ts ?? 0;
     const hasUnread =
-      stored != null && ordered.some((m) => m.ts > stored && m.personaId !== selfId);
+      stored != null &&
+      ordered.some((m) => m.kind === 'conversation' && m.ts > stored && m.personaId !== selfId);
     requestAnimationFrame(() => {
       if (hasUnread) {
         atBottomRef.current = false;

@@ -1,13 +1,4 @@
-import {
-  Box,
-  Button,
-  Center,
-  Loader,
-  ScrollArea,
-  Stack,
-  Text,
-  UnstyledButton,
-} from '@mantine/core';
+import { Box, Center, Loader, ScrollArea, Stack, Text, UnstyledButton } from '@mantine/core';
 import { IconArrowDown } from '@tabler/icons-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -41,6 +32,10 @@ const REGEN_TIMEOUT_MS = 8000;
 // pulls. The initial page is extended past this when there are more unread lines,
 // so the whole unread run is always present; older history is fetched on demand.
 const PAGE_SIZE = 40;
+
+// How near either end of the loaded window (px) starts pulling the next page in,
+// so scrolling flows into unloaded history instead of stopping at a button.
+const AUTO_LOAD_MARGIN = 320;
 
 /** Appends a streamed message, replacing any existing entry with the same id. */
 function appendMessage(prev: Message[] | null, message: Message): Message[] {
@@ -174,10 +169,8 @@ export function ChatView({ group, personas }: Props) {
   // a window fetched around a jump target. `hasEarlier`/`hasLater` gate the two
   // end loaders.
   const [hasEarlier, setHasEarlier] = useState(false);
-  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const loadingEarlierRef = useRef(false);
   const [hasLater, setHasLater] = useState(false);
-  const [loadingLater, setLoadingLater] = useState(false);
   const loadingLaterRef = useRef(false);
   // Whether the loaded window includes the live newest line. False after a jump
   // into old history: streamed lines are then held out of the detached window (a
@@ -340,9 +333,7 @@ export function ChatView({ group, personas }: Props) {
     setHasEarlier(false);
     setHasLater(false);
     setUnreadAbove(false);
-    setLoadingEarlier(false);
     loadingEarlierRef.current = false;
-    setLoadingLater(false);
     loadingLaterRef.current = false;
     setAtTail(true);
     atTailRef.current = true;
@@ -465,7 +456,6 @@ export function ChatView({ group, personas }: Props) {
   const handleLoadEarlier = useCallback(() => {
     if (!oldestLoadedId || loadingEarlierRef.current) return;
     loadingEarlierRef.current = true;
-    setLoadingEarlier(true);
     const el = viewport.current;
     const anchorHeight = el?.scrollHeight ?? 0;
     const anchorTop = el?.scrollTop ?? 0;
@@ -482,7 +472,6 @@ export function ChatView({ group, personas }: Props) {
       .catch(() => {})
       .finally(() => {
         loadingEarlierRef.current = false;
-        setLoadingEarlier(false);
       });
   }, [oldestLoadedId, group.id, viewport]);
 
@@ -492,7 +481,6 @@ export function ChatView({ group, personas }: Props) {
   const handleLoadLater = useCallback(() => {
     if (!newestLoadedId || loadingLaterRef.current) return;
     loadingLaterRef.current = true;
-    setLoadingLater(true);
     void api
       .listMessages(group.id, { anchor: newestLoadedId, after: PAGE_SIZE })
       .then((newer) => {
@@ -509,9 +497,32 @@ export function ChatView({ group, personas }: Props) {
       .catch(() => {})
       .finally(() => {
         loadingLaterRef.current = false;
-        setLoadingLater(false);
       });
   }, [newestLoadedId, group.id]);
+
+  // Continuous scroll: approaching either end pulls the next page in, so history
+  // slides in without a click. Each page is gated by its ref (no re-entry) and by
+  // `hasEarlier`/`hasLater` (so a settled end stops fetching); after a prepend the
+  // layout effect shifts scrollTop off the top edge, so it won't re-fire in a loop.
+  const maybeAutoLoad = useCallback(() => {
+    const el = viewport.current;
+    if (!el) return;
+    if (hasEarlier && el.scrollTop < AUTO_LOAD_MARGIN) {
+      handleLoadEarlier();
+    } else if (
+      hasLater &&
+      el.scrollHeight - el.scrollTop - el.clientHeight < AUTO_LOAD_MARGIN
+    ) {
+      handleLoadLater();
+    }
+  }, [viewport, hasEarlier, hasLater, handleLoadEarlier, handleLoadLater]);
+
+  // One scroll handler for the viewport: update the read/at-bottom state, then see
+  // whether nearing an edge should page more in.
+  const handleScroll = useCallback(() => {
+    handleScrollPosition();
+    maybeAutoLoad();
+  }, [handleScrollPosition, maybeAutoLoad]);
 
   // Jumps to a line — a turn's trigger, an avatar's reply, later a search hit.
   // When it's already loaded, a plain scroll (instant). When it isn't (it paged
@@ -607,7 +618,7 @@ export function ChatView({ group, personas }: Props) {
           h="100%"
           viewportRef={viewport}
           p="md"
-          onScrollPositionChange={handleScrollPosition}
+          onScrollPositionChange={handleScroll}
         >
           <MessageList
             dayGroups={dayGroups}
@@ -622,11 +633,7 @@ export function ChatView({ group, personas }: Props) {
             onRetry={handleRetry}
             locale={i18n.language}
             hasEarlier={hasEarlier}
-            loadingEarlier={loadingEarlier}
-            onLoadEarlier={handleLoadEarlier}
             hasLater={hasLater}
-            loadingLater={loadingLater}
-            onLoadLater={handleLoadLater}
           />
         </ScrollArea>
         {jumping && (
@@ -686,17 +693,10 @@ interface MessageListProps {
   busy: boolean;
   onRetry: () => void;
   locale: string;
-  /** Whether an earlier page may still be fetched — shows the top loader. */
+  /** More history exists above — a top spinner shows and scrolling near it pages in. */
   hasEarlier: boolean;
-  /** An earlier page is in flight — the top loader spins. */
-  loadingEarlier: boolean;
-  onLoadEarlier: () => void;
-  /** Whether a later page may still be fetched — shows the bottom loader. Only set
-   * when the window is detached in history, below the loaded lines. */
+  /** More history exists below (a detached window) — a bottom spinner pages in. */
   hasLater: boolean;
-  /** A later page is in flight — the bottom loader spins. */
-  loadingLater: boolean;
-  onLoadLater: () => void;
 }
 
 /**
@@ -718,11 +718,7 @@ const MessageList = memo(function MessageList({
   onRetry,
   locale,
   hasEarlier,
-  loadingEarlier,
-  onLoadEarlier,
   hasLater,
-  loadingLater,
-  onLoadLater,
 }: MessageListProps) {
   const { t } = useTranslation();
   if (dayGroups === null) {
@@ -742,16 +738,8 @@ const MessageList = memo(function MessageList({
   return (
     <Stack gap="md">
       {hasEarlier && (
-        <Center>
-          <Button
-            variant="subtle"
-            size="xs"
-            color="gray"
-            loading={loadingEarlier}
-            onClick={onLoadEarlier}
-          >
-            {t('chat.loadEarlier')}
-          </Button>
+        <Center py="xs">
+          <Loader size="sm" />
         </Center>
       )}
       {dayGroups.map((day) => (
@@ -775,16 +763,8 @@ const MessageList = memo(function MessageList({
         </Stack>
       ))}
       {hasLater && (
-        <Center>
-          <Button
-            variant="subtle"
-            size="xs"
-            color="gray"
-            loading={loadingLater}
-            onClick={onLoadLater}
-          >
-            {t('chat.loadNewer')}
-          </Button>
+        <Center py="xs">
+          <Loader size="sm" />
         </Center>
       )}
     </Stack>
