@@ -1,4 +1,4 @@
-import type { GroupSuggestions, Message } from '../../types';
+import type { GroupSuggestions, Message, Turn } from '../../types';
 import type {
   ActivityHandler,
   AgentTrace,
@@ -11,6 +11,7 @@ import type {
   ReadReceipt,
   ServerMeta,
   SuggestionsHandler,
+  TurnHandler,
 } from './types';
 
 /** Parses an SSE frame's JSON payload, yielding null on malformed data. */
@@ -31,6 +32,7 @@ interface GroupStream {
   message: Set<MessageHandler>;
   read: Set<ReadHandler>;
   activity: Set<ActivityHandler>;
+  turn: Set<TurnHandler>;
   debug: Set<DebugHandler>;
   suggestions: Set<SuggestionsHandler>;
   /** Pending close from a grace period; cleared if a subscriber returns first. */
@@ -75,6 +77,12 @@ class SharedStreams {
     return () => this.drop(groupId, stream, stream.activity, handler);
   }
 
+  subscribeTurn(groupId: string, handler: TurnHandler): () => void {
+    const stream = this.open(groupId);
+    stream.turn.add(handler);
+    return () => this.drop(groupId, stream, stream.turn, handler);
+  }
+
   subscribeDebug(groupId: string, handler: DebugHandler): () => void {
     const stream = this.open(groupId);
     stream.debug.add(handler);
@@ -104,6 +112,7 @@ class SharedStreams {
       message: new Set(),
       read: new Set(),
       activity: new Set(),
+      turn: new Set(),
       debug: new Set(),
       suggestions: new Set(),
     };
@@ -119,6 +128,10 @@ class SharedStreams {
     source.addEventListener('activity', (e: MessageEvent<string>) => {
       const data = parseFrame<{ active: boolean }>(e.data);
       if (data) for (const h of stream.activity) h(data.active);
+    });
+    source.addEventListener('turn', (e: MessageEvent<string>) => {
+      const data = parseFrame<Turn>(e.data);
+      if (data) for (const h of stream.turn) h(data);
     });
     source.addEventListener('debug', (e: MessageEvent<string>) => {
       const data = parseFrame<AgentTrace>(e.data);
@@ -182,6 +195,7 @@ class SharedStreams {
       stream.message.size > 0 ||
       stream.read.size > 0 ||
       stream.activity.size > 0 ||
+      stream.turn.size > 0 ||
       stream.debug.size > 0 ||
       stream.suggestions.size > 0
     );
@@ -258,6 +272,10 @@ export class HttpChatApi implements ChatApi {
 
   subscribeActivity(groupId: string, handler: ActivityHandler): () => void {
     return this.streams.subscribeActivity(groupId, handler);
+  }
+
+  subscribeTurn(groupId: string, handler: TurnHandler): () => void {
+    return this.streams.subscribeTurn(groupId, handler);
   }
 
   getUsage(): Promise<DebugUsage> {

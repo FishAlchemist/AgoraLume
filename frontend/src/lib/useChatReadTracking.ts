@@ -36,6 +36,12 @@ export function useChatReadTracking(
   groupId: string,
   ordered: Message[] | null,
   selfId: string | undefined,
+  /**
+   * True when unread lines exist above the loaded window — the initial page was
+   * capped mid-backlog. While set, the divider is held back if the oldest loaded
+   * line is itself unread, since the real read boundary hasn't paged in yet.
+   */
+  unreadAbove = false,
 ): ChatReadTracking {
   const lastReadTs = useReadState((s) => s.lastRead[groupId]);
   const markRead = useReadState((s) => s.markRead);
@@ -94,9 +100,16 @@ export function useChatReadTracking(
   // (the watermark only advances at the bottom), so the divider stays put.
   const firstUnreadId = useMemo(() => {
     if (!ordered || lastReadTs == null) return null;
-    const m = ordered.find((m) => m.ts > lastReadTs && m.personaId !== selfId);
-    return m?.id ?? null;
-  }, [ordered, lastReadTs, selfId]);
+    const idx = ordered.findIndex((m) => m.ts > lastReadTs && m.personaId !== selfId);
+    if (idx === -1) return null;
+    // If that first unread line is the oldest one loaded and more unread sits
+    // above (a capped backlog), the real read boundary is out of the window:
+    // hold the divider back rather than draw it here — an earlier page brings the
+    // boundary into view, where it renders correctly. Once any read line has
+    // paged in above the unread run, idx > 0 and the divider shows as usual.
+    if (idx === 0 && unreadAbove) return null;
+    return ordered[idx].id;
+  }, [ordered, lastReadTs, selfId, unreadAbove]);
 
   const unreadCount = useMemo(() => {
     if (!ordered || lastReadTs == null) return 0;

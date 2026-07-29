@@ -2,7 +2,7 @@ import { Box, Group, Text, Tooltip, UnstyledButton } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import { IconArrowBackUp, IconChecks } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
-import type { ConversationMessage, Persona } from '../types';
+import type { Persona, Turn } from '../types';
 import { PersonaAvatar } from './PersonaAvatar';
 import { classifyReaders, ReadReceiptsModal } from './ReadReceiptsModal';
 
@@ -11,45 +11,64 @@ import { classifyReaders, ReadReceiptsModal } from './ReadReceiptsModal';
 const MAX_AVATARS = 5;
 
 interface Props {
-  /** The user's most recent line — the one whose read progress we pin. */
-  message: ConversationMessage;
-  /** The group's AI members: the audience for read receipts. */
-  aiMembers: Persona[];
-  /** AI ids that replied to `message` (a subset of those who read it). */
-  repliedBy?: string[];
-  /** persona id → the message id of that member's reply, for members who replied. */
-  replyTargets: Map<string, string>;
+  /**
+   * The current processing round: what triggered it and how far each AI member
+   * has got. Comes from live turn state (not the loaded message window), so the
+   * bar shows regardless of how much history is loaded — and works for an event
+   * trigger that has no user message.
+   */
+  turn: Turn;
+  /** Resolves the turn's member (and trigger) persona ids to personas. */
+  personas: Map<string, Persona>;
   /** Scrolls the conversation to a given line (a reply, or your own message). */
   onJumpToMessage: (id: string) => void;
 }
 
 /**
- * A slim bar pinned above the composer that always shows how far the group has
- * got through your latest message — a read count, and one avatar per member
- * tinted by state (replied / read-silently / not yet). You never have to scroll
- * back to find your own line to check progress. Clicking the count opens the full
- * receipt list; clicking a member who replied jumps to their reply; the return
- * button jumps back to the message itself.
+ * A slim bar pinned above the composer showing how far the group has got through
+ * the current round — a processed count, and one avatar per member tinted by
+ * state (replied / read-silently / still working). You never have to scroll back
+ * to check progress. Clicking the count opens the full receipt list; clicking a
+ * member who replied jumps to their reply; the return button (message triggers
+ * only) jumps back to the line that started the round.
+ *
+ * It conceptually reflects the *agents' processing progress*, not a specific
+ * message's read receipts — so a future event trigger, which has no user
+ * message, still shows a round's progress here.
  */
-export function ReadProgressBar({
-  message,
-  aiMembers,
-  repliedBy,
-  replyTargets,
-  onJumpToMessage,
-}: Props) {
+export function ReadProgressBar({ turn, personas, onJumpToMessage }: Props) {
   const { t } = useTranslation();
   const [opened, { open, close }] = useDisclosure(false);
+
+  // Resolve the turn's members to personas (in turn order), and derive the
+  // read/replied sets the shared classifier + receipts modal already understand,
+  // so the bar draws from live turn state while reusing the receipt UI unchanged.
+  const aiMembers = turn.members
+    .map((m) => personas.get(m.personaId))
+    .filter((p): p is Persona => !!p);
+  const readBy = turn.members.filter((m) => m.state !== 'pending').map((m) => m.personaId);
+  const repliedBy = turn.members.filter((m) => m.state === 'replied').map((m) => m.personaId);
+  const replyTargets = new Map(
+    turn.members
+      .filter((m): m is typeof m & { replyId: string } => m.replyId != null)
+      .map((m) => [m.personaId, m.replyId]),
+  );
+
   const { readSet, repliedSet, replied, readSilent, unread } = classifyReaders(
-    message.readBy,
+    readBy,
     aiMembers,
     repliedBy,
   );
-  // Show the readers furthest along first (replied → read → unread), so the ones
+  // Show the readers furthest along first (replied → read → pending), so the ones
   // that matter survive the cap; the rest collapse into a "+K" chip.
   const orderedReaders = [...replied, ...readSilent, ...unread];
   const shown = orderedReaders.slice(0, MAX_AVATARS);
   const overflow = orderedReaders.length - shown.length;
+
+  // What the round is about, and — for a message trigger only — the line to jump
+  // back to. An event trigger has just a label and nothing to jump to.
+  const triggerText = turn.trigger.kind === 'message' ? turn.trigger.text : turn.trigger.label;
+  const triggerMessageId = turn.trigger.kind === 'message' ? turn.trigger.messageId : undefined;
 
   return (
     <Box px="md" py={6} style={{ borderTop: '1px solid var(--mantine-color-default-border)' }}>
@@ -138,25 +157,27 @@ export function ReadProgressBar({
           )}
         </Group>
 
-        <Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0 }} title={message.text}>
-          {message.text}
+        <Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0 }} title={triggerText}>
+          {triggerText}
         </Text>
 
-        <Tooltip label={t('chat.jumpToMine')} withArrow>
-          <UnstyledButton
-            onClick={() => onJumpToMessage(message.id)}
-            aria-label={t('chat.jumpToMine')}
-            style={{ flexShrink: 0, color: 'var(--mantine-color-dimmed)', lineHeight: 0 }}
-          >
-            <IconArrowBackUp size={16} />
-          </UnstyledButton>
-        </Tooltip>
+        {triggerMessageId && (
+          <Tooltip label={t('chat.jumpToMine')} withArrow>
+            <UnstyledButton
+              onClick={() => onJumpToMessage(triggerMessageId)}
+              aria-label={t('chat.jumpToMine')}
+              style={{ flexShrink: 0, color: 'var(--mantine-color-dimmed)', lineHeight: 0 }}
+            >
+              <IconArrowBackUp size={16} />
+            </UnstyledButton>
+          </Tooltip>
+        )}
       </Box>
 
       <ReadReceiptsModal
         opened={opened}
         onClose={close}
-        readBy={message.readBy}
+        readBy={readBy}
         aiMembers={aiMembers}
         repliedBy={repliedBy}
         replyTargets={replyTargets}

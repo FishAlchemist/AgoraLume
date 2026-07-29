@@ -22,11 +22,12 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::state::AppState;
 
 /// Top-level API metadata. Paths and most schemas are contributed by the
-/// handlers; `ReadReceipt` is added explicitly because it only appears in the
-/// SSE stream (as a `read` event), never as a typed request/response body.
+/// handlers; `ReadReceipt` and `Turn` are added explicitly because they only
+/// appear in the SSE stream (as `read` and `turn` events), never as a typed
+/// request/response body.
 #[derive(OpenApi)]
 #[openapi(
-    components(schemas(crate::models::ReadReceipt)),
+    components(schemas(crate::models::ReadReceipt, crate::models::Turn)),
     info(
         title = "AgoraLume API",
         version = "0.1.0",

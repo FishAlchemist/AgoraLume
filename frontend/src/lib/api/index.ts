@@ -13,6 +13,7 @@ import type {
   ReadHandler,
   ServerMeta,
   SuggestionsHandler,
+  TurnHandler,
 } from './types';
 
 /**
@@ -58,6 +59,9 @@ class RoutingChatApi implements ChatApi {
   }
   subscribeActivity(groupId: string, handler: ActivityHandler): () => void {
     return this.impl().subscribeActivity(groupId, handler);
+  }
+  subscribeTurn(groupId: string, handler: TurnHandler): () => void {
+    return this.impl().subscribeTurn(groupId, handler);
   }
   getUsage(): Promise<DebugUsage> {
     return this.impl().getUsage();

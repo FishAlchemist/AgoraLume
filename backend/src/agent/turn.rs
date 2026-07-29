@@ -22,7 +22,7 @@ use crate::agent::brain::{
 };
 use crate::agent::event::{Event, Salience, appraise};
 use crate::agent::mock::RuleBrain;
-use crate::models::{AgentTrace, GroupSuggestions, Message, now_ms};
+use crate::models::{AgentTrace, GroupSuggestions, Message, TurnMemberState, TurnTrigger, now_ms};
 use crate::state::{AppState, GroupSummary};
 use crate::workspace::RosterMember;
 
@@ -134,6 +134,10 @@ pub async fn coordinator_loop(state: Arc<AppState>, group_id: String, mut rx: mp
             }
         };
         state.set_active(&group_id, false);
+        // The round has settled (completed or suspended): mark the turn finished so
+        // the pinned bar stops showing it as in-flight. Members still pending after
+        // a suspend stay pending — exactly the agents a retry would resume.
+        state.end_turn(&group_id);
         // Compress the older history once the turn has fully settled — not after a
         // suspend, whose failing provider would only fail the summary too. Running
         // here (idle, off the reply path) keeps the summarizing call's latency out
@@ -256,6 +260,19 @@ async fn run_turn(
     let mut injected_events: Vec<String> = Vec::new();
     if let Some(text) = trigger.as_context() {
         injected_events.push(text.to_string());
+    }
+
+    // Open (or, on a retry, resume) this group's turn so the pinned progress bar
+    // tracks it live — independently of how much history the client has loaded,
+    // and including event triggers that leave no user message. A fresh trigger
+    // (including one that preempted a running turn) is a new round; a retry keeps
+    // the held turn's already-processed members and re-runs only the rest.
+    let member_ids =
+        state.workspace().turn_members(group_id).map(|(_, ids)| ids).unwrap_or_default();
+    if resuming {
+        state.resume_turn(group_id);
+    } else {
+        state.start_turn(group_id, turn_trigger(state, group_id, &trigger), &member_ids);
     }
 
     let mut rng = Rng::new(cfg.seed.unwrap_or_else(time_seed));
@@ -427,11 +444,13 @@ async fn run_turn(
                 state.persist_workspace();
             }
 
-            // Phase 4: route the decision to the two streams.
+            // Phase 4: route the decision to the two streams. A spoken line's id
+            // is captured as this member's reply target for the progress bar.
+            let mut reply_id: Option<String> = None;
             match action {
                 Action::Speak => {
                     if let Some(text) = message {
-                        emit_message(state, group_id, &persona_id, text);
+                        reply_id = Some(emit_message(state, group_id, &persona_id, text));
                         spoke_this_round = true;
                     }
                 }
@@ -441,7 +460,7 @@ async fn run_turn(
                     }
                     pace(cfg).await;
                     if let Some(text) = message {
-                        emit_message(state, group_id, &persona_id, text);
+                        reply_id = Some(emit_message(state, group_id, &persona_id, text));
                         spoke_this_round = true;
                     }
                 }
@@ -457,6 +476,13 @@ async fn run_turn(
             if let Some(message_id) = &read_target {
                 state.mark_read(group_id, message_id, &persona_id);
             }
+            // Record the member's progress on the live turn: replied if it spoke,
+            // else read (a mood or a silent read alike). This is the event-safe
+            // counterpart to the read receipt above — it needs no trigger message,
+            // so an environment-triggered round still shows per-member progress.
+            let member_state =
+                if reply_id.is_some() { TurnMemberState::Replied } else { TurnMemberState::Read };
+            state.set_turn_member(group_id, &persona_id, member_state, reply_id);
 
             // Handover: fold any soft events into the context for the next agent.
             injected_events.append(&mut pending_soft);
@@ -482,9 +508,35 @@ fn action_label(action: Action) -> &'static str {
     }
 }
 
-/// Emits a spoken line to the group (Context Stream + UI View).
-fn emit_message(state: &AppState, group_id: &str, persona_id: &str, text: String) {
-    state.emit(group_id, Message::conversation(group_id, persona_id, text, None));
+/// Emits a spoken line to the group (Context Stream + UI View), returning its id
+/// so the caller can record it as the speaker's reply target for the turn.
+fn emit_message(state: &AppState, group_id: &str, persona_id: &str, text: String) -> String {
+    let message = Message::conversation(group_id, persona_id, text, None);
+    let id = message.id().to_string();
+    state.emit(group_id, message);
+    id
+}
+
+/// Builds the pinned-bar trigger for a turn from the event that started it. A
+/// user message carries its author and text (looked up from the just-stored
+/// line) so the bar can render it even when that line is outside the client's
+/// loaded window; an environment event carries its description as the label.
+fn turn_trigger(state: &AppState, group_id: &str, event: &Event) -> TurnTrigger {
+    match event {
+        Event::User { message_id } => {
+            let found = state.list(group_id).into_iter().find_map(|m| match m {
+                Message::Conversation { id, persona_id, text, .. } if id == *message_id => {
+                    Some((persona_id, text))
+                }
+                _ => None,
+            });
+            let (persona_id, text) = found.unwrap_or_default();
+            TurnTrigger::Message { message_id: message_id.clone(), persona_id, text }
+        }
+        Event::Environment { description, .. } => TurnTrigger::Event { label: description.clone() },
+        // A retry is resolved to its held trigger before run_turn — never here.
+        Event::Retry => TurnTrigger::Event { label: String::new() },
+    }
 }
 
 /// Emits a mood to the group (UI View only — moods never enter the Context).
@@ -1108,6 +1160,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_tracks_each_members_progress() {
+        let state = app(Arc::new(RuleBrain::seeded(42)), cfg());
+        let mid = store_user(&state, "lab", "hello aria");
+        run_once(&state, "lab", Event::User { message_id: mid.clone() }).await;
+
+        let turn = state.current_turn("lab").expect("a turn should exist");
+        // The trigger carries the user's line whole, so the bar can render it even
+        // when that message is outside the client's loaded window.
+        match turn.trigger {
+            TurnTrigger::Message { message_id, text, .. } => {
+                assert_eq!(message_id, mid);
+                assert_eq!(text, "hello aria");
+            }
+            TurnTrigger::Event { .. } => panic!("expected a message trigger"),
+        }
+        // Both AI members processed (none left pending), and a reply id is present
+        // exactly for the members that spoke — the avatar jump targets.
+        assert_eq!(turn.members.len(), 2);
+        for member in &turn.members {
+            assert_ne!(member.state, TurnMemberState::Pending);
+            assert_eq!(member.reply_id.is_some(), member.state == TurnMemberState::Replied);
+        }
+    }
+
+    #[tokio::test]
+    async fn event_trigger_produces_a_turn_with_no_message() {
+        let state = app(Arc::new(RuleBrain::seeded(7)), cfg());
+        // No user message: an environment event drives the round. There is no read
+        // receipt to hang progress on, so the turn is the only thing that carries it.
+        run_once(
+            &state,
+            "lab",
+            Event::Environment { description: "It starts to rain.".into(), urgent: false },
+        )
+        .await;
+
+        let turn = state.current_turn("lab").expect("an event turn should exist");
+        match turn.trigger {
+            TurnTrigger::Event { label } => assert_eq!(label, "It starts to rain."),
+            TurnTrigger::Message { .. } => panic!("expected an event trigger"),
+        }
+        // Members are still tracked, so the bar shows processing progress for a
+        // trigger that has no message behind it.
+        assert_eq!(turn.members.len(), 2);
+        assert!(turn.members.iter().all(|m| m.state != TurnMemberState::Pending));
+    }
+
+    #[tokio::test]
+    async fn reconstructs_a_turn_from_the_log_when_none_is_live() {
+        // No coordinator ran this process (like a fresh restart): current_turn must
+        // rebuild the bar's turn from the stored log — the last line "you" sent,
+        // plus who read and who replied.
+        let state = AppState::with_runtime(AgentRuntime::mock());
+        let mid = store_user(&state, "lab", "dinner?");
+        state.mark_read("lab", &mid, "aria");
+        state.emit("lab", Message::conversation("lab", "aria", "pizza!", None));
+
+        let turn = state.current_turn("lab").expect("a turn should reconstruct");
+        assert!(!turn.active);
+        let aria = turn.members.iter().find(|m| m.persona_id == "aria").unwrap();
+        assert_eq!(aria.state, TurnMemberState::Replied);
+        assert!(aria.reply_id.is_some());
+        // Nox neither read nor replied — still pending.
+        let nox = turn.members.iter().find(|m| m.persona_id == "nox").unwrap();
+        assert_eq!(nox.state, TurnMemberState::Pending);
+    }
+
+    #[tokio::test]
     async fn silence_terminates_after_one_round() {
         let calls = Arc::new(AtomicUsize::new(0));
         let brain = Arc::new(CountingReadBrain { calls: calls.clone() });
@@ -1129,7 +1249,10 @@ mod tests {
             match event {
                 StreamEvent::Message(_) => messages += 1,
                 StreamEvent::Read(_) => reads += 1,
-                StreamEvent::Activity(_) | StreamEvent::Debug(_) | StreamEvent::Suggestions(_) => {}
+                StreamEvent::Activity(_)
+                | StreamEvent::Turn(_)
+                | StreamEvent::Debug(_)
+                | StreamEvent::Suggestions(_) => {}
             }
         }
         assert_eq!(messages, 0);

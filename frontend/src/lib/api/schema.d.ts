@@ -80,8 +80,9 @@ export interface paths {
   "/groups/{id}/stream": {
     /**
      * Server-Sent Events for a group: default `message` events (AI replies and
-     * moods), named `read` events (read receipts), and named `activity` events
-     * (the agent loop turning busy/idle).
+     * moods), named `read` events (read receipts), named `activity` events (the
+     * agent loop turning busy/idle), and named `turn` events (the current
+     * processing round's per-member progress, seeded on connect).
      */
     get: operations["stream"];
   };
@@ -537,6 +538,65 @@ export interface components {
        */
       totalTokens: number;
     };
+    /**
+     * @description A processing round: what triggered it and how far each AI member has got.
+     * Owned by the backend and streamed independently of message history (a named
+     * `turn` SSE frame, seeded on connect), so the pinned progress bar reflects the
+     * *current* processing state whether or not the trigger line is in the loaded
+     * window — and shows progress for event triggers that have no user message at
+     * all. `active` tracks whether the coordinator is still running the round.
+     */
+    Turn: {
+      /** @description Whether the coordinator is still running this turn. */
+      active: boolean;
+      groupId: string;
+      id: string;
+      /**
+       * @description The AI members participating, in the group's member order, each with its
+       * progress this round.
+       */
+      members: components["schemas"]["TurnMember"][];
+      /**
+       * Format: int64
+       * @description Epoch millis when the turn started.
+       */
+      startedAt: number;
+      trigger: components["schemas"]["TurnTrigger"];
+    };
+    /** @description One AI member's progress within a turn. */
+    TurnMember: {
+      personaId: string;
+      /**
+       * @description The id of this member's first reply line this turn — the avatar's jump
+       * target. Present only once `state` is `replied`.
+       */
+      replyId?: string | null;
+      state: components["schemas"]["TurnMemberState"];
+    };
+    /**
+     * @description How far one AI member has got in the current turn — the buckets the pinned
+     * progress bar tints avatars by. Mirrors a read receipt's meaning but is
+     * turn-scoped rather than message-scoped, so it works for an event trigger that
+     * has no message to hang a receipt on.
+     * @enum {string}
+     */
+    TurnMemberState: "pending" | "read" | "replied";
+    /**
+     * @description What kicked off a turn: a conversation line someone sent, or an environment
+     * event that carries no message of its own. Tagged by `kind` to match the
+     * TypeScript union.
+     */
+    TurnTrigger: OneOf<[{
+      /** @enum {string} */
+      kind: "message";
+      messageId: string;
+      personaId: string;
+      text: string;
+    }, {
+      /** @enum {string} */
+      kind: "event";
+      label: string;
+    }]>;
   };
   responses: never;
   parameters: never;
@@ -866,8 +926,9 @@ export interface operations {
   };
   /**
    * Server-Sent Events for a group: default `message` events (AI replies and
-   * moods), named `read` events (read receipts), and named `activity` events
-   * (the agent loop turning busy/idle).
+   * moods), named `read` events (read receipts), named `activity` events (the
+   * agent loop turning busy/idle), and named `turn` events (the current
+   * processing round's per-member progress, seeded on connect).
    */
   stream: {
     parameters: {
@@ -877,7 +938,7 @@ export interface operations {
       };
     };
     responses: {
-      /** @description text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions */
+      /** @description text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `turn` frames carry a Turn, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions */
       200: {
         content: never;
       };

@@ -1,6 +1,20 @@
-import type { GroupSuggestions, Message } from '../../types';
+import type { GroupSuggestions, Message, Turn } from '../../types';
+
+/**
+ * Upper bound on the initial history page, matching the backend's `INITIAL_CAP`.
+ * When a group is opened with more unread than this (e.g. many event-triggered
+ * turns piled up while the user was away), the tail is loaded and the rest pages
+ * in — so a page returned at exactly this length means the unread run was
+ * truncated and more unread lines exist above the loaded window. The frontend
+ * mock mirrors the same bound, and the read-tracking divider uses it to tell a
+ * capped backlog from a page that simply starts at the first unread line.
+ */
+export const INITIAL_PAGE_CAP = 160;
 
 export type MessageHandler = (message: Message) => void;
+
+/** A turn snapshot: the current processing round's trigger + per-member progress. */
+export type TurnHandler = (turn: Turn) => void;
 
 /** Options for paging message history — see {@link ChatApi.listMessages}. */
 export interface HistoryPage {
@@ -153,6 +167,16 @@ export interface ChatApi {
    * unsubscribe function.
    */
   subscribeActivity(groupId: string, handler: ActivityHandler): () => void;
+
+  /**
+   * Subscribes to the group's current-turn snapshots: what triggered the round
+   * (a user message, or an event with no message) and each AI member's progress
+   * (pending / read / replied). The backend seeds the latest turn on connect and
+   * pushes an update on every change, so the pinned progress bar reflects live
+   * processing state independently of the loaded message window. Returns an
+   * unsubscribe function.
+   */
+  subscribeTurn(groupId: string, handler: TurnHandler): () => void;
 
   /**
    * The group's cached conversation suggestions. Returns immediately from the

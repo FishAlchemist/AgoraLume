@@ -285,12 +285,13 @@ struct ActivityFrame {
 }
 
 /// Server-Sent Events for a group: default `message` events (AI replies and
-/// moods), named `read` events (read receipts), and named `activity` events
-/// (the agent loop turning busy/idle).
+/// moods), named `read` events (read receipts), named `activity` events (the
+/// agent loop turning busy/idle), and named `turn` events (the current
+/// processing round's per-member progress, seeded on connect).
 #[utoipa::path(get, path = "/groups/{id}/stream", tag = "chat",
     params(("id" = String, Path, description = "Group id")),
     responses((status = 200,
-        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions")))]
+        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `turn` frames carry a Turn, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions")))]
 async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
     // Subscribe before reading the activity flag: any change that races this
     // arrives on `live` afterwards, so the seed can only be stale, never lost.
@@ -307,7 +308,14 @@ async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> i
     // missed the `activity` frames broadcast while it was down, so without this
     // its composer lock could stay stuck until a manual refresh.
     let seed = tokio_stream::iter(to_sse_event(Ok(StreamEvent::Activity(state.is_active(&id)))));
-    let events = opened.chain(seed).chain(live);
+    // Seed the current turn too, so the pinned progress bar shows the group's
+    // latest processing state the instant the client connects — independently of
+    // how much message history it loads, and even for an event-triggered round
+    // that left no user message to reconstruct it from.
+    let turn_seed = tokio_stream::iter(
+        state.current_turn(&id).and_then(|turn| to_sse_event(Ok(StreamEvent::Turn(turn)))),
+    );
+    let events = opened.chain(seed).chain(turn_seed).chain(live);
     Sse::new(events).keep_alive(KeepAlive::default())
 }
 
@@ -327,6 +335,7 @@ fn to_sse_event(
         StreamEvent::Suggestions(suggestions) => {
             Event::default().event("suggestions").json_data(suggestions).ok()?
         }
+        StreamEvent::Turn(turn) => Event::default().event("turn").json_data(turn).ok()?,
     };
     Some(Ok(event))
 }

@@ -1,5 +1,12 @@
 import { useWorkspace } from '../../store/workspace';
-import type { GroupSuggestions, Message } from '../../types';
+import type {
+  ConversationMessage,
+  GroupSuggestions,
+  Message,
+  Turn,
+  TurnMember,
+  TurnMemberState,
+} from '../../types';
 import type {
   ActivityHandler,
   AgentTrace,
@@ -11,12 +18,17 @@ import type {
   ReadHandler,
   ServerMeta,
   SuggestionsHandler,
+  TurnHandler,
 } from './types';
+import { INITIAL_PAGE_CAP } from './types';
 
 let seq = 0;
 const nextId = () => `m${Date.now()}-${seq++}`;
 
 const MOODS = ['🙂 pleased', '🤔 thinking', '✨ inspired', '😆 amused'];
+
+/** Orders member states so a turn update only ever advances a member. */
+const STATE_RANK: Record<TurnMemberState, number> = { pending: 0, read: 1, replied: 2 };
 
 /**
  * A self-contained backend that lives entirely in the browser. It lets the
@@ -29,6 +41,10 @@ export class MockChatApi implements ChatApi {
   private subs = new Map<string, Set<MessageHandler>>();
   private readSubs = new Map<string, Set<ReadHandler>>();
   private activitySubs = new Map<string, Set<ActivityHandler>>();
+  private turnSubs = new Map<string, Set<TurnHandler>>();
+  // The current (or most recent) turn per group — mirrors the backend's live turn
+  // state that drives the pinned progress bar.
+  private turns: Record<string, Turn> = {};
 
   async probe(): Promise<ServerMeta> {
     // The mock runs entirely in-browser — always reachable, always mock mode.
@@ -49,7 +65,8 @@ export class MockChatApi implements ChatApi {
       return opts.limit != null ? slice.slice(Math.max(0, slice.length - opts.limit)) : slice;
     }
     // Initial page: the newest `limit`, extended back to include everything newer
-    // than `since` (the read mark) so the whole unread run is present.
+    // than `since` (the read mark) so the unread run is present — but capped at
+    // INITIAL_CAP so a large backlog doesn't load whole (older lines page in).
     const byLimit = opts?.limit != null ? Math.max(0, all.length - opts.limit) : 0;
     const bySince =
       opts?.since != null
@@ -58,7 +75,8 @@ export class MockChatApi implements ChatApi {
             return i === -1 ? all.length : i;
           })()
         : all.length;
-    return all.slice(Math.min(byLimit, bySince));
+    const byCap = Math.max(0, all.length - INITIAL_PAGE_CAP);
+    return all.slice(Math.max(Math.min(byLimit, bySince), byCap));
   }
 
   async sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {
@@ -80,7 +98,7 @@ export class MockChatApi implements ChatApi {
     };
     this.messages[groupId] ??= [];
     this.messages[groupId].push(msg);
-    this.scheduleTurn(groupId, msg.id, text);
+    this.scheduleTurn(groupId, msg, text);
     return msg;
   }
 
@@ -105,6 +123,18 @@ export class MockChatApi implements ChatApi {
     const set = this.activitySubs.get(groupId) ?? new Set<ActivityHandler>();
     set.add(handler);
     this.activitySubs.set(groupId, set);
+    return () => set.delete(handler);
+  }
+
+  subscribeTurn(groupId: string, handler: TurnHandler): () => void {
+    const set = this.turnSubs.get(groupId) ?? new Set<TurnHandler>();
+    set.add(handler);
+    this.turnSubs.set(groupId, set);
+    // Seed the just-subscribed handler with the current turn, matching the HTTP
+    // backend's connect-time seed: the live turn if one is running/held, else one
+    // reconstructed from the log (the last line "you" sent) so the bar shows up.
+    const seed = this.turns[groupId] ?? this.reconstructTurn(groupId);
+    if (seed) handler(seed);
     return () => set.delete(handler);
   }
 
@@ -145,6 +175,62 @@ export class MockChatApi implements ChatApi {
     for (const handler of this.activitySubs.get(groupId) ?? []) handler(active);
   }
 
+  /** Stores a turn as the group's current one and notifies turn subscribers. */
+  private emitTurn(groupId: string, turn: Turn): void {
+    this.turns[groupId] = turn;
+    for (const handler of this.turnSubs.get(groupId) ?? []) handler(turn);
+  }
+
+  /**
+   * Advances one member's progress in the group's current turn (never walks it
+   * back) and re-emits the snapshot — the mock counterpart to the backend's
+   * per-member turn updates.
+   */
+  private updateTurnMember(
+    groupId: string,
+    personaId: string,
+    state: TurnMemberState,
+    replyId?: string,
+  ): void {
+    const turn = this.turns[groupId];
+    if (!turn) return;
+    const members = turn.members.map((m) => {
+      if (m.personaId !== personaId || STATE_RANK[state] < STATE_RANK[m.state]) return m;
+      return { ...m, state, replyId: m.replyId ?? replyId };
+    });
+    this.emitTurn(groupId, { ...turn, members });
+  }
+
+  /** Rebuilds a message-triggered turn from the log — the last line "you" sent,
+   * plus who read/replied — so a fresh subscriber sees the bar even with no live
+   * turn. Mirrors the backend's reconstruction. */
+  private reconstructTurn(groupId: string): Turn | undefined {
+    const all = this.messages[groupId] ?? [];
+    const state = useWorkspace.getState();
+    const group = state.groups.find((g) => g.id === groupId);
+    if (!group) return undefined;
+    const selfId = group.selfPersonaId || state.personas.find((p) => p.kind === 'user')?.id;
+    if (!selfId) return undefined;
+    const aiIds = group.personaIds.filter(
+      (id) => state.personas.find((p) => p.id === id)?.kind === 'ai',
+    );
+    const trigger = lastSelfMessage(all, selfId);
+    if (!trigger) return undefined;
+    const replyOf = firstRepliesAfter(all, trigger.id, selfId, aiIds);
+    const readBy = new Set(trigger.readBy ?? []);
+    const members: TurnMember[] = aiIds.map((id) =>
+      turnMember(id, replyOf.get(id), readBy.has(id)),
+    );
+    return {
+      id: trigger.id,
+      groupId,
+      trigger: { kind: 'message', messageId: trigger.id, personaId: selfId, text: trigger.text },
+      startedAt: trigger.ts,
+      active: false,
+      members,
+    };
+  }
+
   private emit(groupId: string, message: Message): void {
     this.messages[groupId] ??= [];
     this.messages[groupId].push(message);
@@ -171,7 +257,7 @@ export class MockChatApi implements ChatApi {
    * persona's read receipt fires when its turn finishes, so "all read" lines up
    * with "everyone is done".
    */
-  private scheduleTurn(groupId: string, messageId: string, userText: string): void {
+  private scheduleTurn(groupId: string, trigger: Message, userText: string): void {
     const state = useWorkspace.getState();
     const group = state.groups.find((g) => g.id === groupId);
     const aiIds = new Set(state.personas.filter((p) => p.kind === 'ai').map((p) => p.id));
@@ -181,10 +267,29 @@ export class MockChatApi implements ChatApi {
     const replier = readers[Math.floor(Math.random() * readers.length)];
     const mood = MOODS[Math.floor(Math.random() * MOODS.length)];
 
+    // Open the turn: every reader starts pending. Drives the pinned progress bar,
+    // independently of the loaded message window.
+    this.emitTurn(groupId, {
+      id: `t${nextId()}`,
+      groupId,
+      trigger:
+        trigger.kind === 'conversation'
+          ? { kind: 'message', messageId: trigger.id, personaId: trigger.personaId, text: userText }
+          : { kind: 'event', label: userText },
+      startedAt: Date.now(),
+      active: true,
+      members: readers.map((id) => ({ personaId: id, state: 'pending' as TurnMemberState })),
+    });
+
     // The loop is busy until the last reader finishes; the composer gates on it.
     this.setActive(groupId, true);
     const doneAt = Math.max(1100, 400 + (readers.length - 1) * 160) + 50;
-    setTimeout(() => this.setActive(groupId, false), doneAt);
+    setTimeout(() => {
+      this.setActive(groupId, false);
+      // Mark the turn finished, keeping each member's final state.
+      const turn = this.turns[groupId];
+      if (turn) this.emitTurn(groupId, { ...turn, active: false });
+    }, doneAt);
 
     let i = 0;
     for (const id of readers) {
@@ -200,19 +305,27 @@ export class MockChatApi implements ChatApi {
           });
         }, 500);
         setTimeout(() => {
-          this.emit(groupId, {
+          const reply: Message = {
             id: nextId(),
             groupId,
             personaId: id,
             kind: 'conversation',
             text: mockReply(userText),
             ts: Date.now(),
-          });
-          this.markRead(groupId, messageId, id);
+          };
+          this.emit(groupId, reply);
+          this.markRead(groupId, trigger.id, id);
+          this.updateTurnMember(groupId, id, 'replied', reply.id);
         }, 1100);
       } else {
         // Read-but-don't-reply: acknowledge processing without a message.
-        setTimeout(() => this.markRead(groupId, messageId, id), 400 + i * 160);
+        setTimeout(
+          () => {
+            this.markRead(groupId, trigger.id, id);
+            this.updateTurnMember(groupId, id, 'read');
+          },
+          400 + i * 160,
+        );
       }
       i += 1;
     }
@@ -260,6 +373,40 @@ function seed(): Record<string, Message[]> {
       },
     ],
   };
+}
+
+/** The last line the given identity sent — the trigger a reconstructed turn pins. */
+function lastSelfMessage(all: Message[], selfId: string): ConversationMessage | undefined {
+  for (let i = all.length - 1; i >= 0; i--) {
+    const m = all[i];
+    if (m.kind === 'conversation' && m.personaId === selfId) return m;
+  }
+  return undefined;
+}
+
+/** Each AI member's first reply after `triggerId`, until the user speaks again. */
+function firstRepliesAfter(
+  all: Message[],
+  triggerId: string,
+  selfId: string,
+  aiIds: string[],
+): Map<string, string> {
+  const replyOf = new Map<string, string>();
+  const start = all.findIndex((m) => m.id === triggerId);
+  if (start === -1) return replyOf;
+  for (let i = start + 1; i < all.length; i++) {
+    const m = all[i];
+    if (m.kind !== 'conversation') continue;
+    if (m.personaId === selfId) break;
+    if (aiIds.includes(m.personaId) && !replyOf.has(m.personaId)) replyOf.set(m.personaId, m.id);
+  }
+  return replyOf;
+}
+
+/** One reconstructed member's progress: replied (with jump target) > read > pending. */
+function turnMember(personaId: string, replyId: string | undefined, read: boolean): TurnMember {
+  const state: TurnMemberState = replyId ? 'replied' : read ? 'read' : 'pending';
+  return { personaId, state, replyId };
 }
 
 function mockReply(userText: string): string {

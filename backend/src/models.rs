@@ -375,6 +375,72 @@ pub struct ReadReceipt {
     pub persona_id: String,
 }
 
+/// How far one AI member has got in the current turn — the buckets the pinned
+/// progress bar tints avatars by. Mirrors a read receipt's meaning but is
+/// turn-scoped rather than message-scoped, so it works for an event trigger that
+/// has no message to hang a receipt on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnMemberState {
+    /// Not yet processed this turn: still working, or never reached (a turn
+    /// suspended by a failed inference leaves the agents after it pending).
+    Pending,
+    /// Processed and chose not to speak (read silently).
+    Read,
+    /// Processed and spoke.
+    Replied,
+}
+
+/// One AI member's progress within a turn.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnMember {
+    pub persona_id: String,
+    pub state: TurnMemberState,
+    /// The id of this member's first reply line this turn — the avatar's jump
+    /// target. Present only once `state` is `replied`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_id: Option<String>,
+}
+
+/// What kicked off a turn: a conversation line someone sent, or an environment
+/// event that carries no message of its own. Tagged by `kind` to match the
+/// TypeScript union.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TurnTrigger {
+    /// A user (or persona) message. `messageId` locates it in the log; `text` and
+    /// `personaId` are carried so the bar can render the trigger even when that
+    /// line is outside the client's loaded history window.
+    #[serde(rename_all = "camelCase")]
+    Message { message_id: String, persona_id: String, text: String },
+    /// An environment event — rain, time passing, an emergency. `label` is the
+    /// description shown; there is no message to jump to.
+    #[serde(rename_all = "camelCase")]
+    Event { label: String },
+}
+
+/// A processing round: what triggered it and how far each AI member has got.
+/// Owned by the backend and streamed independently of message history (a named
+/// `turn` SSE frame, seeded on connect), so the pinned progress bar reflects the
+/// *current* processing state whether or not the trigger line is in the loaded
+/// window — and shows progress for event triggers that have no user message at
+/// all. `active` tracks whether the coordinator is still running the round.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Turn {
+    pub id: String,
+    pub group_id: String,
+    pub trigger: TurnTrigger,
+    /// Epoch millis when the turn started.
+    pub started_at: i64,
+    /// Whether the coordinator is still running this turn.
+    pub active: bool,
+    /// The AI members participating, in the group's member order, each with its
+    /// progress this round.
+    pub members: Vec<TurnMember>,
+}
+
 /// Token usage for one LLM inference. Zero across the board when the provider
 /// reports nothing; entirely absent (on the trace) for the rule-based mock,
 /// which makes no LLM call.

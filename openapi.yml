@@ -375,8 +375,9 @@ paths:
       - chat
       summary: |-
         Server-Sent Events for a group: default `message` events (AI replies and
-        moods), named `read` events (read receipts), and named `activity` events
-        (the agent loop turning busy/idle).
+        moods), named `read` events (read receipts), named `activity` events (the
+        agent loop turning busy/idle), and named `turn` events (the current
+        processing round's per-member progress, seeded on connect).
       operationId: stream
       parameters:
       - name: id
@@ -387,7 +388,7 @@ paths:
           type: string
       responses:
         '200':
-          description: 'text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions'
+          description: 'text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `turn` frames carry a Turn, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions'
   /groups/{id}/suggestions:
     get:
       tags:
@@ -1425,6 +1426,113 @@ components:
             Total tokens the provider reported (or input+output when it only gives
             the two).
           minimum: 0
+    Turn:
+      type: object
+      description: |-
+        A processing round: what triggered it and how far each AI member has got.
+        Owned by the backend and streamed independently of message history (a named
+        `turn` SSE frame, seeded on connect), so the pinned progress bar reflects the
+        *current* processing state whether or not the trigger line is in the loaded
+        window — and shows progress for event triggers that have no user message at
+        all. `active` tracks whether the coordinator is still running the round.
+      required:
+      - id
+      - groupId
+      - trigger
+      - startedAt
+      - active
+      - members
+      properties:
+        active:
+          type: boolean
+          description: Whether the coordinator is still running this turn.
+        groupId:
+          type: string
+        id:
+          type: string
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/TurnMember'
+          description: |-
+            The AI members participating, in the group's member order, each with its
+            progress this round.
+        startedAt:
+          type: integer
+          format: int64
+          description: Epoch millis when the turn started.
+        trigger:
+          $ref: '#/components/schemas/TurnTrigger'
+    TurnMember:
+      type: object
+      description: One AI member's progress within a turn.
+      required:
+      - personaId
+      - state
+      properties:
+        personaId:
+          type: string
+        replyId:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The id of this member's first reply line this turn — the avatar's jump
+            target. Present only once `state` is `replied`.
+        state:
+          $ref: '#/components/schemas/TurnMemberState'
+    TurnMemberState:
+      type: string
+      description: |-
+        How far one AI member has got in the current turn — the buckets the pinned
+        progress bar tints avatars by. Mirrors a read receipt's meaning but is
+        turn-scoped rather than message-scoped, so it works for an event trigger that
+        has no message to hang a receipt on.
+      enum:
+      - pending
+      - read
+      - replied
+    TurnTrigger:
+      oneOf:
+      - type: object
+        description: |-
+          A user (or persona) message. `messageId` locates it in the log; `text` and
+          `personaId` are carried so the bar can render the trigger even when that
+          line is outside the client's loaded history window.
+        required:
+        - messageId
+        - personaId
+        - text
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - message
+          messageId:
+            type: string
+          personaId:
+            type: string
+          text:
+            type: string
+      - type: object
+        description: |-
+          An environment event — rain, time passing, an emergency. `label` is the
+          description shown; there is no message to jump to.
+        required:
+        - label
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - event
+          label:
+            type: string
+      description: |-
+        What kicked off a turn: a conversation line someone sent, or an environment
+        event that carries no message of its own. Tagged by `kind` to match the
+        TypeScript union.
 tags:
 - name: service
   description: Liveness and server mode

@@ -12,12 +12,13 @@ import { IconArrowDown } from '@tabler/icons-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
+import { INITIAL_PAGE_CAP } from '../lib/api/types';
 import { useChatReadTracking } from '../lib/useChatReadTracking';
 import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
 import { useReadState } from '../store/readState';
 import { useWorkspace } from '../store/workspace';
-import type { ConversationMessage, Group, Message, Persona } from '../types';
+import type { Group, Message, Persona, Turn } from '../types';
 import { Composer } from './Composer';
 import { MessageItem } from './MessageItem';
 import { ReadProgressBar } from './ReadProgressBar';
@@ -95,30 +96,6 @@ function compareMessages(a: Message, b: Message): number {
   return a.ts - b.ts || seqOf(a.id) - seqOf(b.id);
 }
 
-/**
- * For the anchor line (your latest message), the id of each AI member's first
- * reply — walking forward until your next line closes the window. Members who
- * only read silently get no entry, so the progress bar knows which avatars have
- * somewhere to jump to.
- */
-function firstRepliesAfter(
-  ordered: Message[],
-  anchorId: string,
-  aiIds: Set<string>,
-  selfId: string | undefined,
-): Map<string, string> {
-  const targets = new Map<string, string>();
-  const start = ordered.findIndex((m) => m.id === anchorId);
-  if (start === -1) return targets;
-  for (let i = start + 1; i < ordered.length; i++) {
-    const m = ordered[i];
-    if (m.kind !== 'conversation') continue;
-    if (m.personaId === selfId) break;
-    if (aiIds.has(m.personaId) && !targets.has(m.personaId)) targets.set(m.personaId, m.id);
-  }
-  return targets;
-}
-
 /** Local midnight for a timestamp, so two messages compare equal iff same calendar day. */
 function startOfDay(ts: number): number {
   const d = new Date(ts);
@@ -171,12 +148,23 @@ export function ChatView({ group, personas }: Props) {
   const [hasEarlier, setHasEarlier] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const loadingEarlierRef = useRef(false);
+  // True when the initial page was capped mid-unread — i.e. more unread lines
+  // exist above the loaded window (a large backlog was truncated). It lets the
+  // read tracking hold the "new messages" divider back until an earlier page
+  // brings the true read boundary into view, rather than drawing it at the top of
+  // a window that is entirely unread.
+  const [unreadAbove, setUnreadAbove] = useState(false);
   // Pre-prepend scroll metrics, so the layout effect can hold the reader's place
   // when an earlier page grows the content above them.
   const pendingAnchor = useRef<{ height: number; top: number } | null>(null);
   // The agent loop's busy/idle state, driven by the backend's activity signal.
   // The composer stays locked while busy, so a message can't interleave a turn.
   const [busy, setBusy] = useState(false);
+  // The current processing round — trigger + per-member progress — streamed from
+  // the backend and seeded on connect, independently of the loaded history. It,
+  // not the message window, drives the pinned progress bar, so the bar shows even
+  // when the trigger line has paged out and for event triggers with no message.
+  const [currentTurn, setCurrentTurn] = useState<Turn | null>(null);
   // Server-generated conversation openers; the frontend only fetches & displays.
   const [suggestions, setSuggestions] = useState<string[]>([]);
   // A chip click pushes its text into the composer (never sends). The nonce lets
@@ -209,7 +197,7 @@ export function ChatView({ group, personas }: Props) {
     followToBottom,
     jumpToMessage,
     resetForReload,
-  } = useChatReadTracking(group.id, ordered, selfId);
+  } = useChatReadTracking(group.id, ordered, selfId, unreadAbove);
 
   // Ends an in-flight manual regenerate: cancels its safety timer and drops the
   // loader. Leaves whatever suggestions are currently shown in place.
@@ -264,10 +252,12 @@ export function ChatView({ group, personas }: Props) {
     let active = true;
     setMessages(null);
     setHasEarlier(false);
+    setUnreadAbove(false);
     setLoadingEarlier(false);
     loadingEarlierRef.current = false;
     pendingAnchor.current = null;
     setBusy(false);
+    setCurrentTurn(null);
     setSuggestions([]);
     finishRegen();
     reads.current = new Map();
@@ -283,6 +273,9 @@ export function ChatView({ group, personas }: Props) {
       if (!active) return;
       setMessages(applyReads(initial, reads.current));
       setHasEarlier(initial.length >= PAGE_SIZE);
+      // A full page (== the cap) means the unread run was truncated: more unread
+      // sits above the window, so the divider stays hidden until it pages in.
+      setUnreadAbove(initial.length >= INITIAL_PAGE_CAP);
     });
 
     // Fetch the cached openers on open; a stale set kicks a background regen on
@@ -310,11 +303,16 @@ export function ChatView({ group, personas }: Props) {
     // The composer unlocks only when the whole agent loop reports idle.
     const unsubscribeActivity = api.subscribeActivity(group.id, setBusy);
 
+    // The pinned progress bar's source of truth: the backend seeds the current
+    // turn on connect and pushes an update on every member's progress.
+    const unsubscribeTurn = api.subscribeTurn(group.id, setCurrentTurn);
+
     return () => {
       active = false;
       unsubscribe();
       unsubscribeReads();
       unsubscribeActivity();
+      unsubscribeTurn();
       unsubscribeSuggestions();
       finishRegen();
     };
@@ -400,16 +398,6 @@ export function ChatView({ group, personas }: Props) {
     el.scrollTop = anchor.top + (el.scrollHeight - anchor.height);
   }, [messages]);
 
-  // The newest line you sent — the one the pinned progress bar tracks.
-  const lastSelfMessage = useMemo(() => {
-    if (!ordered) return undefined;
-    for (let i = ordered.length - 1; i >= 0; i--) {
-      const m = ordered[i];
-      if (m.kind === 'conversation' && m.personaId === selfId) return m as ConversationMessage;
-    }
-    return undefined;
-  }, [ordered, selfId]);
-
   // For each of your messages, which AI ids replied to it (until the next of yours).
   const replyMap = useMemo(() => {
     const map = new Map<string, Set<string>>();
@@ -426,20 +414,6 @@ export function ChatView({ group, personas }: Props) {
     }
     return map;
   }, [ordered, selfId, aiMembers]);
-
-  // Which AI ids replied to your latest line — passed to the pinned progress bar.
-  const lastSelfReplied = useMemo(() => {
-    const set = lastSelfMessage ? replyMap.get(lastSelfMessage.id) : undefined;
-    return set ? [...set] : undefined;
-  }, [replyMap, lastSelfMessage]);
-
-  // For your latest line, each replying member's first reply id — the target the
-  // progress bar's avatar jumps to. Silent readers get no entry (nothing to jump to).
-  const lastSelfReplyTargets = useMemo(() => {
-    if (!ordered || !lastSelfMessage) return new Map<string, string>();
-    const aiIds = new Set(aiMembers.map((p) => p.id));
-    return firstRepliesAfter(ordered, lastSelfMessage.id, aiIds, selfId);
-  }, [ordered, lastSelfMessage, aiMembers, selfId]);
 
   // Bucket the ordered lines into consecutive same-day runs. Each run renders as
   // its own block with a sticky date header, so the day stays pinned at the top
@@ -496,14 +470,8 @@ export function ChatView({ group, personas }: Props) {
           />
         )}
       </Box>
-      {lastSelfMessage && aiMembers.length > 0 && (
-        <ReadProgressBar
-          message={lastSelfMessage}
-          aiMembers={aiMembers}
-          repliedBy={lastSelfReplied}
-          replyTargets={lastSelfReplyTargets}
-          onJumpToMessage={jumpToMessage}
-        />
+      {currentTurn && currentTurn.members.length > 0 && (
+        <ReadProgressBar turn={currentTurn} personas={personas} onJumpToMessage={jumpToMessage} />
       )}
       <Box p="md" style={{ borderTop: '1px solid var(--mantine-color-default-border)' }}>
         {readOnly ? (

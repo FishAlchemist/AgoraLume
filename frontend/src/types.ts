@@ -161,6 +161,52 @@ export interface SystemMessage extends BaseMessage {
 export type Message = ConversationMessage | MoodMessage | SystemMessage;
 
 /**
+ * How far one AI member has got in the current turn — the buckets the pinned
+ * progress bar tints avatars by: still working, done-and-silent, or replied.
+ */
+export type TurnMemberState = 'pending' | 'read' | 'replied';
+
+/** One AI member's progress within a turn. */
+export interface TurnMember {
+  personaId: string;
+  state: TurnMemberState;
+  /**
+   * The id of this member's first reply line this turn — the avatar's jump
+   * target. Present only once `state` is `replied`.
+   */
+  replyId?: string;
+}
+
+/**
+ * What kicked off a turn: a conversation line someone sent (jumpable, with its
+ * text to render), or an environment event that carries no message of its own
+ * (just a label). The message case is the only one today; the event case is what
+ * an upcoming event-trigger feature produces — the bar already handles both.
+ */
+export type TurnTrigger =
+  | { kind: 'message'; messageId: string; personaId: string; text: string }
+  | { kind: 'event'; label: string };
+
+/**
+ * A processing round: what triggered it and how far each AI member has got.
+ * Owned by the backend and streamed independently of message history (a `turn`
+ * SSE frame, seeded on connect), so the pinned progress bar reflects the current
+ * processing state whether or not the trigger line is in the loaded window — and
+ * shows progress for event triggers that have no user message at all. `active`
+ * is true while the coordinator is still running the round.
+ */
+export interface Turn {
+  id: string;
+  groupId: string;
+  trigger: TurnTrigger;
+  /** Epoch millis when the turn started. */
+  startedAt: number;
+  active: boolean;
+  /** AI members participating, in the group's member order, each with its progress. */
+  members: TurnMember[];
+}
+
+/**
  * Conversation-starter suggestions for a group: a few short first-person
  * messages the user could send next when unsure what to say. Generated and
  * cached server-side (the frontend only fetches and displays), and tuned to the

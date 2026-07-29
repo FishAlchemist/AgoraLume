@@ -15,7 +15,10 @@ use tokio::sync::{broadcast, mpsc};
 use crate::agent::event::Event;
 use crate::agent::turn::{AgentRuntime, coordinator_loop, current_time_of_day, generate_suggestions};
 use crate::config::Pricing;
-use crate::models::{AgentTrace, GroupSuggestions, Message, ReadReceipt};
+use crate::models::{
+    AgentTrace, GroupSuggestions, Message, ReadReceipt, Turn, TurnMember, TurnMemberState,
+    TurnTrigger,
+};
 use crate::persist::Persistence;
 use crate::workspace::Workspace;
 
@@ -30,6 +33,14 @@ const CHANNEL_CAPACITY: usize = 256;
 /// How many recent agent traces to keep per group for the debug panel. Old
 /// traces fall off the front; the running usage totals are unaffected.
 const DEBUG_TRACE_CAP: usize = 50;
+
+/// Upper bound on the initial history page, however far the unread run (via
+/// `since`) would otherwise reach back. It keeps opening a group cheap even when
+/// events have piled up a large unread backlog while the user was away: the tail
+/// is loaded, older lines page in on demand. Comfortably above a screenful (the
+/// client's page size) so a moderate unread run still loads whole and its divider
+/// stays exact; only an extreme backlog is capped.
+const INITIAL_CAP: usize = 160;
 
 /// Minimum gap between suggestion generations for one group. A GET that finds the
 /// suggestions stale, or an explicit regenerate, is dropped inside this window —
@@ -49,6 +60,11 @@ pub enum StreamEvent {
     /// Delivered as a named `activity` SSE event; drives the composer lock so a
     /// user message can never interleave with an in-flight turn.
     Activity(bool),
+    /// The current turn's snapshot — what triggered it and each AI member's
+    /// progress. Delivered as a named `turn` SSE event (and seeded on connect);
+    /// drives the pinned read-progress bar independently of the loaded message
+    /// window, and carries event-triggered rounds that have no user message.
+    Turn(Turn),
     /// A debug trace of one agent inference (the prompt it saw + its decision +
     /// token usage). Delivered as a named `debug` SSE event; drives the debug
     /// panel. Never affects the chat itself.
@@ -118,6 +134,13 @@ pub struct AppState {
     /// early regeneration.
     suggest_gates: Mutex<HashMap<String, SuggestGate>>,
     channels: Mutex<HashMap<String, broadcast::Sender<StreamEvent>>>,
+    /// The current (or most recent) turn per group — what triggered it and how
+    /// far each AI member has got. Owned here so the pinned progress bar draws
+    /// from live turn state rather than reconstructing it from the loaded message
+    /// window; absent for a group whose coordinator hasn't run this process, in
+    /// which case [`Self::current_turn`] rebuilds a message-triggered turn from
+    /// the log so the bar survives a restart.
+    turns: Mutex<HashMap<String, Turn>>,
     /// The swappable agent runtime (brain + memory + loop config).
     pub runtime: AgentRuntime,
     /// One command channel per group, feeding its coordinator task. Created
@@ -174,6 +197,7 @@ impl AppState {
             suggestions: Mutex::new(HashMap::new()),
             suggest_gates: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
             runtime,
             coordinators: Mutex::new(HashMap::new()),
             persistence,
@@ -466,12 +490,15 @@ impl AppState {
         slice[start..].to_vec()
     }
 
-    /// The initial history page, oldest-first: the newest `limit` messages, but
-    /// always extended far enough back to include every message newer than
-    /// `since` (the client's read mark). Unread lines are the newest tail, so
-    /// this guarantees the client loads the whole unread run — the "new messages"
-    /// divider and its count stay correct — while a caught-up open still costs
-    /// just one screen. With neither bound set it returns the full log.
+    /// The initial history page, oldest-first: the newest `limit` messages,
+    /// extended back far enough to include every message newer than `since` (the
+    /// client's read mark) — but never more than [`INITIAL_CAP`] lines in total.
+    /// Unread lines are the newest tail, so the extension loads the unread run so
+    /// its divider and count stay exact; the cap keeps the page cheap when a large
+    /// unread backlog has built up (e.g. many event-triggered turns while the user
+    /// was away), leaving the rest to page in on demand. A caught-up open still
+    /// costs just one screen. With neither bound set it returns the full log
+    /// (still capped), so callers wanting everything must page.
     pub fn list_tail(&self, group_id: &str, limit: Option<usize>, since: Option<i64>) -> Vec<Message> {
         self.ensure_loaded(group_id);
         let store = self.messages.lock().unwrap();
@@ -488,7 +515,13 @@ impl AppState {
             Some(ts) => list.iter().position(|m| m.ts() > ts).unwrap_or(list.len()),
             None => list.len(),
         };
-        list[by_limit.min(by_since)..].to_vec()
+        // Bound how far the unread extension reaches back, so an extreme backlog
+        // doesn't drag the whole log into one page. `max` raises the start index
+        // (fewer, newer lines) toward the cap without ever dropping below the
+        // requested `limit` tail.
+        let by_cap = list.len().saturating_sub(INITIAL_CAP);
+        let start = by_limit.min(by_since).max(by_cap);
+        list[start..].to_vec()
     }
 
     /// The broadcast sender for a group, creating it on first use so late
@@ -590,6 +623,171 @@ impl AppState {
             Some(Message::Conversation { read_by: Some(readers), .. })
                 if readers.iter().any(|id| id == persona_id)
         )
+    }
+
+    /// The group's current (or most recent) turn, for seeding a freshly-connected
+    /// stream. Returns the live turn when the coordinator has run one this
+    /// process; otherwise rebuilds a message-triggered turn from the log so the
+    /// pinned progress bar survives a restart. `None` when there is nothing to pin
+    /// (an empty log, or a history with no line the group's "you" sent).
+    pub fn current_turn(&self, group_id: &str) -> Option<Turn> {
+        if let Some(turn) = self.turns.lock().unwrap().get(group_id) {
+            return Some(turn.clone());
+        }
+        self.reconstruct_turn(group_id)
+    }
+
+    /// Rebuilds a message-triggered turn from a group's stored log: the trigger is
+    /// the last line the group's "you" sent; each AI member's state comes from
+    /// that line's read receipts (read vs. still pending) and whether the member
+    /// spoke before the user's next line (replied, with the reply id as the jump
+    /// target). Mirrors what the coordinator records live, so a restart shows the
+    /// same bar without persisting turn state.
+    fn reconstruct_turn(&self, group_id: &str) -> Option<Turn> {
+        let (self_id, member_ids) = self.workspace().turn_members(group_id)?;
+        self.ensure_loaded(group_id);
+        let store = self.messages.lock().unwrap();
+        let list = store.get(group_id)?;
+        // The last line the user sent — the trigger to pin.
+        let trigger_idx = list.iter().rposition(
+            |m| matches!(m, Message::Conversation { persona_id, .. } if *persona_id == self_id),
+        )?;
+        let Message::Conversation { id: trigger_id, ts, text, read_by, .. } = &list[trigger_idx]
+        else {
+            return None;
+        };
+        let readers: HashSet<&str> =
+            read_by.as_deref().unwrap_or_default().iter().map(String::as_str).collect();
+        // The first reply per member after the trigger, until the user speaks
+        // again — the avatar's jump target.
+        let mut reply_of: HashMap<&str, &str> = HashMap::new();
+        for m in &list[trigger_idx + 1..] {
+            let Message::Conversation { persona_id, id, .. } = m else { continue };
+            if *persona_id == self_id {
+                break;
+            }
+            reply_of.entry(persona_id.as_str()).or_insert(id.as_str());
+        }
+        let members = member_ids
+            .iter()
+            .map(|pid| {
+                let reply = reply_of.get(pid.as_str());
+                let state = if reply.is_some() {
+                    TurnMemberState::Replied
+                } else if readers.contains(pid.as_str()) {
+                    TurnMemberState::Read
+                } else {
+                    TurnMemberState::Pending
+                };
+                TurnMember { persona_id: pid.clone(), state, reply_id: reply.map(|id| id.to_string()) }
+            })
+            .collect();
+        Some(Turn {
+            id: trigger_id.clone(),
+            group_id: group_id.to_string(),
+            trigger: TurnTrigger::Message {
+                message_id: trigger_id.clone(),
+                persona_id: self_id.clone(),
+                text: text.clone(),
+            },
+            started_at: *ts,
+            active: false,
+            members,
+        })
+    }
+
+    /// Opens a fresh turn for a group: every AI member starts pending. Replaces
+    /// any prior turn — a new trigger (including one that preempted a running
+    /// turn) is a new round — and broadcasts the snapshot.
+    pub fn start_turn(&self, group_id: &str, trigger: TurnTrigger, member_ids: &[String]) {
+        let turn = Turn {
+            id: crate::models::next_id(),
+            group_id: group_id.to_string(),
+            trigger,
+            started_at: crate::models::now_ms(),
+            active: true,
+            members: member_ids
+                .iter()
+                .map(|pid| TurnMember {
+                    persona_id: pid.clone(),
+                    state: TurnMemberState::Pending,
+                    reply_id: None,
+                })
+                .collect(),
+        };
+        self.publish_turn(group_id, turn);
+    }
+
+    /// Re-opens the group's held turn on a manual retry: already-processed members
+    /// keep their state, only `active` flips back on. A no-op when no turn is held.
+    pub fn resume_turn(&self, group_id: &str) {
+        let mut turns = self.turns.lock().unwrap();
+        let Some(turn) = turns.get_mut(group_id) else {
+            return;
+        };
+        turn.active = true;
+        let snapshot = turn.clone();
+        drop(turns);
+        let _ = self.channel(group_id).send(StreamEvent::Turn(snapshot));
+    }
+
+    /// Records one member's progress in the current turn and broadcasts the new
+    /// snapshot. Advances only (pending → read → replied) so a later round can't
+    /// walk a member back; the first reply id is kept as the jump target. A no-op
+    /// when the group has no live turn or the member isn't part of it.
+    pub fn set_turn_member(
+        &self,
+        group_id: &str,
+        persona_id: &str,
+        state: TurnMemberState,
+        reply_id: Option<String>,
+    ) {
+        let mut turns = self.turns.lock().unwrap();
+        let Some(turn) = turns.get_mut(group_id) else {
+            return;
+        };
+        let Some(member) = turn.members.iter_mut().find(|m| m.persona_id == persona_id) else {
+            return;
+        };
+        if state_rank(state) < state_rank(member.state) {
+            return;
+        }
+        member.state = state;
+        if let Some(id) = reply_id {
+            member.reply_id.get_or_insert(id);
+        }
+        let snapshot = turn.clone();
+        drop(turns);
+        let _ = self.channel(group_id).send(StreamEvent::Turn(snapshot));
+    }
+
+    /// Marks the group's turn finished (the coordinator went idle) without
+    /// changing member state — members still pending stay pending (a suspended
+    /// turn). A no-op when no turn is held.
+    pub fn end_turn(&self, group_id: &str) {
+        let mut turns = self.turns.lock().unwrap();
+        let Some(turn) = turns.get_mut(group_id) else {
+            return;
+        };
+        turn.active = false;
+        let snapshot = turn.clone();
+        drop(turns);
+        let _ = self.channel(group_id).send(StreamEvent::Turn(snapshot));
+    }
+
+    /// Stores a turn snapshot as the group's current turn and broadcasts it.
+    fn publish_turn(&self, group_id: &str, turn: Turn) {
+        self.turns.lock().unwrap().insert(group_id.to_string(), turn.clone());
+        let _ = self.channel(group_id).send(StreamEvent::Turn(turn));
+    }
+}
+
+/// Orders member states so [`AppState::set_turn_member`] only ever advances one.
+fn state_rank(state: TurnMemberState) -> u8 {
+    match state {
+        TurnMemberState::Pending => 0,
+        TurnMemberState::Read => 1,
+        TurnMemberState::Replied => 2,
     }
 }
 
