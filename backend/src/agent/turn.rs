@@ -1208,6 +1208,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn window_pages_around_an_anchor_in_both_directions() {
+        let state = app(Arc::new(RuleBrain::seeded(1)), cfg());
+        let ids: Vec<String> =
+            (0..10).map(|i| store_user(&state, "win", &format!("m{i}"))).collect();
+        let id = |i: usize| ids[i].as_str();
+
+        // before + after around a middle line: the anchor plus its neighbours.
+        let around = state.list_window("win", Some(id(5)), Some(2), Some(2), None);
+        let got: Vec<&str> = around.iter().map(|m| m.id()).collect();
+        assert_eq!(got, vec![id(3), id(4), id(5), id(6), id(7)]);
+
+        // `after` past the end stops at the newest line (anchor + all that follow).
+        let to_tail = state.list_window("win", Some(id(5)), Some(0), Some(100), None);
+        assert_eq!(to_tail.first().unwrap().id(), id(5));
+        assert_eq!(to_tail.last().unwrap().id(), id(9));
+        assert_eq!(to_tail.len(), 5);
+
+        // The tail window (no anchor) ends at the newest line.
+        let tail = state.list_window("win", None, Some(3), None, None);
+        let tail_ids: Vec<&str> = tail.iter().map(|m| m.id()).collect();
+        assert_eq!(tail_ids, vec![id(7), id(8), id(9)]);
+
+        // An unknown anchor is an empty window, not the whole log.
+        assert!(state.list_window("win", Some("nope"), Some(5), Some(5), None).is_empty());
+    }
+
+    #[tokio::test]
     async fn reconstructs_a_turn_from_the_log_when_none_is_live() {
         // No coordinator ran this process (like a fresh restart): current_turn must
         // rebuild the bar's turn from the stored log — the last line "you" sent,

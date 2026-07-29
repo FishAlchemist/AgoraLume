@@ -96,42 +96,38 @@ async fn debug_traces(
     Json(state.debug_traces(&id))
 }
 
-/// Query for a page of message history. Both fields are optional: with neither,
-/// the full log is returned (oldest first), preserving the original behaviour.
+/// Query for a window of message history — one shape for every navigation. All
+/// fields are optional; with none, the whole log is returned (oldest first).
 #[derive(Deserialize, IntoParams)]
 #[serde(rename_all = "camelCase")]
 struct HistoryQuery {
-    /// Page upward: return only messages strictly older than this message id (the
-    /// oldest line already loaded). Takes precedence over `since`.
-    before: Option<String>,
-    /// Cap the result to the newest N messages of the selected range, so the
-    /// default page is the tail of history.
-    limit: Option<usize>,
-    /// The client's read mark (epoch millis). On the initial page (no `before`)
-    /// the tail is extended back far enough to include every message newer than
-    /// this, so the whole unread run is loaded even when it exceeds `limit`.
+    /// The line to build the window around (its id). Omitted, the window ends at
+    /// the newest line — the initial open and "jump to latest".
+    anchor: Option<String>,
+    /// How many lines before the anchor (or before the tail) to include.
+    before: Option<usize>,
+    /// How many lines after the anchor to include. Ignored without an `anchor`.
+    after: Option<usize>,
+    /// The client's read mark (epoch millis), for the initial open only (no
+    /// `anchor`): the window is extended back to cover every line newer than this,
+    /// so the whole unread run loads and its divider stays exact.
     since: Option<i64>,
 }
 
-/// A page of a group's message history, oldest first. The initial open sends
-/// `limit` (and `since`, the read mark, so the entire unread tail is included);
-/// `before`+`limit` then walks earlier pages. With no query it returns the whole
-/// log.
+/// A contiguous window of a group's message history, oldest first. One shape drives
+/// every navigation: the initial open (`before` + `since`), paging earlier
+/// (`anchor` + `before`), paging later (`anchor` + `after`), and jumping to an
+/// arbitrary line (`anchor` + `before` + `after`). With no query it returns the
+/// whole log.
 #[utoipa::path(get, path = "/groups/{id}/messages", tag = "chat",
     params(("id" = String, Path, description = "Group id"), HistoryQuery),
-    responses((status = 200, description = "Message history page, oldest first", body = Vec<Message>)))]
+    responses((status = 200, description = "Message history window, oldest first", body = Vec<Message>)))]
 async fn list_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<Vec<Message>> {
-    // `before` is the "load earlier" cursor; without it this is the initial page,
-    // whose tail must also cover everything unread (`since`).
-    let page = match query.before.as_deref() {
-        Some(before) => state.list_page(&id, Some(before), query.limit),
-        None => state.list_tail(&id, query.limit, query.since),
-    };
-    Json(page)
+    Json(state.list_window(&id, query.anchor.as_deref(), query.before, query.after, query.since))
 }
 
 /// The body of a send request.

@@ -49,6 +49,7 @@ export const zhHant: TranslationSchema = {
     empty: '還沒有訊息 —— 打聲招呼吧 👋',
     loading: '載入中…',
     loadEarlier: '載入更早的訊息',
+    loadNewer: '載入更新的訊息',
     noGroup: '先建立一個群組來開始聊天。',
     members: '成員',
     speakingAs: '以此身份發言',

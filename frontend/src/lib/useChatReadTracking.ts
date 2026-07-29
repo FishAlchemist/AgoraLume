@@ -42,11 +42,20 @@ export function useChatReadTracking(
    * line is itself unread, since the real read boundary hasn't paged in yet.
    */
   unreadAbove = false,
+  /**
+   * Whether the loaded window includes the live newest line. The read mark only
+   * advances while this holds — reading old history after a jump (a window
+   * detached from the tail) must never mark live lines seen, since the loaded
+   * "newest" isn't actually the newest.
+   */
+  atTail = true,
 ): ChatReadTracking {
   const lastReadTs = useReadState((s) => s.lastRead[groupId]);
   const markRead = useReadState((s) => s.markRead);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
+  const atTailRef = useRef(atTail);
+  atTailRef.current = atTail;
   const viewport = useRef<HTMLDivElement>(null);
   // The ordered list as of the last render, so imperative callbacks (scroll
   // handlers, timers) never close over a stale snapshot.
@@ -63,6 +72,9 @@ export function useChatReadTracking(
   }, []);
 
   const markReadNow = useCallback(() => {
+    // Detached in old history: the loaded "newest" isn't the real newest, so
+    // advancing the mark here would wrongly bury still-unseen live lines.
+    if (!atTailRef.current) return;
     const newest = orderedRef.current?.at(-1)?.ts;
     if (newest != null) markRead(groupId, newest);
   }, [groupId, markRead]);

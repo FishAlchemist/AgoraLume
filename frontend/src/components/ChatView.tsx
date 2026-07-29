@@ -59,6 +59,32 @@ function prependMessages(prev: Message[] | null, older: Message[]): Message[] {
   return fresh.length > 0 ? [...fresh, ...prev] : prev;
 }
 
+/** Appends a newer page after the loaded lines, dropping any known ids. */
+function appendMessages(prev: Message[] | null, newer: Message[]): Message[] {
+  if (!prev || prev.length === 0) return newer;
+  const have = new Set(prev.map((m) => m.id));
+  const fresh = newer.filter((m) => !have.has(m.id));
+  return fresh.length > 0 ? [...prev, ...fresh] : prev;
+}
+
+/**
+ * Fetches a window centred on a jump target and the flags that describe where it
+ * sits: whether earlier/later pages remain, and whether it reached the true tail
+ * (fewer lines after the target than asked for). `null` when the line is gone.
+ */
+async function fetchJumpWindow(groupId: string, id: string) {
+  const win = await api.listMessages(groupId, { anchor: id, before: PAGE_SIZE, after: PAGE_SIZE });
+  const at = win.findIndex((m) => m.id === id);
+  if (at === -1) return null;
+  const after = win.length - at - 1;
+  return {
+    win,
+    hasEarlier: at >= PAGE_SIZE,
+    hasLater: after >= PAGE_SIZE,
+    atTail: after < PAGE_SIZE,
+  };
+}
+
 /**
  * Merges buffered read receipts into whichever messages are present. A receipt
  * can arrive before its target message — the turn streams reads as soon as it
@@ -143,11 +169,29 @@ export function ChatView({ group, personas }: Props) {
   const locked = aiMemberCount === 0;
 
   const [messages, setMessages] = useState<Message[] | null>(null);
-  // History loads in pages: the initial tail (extended to cover the whole unread
-  // run), then earlier pages on demand. `hasEarlier` gates the top loader.
+  // History loads as a contiguous window that can grow either way: the initial
+  // tail (extended to cover the whole unread run), earlier pages, later pages, or
+  // a window fetched around a jump target. `hasEarlier`/`hasLater` gate the two
+  // end loaders.
   const [hasEarlier, setHasEarlier] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const loadingEarlierRef = useRef(false);
+  const [hasLater, setHasLater] = useState(false);
+  const [loadingLater, setLoadingLater] = useState(false);
+  const loadingLaterRef = useRef(false);
+  // Whether the loaded window includes the live newest line. False after a jump
+  // into old history: streamed lines are then held out of the detached window (a
+  // gap would corrupt it) and the read mark is frozen, until the reader returns to
+  // the tail (which reloads it). A ref mirrors it for the stream callback, set up
+  // once on mount, to read the current value without re-subscribing.
+  const [atTail, setAtTail] = useState(true);
+  const atTailRef = useRef(true);
+  // True while a jump is fetching the window around an off-screen target — drives
+  // a spinner so the jump never looks like it silently did nothing.
+  const [jumping, setJumping] = useState(false);
+  // A jump target whose window just loaded; the layout effect scrolls to it once
+  // the replaced window has rendered.
+  const pendingJumpId = useRef<string | null>(null);
   // True when the initial page was capped mid-unread — i.e. more unread lines
   // exist above the loaded window (a large backlog was truncated). It lets the
   // read tracking hold the "new messages" divider back until an earlier page
@@ -185,9 +229,16 @@ export function ChatView({ group, personas }: Props) {
     [messages],
   );
 
+  // Keep the ref the stream callback reads in sync with the atTail state.
+  useEffect(() => {
+    atTailRef.current = atTail;
+  }, [atTail]);
+
   // Owns the scroll viewport and the user's unread state (divider, jump button,
   // read watermark). Never auto-scrolls on incoming lines — catching up is always
-  // an explicit act — which is the "don't yank me down mid-read" behaviour.
+  // an explicit act — which is the "don't yank me down mid-read" behaviour. The
+  // read mark only advances while the window is at the tail, so reading old history
+  // after a jump never marks live lines seen.
   const {
     viewport,
     atBottom,
@@ -197,7 +248,42 @@ export function ChatView({ group, personas }: Props) {
     followToBottom,
     jumpToMessage,
     resetForReload,
-  } = useChatReadTracking(group.id, ordered, selfId, unreadAbove);
+  } = useChatReadTracking(group.id, ordered, selfId, unreadAbove, atTail);
+
+  // Applies a freshly-loaded tail window: the newest lines (extended over the
+  // unread run), reconnected to the live stream. Shared by the initial open and
+  // the "return to latest" reload.
+  const applyTail = useCallback((tail: Message[]) => {
+    setMessages(applyReads(tail, reads.current));
+    setHasEarlier(tail.length >= PAGE_SIZE);
+    setUnreadAbove(tail.length >= INITIAL_PAGE_CAP);
+    setHasLater(false);
+    setAtTail(true);
+  }, []);
+
+  // Reloads the newest window and drops to the bottom — how a detached window (a
+  // jump into old history) rejoins the live stream, and how "return to latest"
+  // catches up. Reading the mark imperatively keeps it out of the deps.
+  const reloadTail = useCallback(() => {
+    const since = useReadState.getState().lastRead[group.id];
+    return api
+      .listMessages(group.id, { before: PAGE_SIZE, since })
+      .then((tail) => {
+        applyTail(tail);
+        followToBottom();
+      })
+      .catch(() => {});
+  }, [group.id, applyTail, followToBottom]);
+
+  // The "return to latest" pill: at the tail it just drops to the bottom; detached
+  // in old history it reloads the tail first, reconnecting to the live stream.
+  const returnToLatest = useCallback(() => {
+    if (atTailRef.current) {
+      followToBottom();
+      return;
+    }
+    void reloadTail();
+  }, [followToBottom, reloadTail]);
 
   // Ends an in-flight manual regenerate: cancels its safety timer and drops the
   // loader. Leaves whatever suggestions are currently shown in place.
@@ -252,9 +338,16 @@ export function ChatView({ group, personas }: Props) {
     let active = true;
     setMessages(null);
     setHasEarlier(false);
+    setHasLater(false);
     setUnreadAbove(false);
     setLoadingEarlier(false);
     loadingEarlierRef.current = false;
+    setLoadingLater(false);
+    loadingLaterRef.current = false;
+    setAtTail(true);
+    atTailRef.current = true;
+    setJumping(false);
+    pendingJumpId.current = null;
     pendingAnchor.current = null;
     setBusy(false);
     setCurrentTurn(null);
@@ -269,13 +362,9 @@ export function ChatView({ group, personas }: Props) {
     // count stay exact. Earlier lines are fetched on demand as the reader scrolls
     // up. Reading the mark imperatively keeps it out of this effect's deps.
     const since = useReadState.getState().lastRead[group.id];
-    void api.listMessages(group.id, { limit: PAGE_SIZE, since }).then((initial) => {
+    void api.listMessages(group.id, { before: PAGE_SIZE, since }).then((initial) => {
       if (!active) return;
-      setMessages(applyReads(initial, reads.current));
-      setHasEarlier(initial.length >= PAGE_SIZE);
-      // A full page (== the cap) means the unread run was truncated: more unread
-      // sits above the window, so the divider stays hidden until it pages in.
-      setUnreadAbove(initial.length >= INITIAL_PAGE_CAP);
+      applyTail(initial);
     });
 
     // Fetch the cached openers on open; a stale set kicks a background regen on
@@ -289,6 +378,10 @@ export function ChatView({ group, personas }: Props) {
     });
 
     const unsubscribe = api.subscribe(group.id, (message) => {
+      // Held out while the window is detached in old history — appending here would
+      // gap the timeline. The reader picks these up when they return to the tail,
+      // which reloads it fresh; buffered receipts still apply on the way back.
+      if (!atTailRef.current) return;
       setMessages((prev) => applyReads(appendMessage(prev, message), reads.current));
     });
 
@@ -339,10 +432,15 @@ export function ChatView({ group, personas }: Props) {
     setBusy(true);
     try {
       const message = await api.sendMessage(group.id, text, selfId);
-      setMessages((prev) => applyReads(appendMessage(prev, message), reads.current));
-      // The user just acted, so follow their own line down and mark caught up —
-      // the replies it triggers then stream in beneath, without dragging the view.
-      followToBottom();
+      if (atTailRef.current) {
+        setMessages((prev) => applyReads(appendMessage(prev, message), reads.current));
+        // The user just acted, so follow their own line down and mark caught up —
+        // the replies it triggers then stream in beneath, without dragging the view.
+        followToBottom();
+      } else {
+        // Sending from old history returns us to the live tail, with the new line.
+        await reloadTail();
+      }
     } catch {
       setBusy(false);
     }
@@ -356,12 +454,14 @@ export function ChatView({ group, personas }: Props) {
     void api.retry(group.id).catch(() => {});
   }, [busy, group.id]);
 
-  // The oldest loaded line — the cursor for fetching the page before it.
+  // The two ends of the loaded window — the anchors for growing it either way.
   const oldestLoadedId = ordered?.[0]?.id;
+  const newestLoadedId = ordered?.at(-1)?.id;
 
   // Fetches the page just before the oldest loaded line and prepends it. Records
-  // the scroll metrics first so the layout effect can hold the reader's place;
-  // a short page means the log's start is reached, so the loader retires.
+  // the scroll metrics first so the layout effect can hold the reader's place; a
+  // short page (nothing new past the anchor) means the log's start is reached, so
+  // the loader retires. The anchor line comes back in the page and is deduped.
   const handleLoadEarlier = useCallback(() => {
     if (!oldestLoadedId || loadingEarlierRef.current) return;
     loadingEarlierRef.current = true;
@@ -370,12 +470,13 @@ export function ChatView({ group, personas }: Props) {
     const anchorHeight = el?.scrollHeight ?? 0;
     const anchorTop = el?.scrollTop ?? 0;
     void api
-      .listMessages(group.id, { before: oldestLoadedId, limit: PAGE_SIZE })
+      .listMessages(group.id, { anchor: oldestLoadedId, before: PAGE_SIZE })
       .then((older) => {
-        setHasEarlier(older.length >= PAGE_SIZE);
-        if (older.length > 0) {
+        const fresh = older.filter((m) => m.id !== oldestLoadedId);
+        setHasEarlier(fresh.length >= PAGE_SIZE);
+        if (fresh.length > 0) {
           pendingAnchor.current = { height: anchorHeight, top: anchorTop };
-          setMessages((prev) => applyReads(prependMessages(prev, older), reads.current));
+          setMessages((prev) => applyReads(prependMessages(prev, fresh), reads.current));
         }
       })
       .catch(() => {})
@@ -385,11 +486,77 @@ export function ChatView({ group, personas }: Props) {
       });
   }, [oldestLoadedId, group.id, viewport]);
 
-  // After an earlier page prepends, the content above the reader grew — shift
-  // scrollTop by that delta so their view stays put instead of being flung up.
-  // Only a prepend sets the anchor; ordinary appends leave it null (a no-op).
-  // biome-ignore lint/correctness/useExhaustiveDependencies: messages is the intended trigger — re-run on a prepend; viewport.current is a stable DOM ref read imperatively.
+  // Fetches the page just after the newest loaded line and appends it. A short page
+  // means the true tail is reached, so the window rejoins the live stream (`atTail`)
+  // and the loader retires. The anchor line comes back in the page and is deduped.
+  const handleLoadLater = useCallback(() => {
+    if (!newestLoadedId || loadingLaterRef.current) return;
+    loadingLaterRef.current = true;
+    setLoadingLater(true);
+    void api
+      .listMessages(group.id, { anchor: newestLoadedId, after: PAGE_SIZE })
+      .then((newer) => {
+        const fresh = newer.filter((m) => m.id !== newestLoadedId);
+        // A full page means more remains below (still detached); a short one means
+        // the true tail is reached, rejoining the live stream.
+        const more = fresh.length >= PAGE_SIZE;
+        setHasLater(more);
+        setAtTail(!more);
+        if (fresh.length > 0) {
+          setMessages((prev) => applyReads(appendMessages(prev, fresh), reads.current));
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        loadingLaterRef.current = false;
+        setLoadingLater(false);
+      });
+  }, [newestLoadedId, group.id]);
+
+  // Jumps to a line — a turn's trigger, an avatar's reply, later a search hit.
+  // When it's already loaded, a plain scroll (instant). When it isn't (it paged
+  // out, or was never in the window), fetch a window centred on it, replace the
+  // view, and scroll to it once rendered — a spinner covers the fetch so the jump
+  // never looks like it silently failed. The fetched window may sit in old history
+  // (detached from the tail), which the reader leaves via "return to latest".
+  const handleJump = useCallback(
+    async (id: string) => {
+      if (ordered?.some((m) => m.id === id)) {
+        jumpToMessage(id);
+        return;
+      }
+      setJumping(true);
+      try {
+        const w = await fetchJumpWindow(group.id, id);
+        if (!w) return; // the line is gone
+        setMessages(applyReads(w.win, reads.current));
+        setHasEarlier(w.hasEarlier);
+        setHasLater(w.hasLater);
+        setAtTail(w.atTail);
+        setUnreadAbove(false);
+        pendingJumpId.current = id;
+      } finally {
+        setJumping(false);
+      }
+    },
+    [ordered, group.id, jumpToMessage],
+  );
+
+  // After a window changes, restore the reader's place. A jump scrolls its target
+  // to centre once the replaced window has rendered; an earlier page grew the
+  // content above the reader, so shift scrollTop by that delta to hold them put.
+  // Ordinary appends set neither ref (a no-op).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: messages is the intended trigger — re-run on a window change; viewport.current is a stable DOM ref read imperatively.
   useLayoutEffect(() => {
+    const jumpId = pendingJumpId.current;
+    if (jumpId) {
+      pendingJumpId.current = null;
+      pendingAnchor.current = null;
+      document
+        .getElementById(`msg-${jumpId}`)
+        ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
     const anchor = pendingAnchor.current;
     if (!anchor) return;
     pendingAnchor.current = null;
@@ -457,21 +624,25 @@ export function ChatView({ group, personas }: Props) {
             hasEarlier={hasEarlier}
             loadingEarlier={loadingEarlier}
             onLoadEarlier={handleLoadEarlier}
+            hasLater={hasLater}
+            loadingLater={loadingLater}
+            onLoadLater={handleLoadLater}
           />
         </ScrollArea>
-        {!atBottom && (
-          <JumpToLatest
-            label={
-              unreadCount > 0
-                ? t('chat.newMessages', { count: unreadCount })
-                : t('chat.jumpToLatest')
-            }
-            onClick={followToBottom}
-          />
+        {jumping && (
+          <Center pos="absolute" inset={0} style={{ pointerEvents: 'none' }}>
+            <Loader />
+          </Center>
         )}
+        <JumpToLatest
+          atBottom={atBottom}
+          atTail={atTail}
+          unreadCount={unreadCount}
+          onClick={returnToLatest}
+        />
       </Box>
       {currentTurn && currentTurn.members.length > 0 && (
-        <ReadProgressBar turn={currentTurn} personas={personas} onJumpToMessage={jumpToMessage} />
+        <ReadProgressBar turn={currentTurn} personas={personas} onJumpToMessage={handleJump} />
       )}
       <Box p="md" style={{ borderTop: '1px solid var(--mantine-color-default-border)' }}>
         {readOnly ? (
@@ -520,6 +691,12 @@ interface MessageListProps {
   /** An earlier page is in flight — the top loader spins. */
   loadingEarlier: boolean;
   onLoadEarlier: () => void;
+  /** Whether a later page may still be fetched — shows the bottom loader. Only set
+   * when the window is detached in history, below the loaded lines. */
+  hasLater: boolean;
+  /** A later page is in flight — the bottom loader spins. */
+  loadingLater: boolean;
+  onLoadLater: () => void;
 }
 
 /**
@@ -543,6 +720,9 @@ const MessageList = memo(function MessageList({
   hasEarlier,
   loadingEarlier,
   onLoadEarlier,
+  hasLater,
+  loadingLater,
+  onLoadLater,
 }: MessageListProps) {
   const { t } = useTranslation();
   if (dayGroups === null) {
@@ -594,6 +774,19 @@ const MessageList = memo(function MessageList({
           ))}
         </Stack>
       ))}
+      {hasLater && (
+        <Center>
+          <Button
+            variant="subtle"
+            size="xs"
+            color="gray"
+            loading={loadingLater}
+            onClick={onLoadLater}
+          >
+            {t('chat.loadNewer')}
+          </Button>
+        </Center>
+      )}
     </Stack>
   );
 });
@@ -687,11 +880,29 @@ function UnreadDivider({ label }: { label: string }) {
 }
 
 /**
- * The catch-up affordance: a pill floating at the bottom of the log while the
- * reader is scrolled up. It shows how many unseen lines wait below, and clicking
- * it drops back to the newest line and marks everything read.
+ * The catch-up affordance: a pill floating at the bottom of the log, shown while
+ * the reader is scrolled up (`!atBottom`) or the window is detached in old history
+ * (`!atTail`). At the tail it shows the unseen-line count; detached it just offers
+ * a way back. Clicking drops to the newest line (reloading the tail if detached)
+ * and marks everything read. Owns its own visibility so the parent stays lean.
  */
-function JumpToLatest({ label, onClick }: { label: string; onClick: () => void }) {
+function JumpToLatest({
+  atBottom,
+  atTail,
+  unreadCount,
+  onClick,
+}: {
+  atBottom: boolean;
+  atTail: boolean;
+  unreadCount: number;
+  onClick: () => void;
+}) {
+  const { t } = useTranslation();
+  if (atBottom && atTail) return null;
+  const label =
+    atTail && unreadCount > 0
+      ? t('chat.newMessages', { count: unreadCount })
+      : t('chat.jumpToLatest');
   return (
     <UnstyledButton
       onClick={onClick}

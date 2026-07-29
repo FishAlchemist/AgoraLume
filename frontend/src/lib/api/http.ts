@@ -5,7 +5,7 @@ import type {
   ChatApi,
   DebugHandler,
   DebugUsage,
-  HistoryPage,
+  HistoryWindow,
   MessageHandler,
   ReadHandler,
   ReadReceipt,
@@ -238,10 +238,11 @@ export class HttpChatApi implements ChatApi {
     }
   }
 
-  listMessages(groupId: string, opts?: HistoryPage): Promise<Message[]> {
+  listMessages(groupId: string, opts?: HistoryWindow): Promise<Message[]> {
     const params = new URLSearchParams();
-    if (opts?.before) params.set('before', opts.before);
-    if (opts?.limit != null) params.set('limit', String(opts.limit));
+    if (opts?.anchor) params.set('anchor', opts.anchor);
+    if (opts?.before != null) params.set('before', String(opts.before));
+    if (opts?.after != null) params.set('after', String(opts.after));
     if (opts?.since != null) params.set('since', String(opts.since));
     const qs = params.toString();
     return this.getJson<Message[]>(`/groups/${groupId}/messages${qs ? `?${qs}` : ''}`);

@@ -47,6 +47,7 @@ export const en = {
     empty: 'No messages yet — say hi 👋',
     loading: 'Loading…',
     loadEarlier: 'Load earlier messages',
+    loadNewer: 'Load newer messages',
     noGroup: 'Create a group to start chatting.',
     members: 'Members',
     speakingAs: 'Speaking as',

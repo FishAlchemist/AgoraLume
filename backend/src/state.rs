@@ -457,71 +457,70 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// A page of a group's log, oldest-first, for lazy history loading. `before`
-    /// keeps only the messages strictly older than that message id (paging
-    /// upward from a known cursor); `limit` then caps to the newest N of that
-    /// range — so the default page (`before` = None) is the tail of history, and
-    /// each earlier page walks back from the oldest line already shown. An
-    /// unknown `before` id yields an empty page, which the client reads as "no
-    /// more history", rather than replaying the whole log.
-    pub fn list_page(
+    /// A contiguous window of a group's log, oldest-first, for lazy history
+    /// loading. The window is built around an `anchor` line: up to `before` lines
+    /// older than it, the anchor itself, and up to `after` lines newer than it.
+    /// With no `anchor` the window ends at the newest line (the tail), so `before`
+    /// alone yields the last N lines and `after` is meaningless. An unknown
+    /// `anchor` id yields an empty window — the client reads that as "that line is
+    /// gone" — rather than replaying the whole log.
+    ///
+    /// `since` (the client's read mark, epoch millis) applies only to the tail
+    /// window (no `anchor`): the start is extended back to include every line newer
+    /// than it, so the whole unread run loads and its divider stays exact — but
+    /// never past [`INITIAL_CAP`] lines, so a large unread backlog (e.g. many
+    /// event-triggered turns while the user was away) still opens cheaply and pages
+    /// the rest in.
+    ///
+    /// One window serves every caller: the initial open (`before` + `since`), paging
+    /// earlier (`anchor` + `before`), paging later (`anchor` + `after`), and jumping
+    /// to an arbitrary line (`anchor` + `before` + `after`). With no arguments it
+    /// returns the whole log (still capped), so callers wanting all of it must page.
+    pub fn list_window(
         &self,
         group_id: &str,
-        before: Option<&str>,
-        limit: Option<usize>,
+        anchor: Option<&str>,
+        before: Option<usize>,
+        after: Option<usize>,
+        since: Option<i64>,
     ) -> Vec<Message> {
         self.ensure_loaded(group_id);
         let store = self.messages.lock().unwrap();
         let Some(list) = store.get(group_id) else {
             return Vec::new();
         };
-        let end = match before {
-            Some(id) => match list.iter().position(|m| m.id() == id) {
-                Some(idx) => idx,
-                None => return Vec::new(),
-            },
-            None => list.len(),
+        let (start, end) = match anchor {
+            // Around a known line: the anchor plus its neighbours on each side.
+            Some(id) => {
+                let Some(idx) = list.iter().position(|m| m.id() == id) else {
+                    return Vec::new();
+                };
+                let start = idx.saturating_sub(before.unwrap_or(0));
+                let end = after.map_or(idx + 1, |n| (idx + 1 + n).min(list.len()));
+                (start, end)
+            }
+            // The tail: end at the newest line (`after` has no meaning here). Reach
+            // the start back over the requested `before`, then over the unread run
+            // (`since`) — the further of the two — but never past the cap. `max`
+            // raises the start toward the cap (fewer, newer lines) as a floor.
+            None => {
+                let end = list.len();
+                let cap = end.saturating_sub(INITIAL_CAP);
+                let by_before = end.saturating_sub(before.unwrap_or(end));
+                let start = match since {
+                    // First line strictly newer than the read mark — the unread run's
+                    // start; absent (all read) it collapses to `by_before`.
+                    Some(ts) => {
+                        let unread = list.iter().position(|m| m.ts() > ts).unwrap_or(end);
+                        by_before.min(unread)
+                    }
+                    None => by_before,
+                }
+                .max(cap);
+                (start, end)
+            }
         };
-        let slice = &list[..end];
-        let start = match limit {
-            Some(n) => slice.len().saturating_sub(n),
-            None => 0,
-        };
-        slice[start..].to_vec()
-    }
-
-    /// The initial history page, oldest-first: the newest `limit` messages,
-    /// extended back far enough to include every message newer than `since` (the
-    /// client's read mark) — but never more than [`INITIAL_CAP`] lines in total.
-    /// Unread lines are the newest tail, so the extension loads the unread run so
-    /// its divider and count stay exact; the cap keeps the page cheap when a large
-    /// unread backlog has built up (e.g. many event-triggered turns while the user
-    /// was away), leaving the rest to page in on demand. A caught-up open still
-    /// costs just one screen. With neither bound set it returns the full log
-    /// (still capped), so callers wanting everything must page.
-    pub fn list_tail(&self, group_id: &str, limit: Option<usize>, since: Option<i64>) -> Vec<Message> {
-        self.ensure_loaded(group_id);
-        let store = self.messages.lock().unwrap();
-        let Some(list) = store.get(group_id) else {
-            return Vec::new();
-        };
-        let by_limit = match limit {
-            Some(n) => list.len().saturating_sub(n),
-            None => 0,
-        };
-        // First line strictly newer than the read mark — the start of the unread
-        // run. Absent (all read) means don't extend past the limit.
-        let by_since = match since {
-            Some(ts) => list.iter().position(|m| m.ts() > ts).unwrap_or(list.len()),
-            None => list.len(),
-        };
-        // Bound how far the unread extension reaches back, so an extreme backlog
-        // doesn't drag the whole log into one page. `max` raises the start index
-        // (fewer, newer lines) toward the cap without ever dropping below the
-        // requested `limit` tail.
-        let by_cap = list.len().saturating_sub(INITIAL_CAP);
-        let start = by_limit.min(by_since).max(by_cap);
-        list[start..].to_vec()
+        list[start..end].to_vec()
     }
 
     /// The broadcast sender for a group, creating it on first use so late

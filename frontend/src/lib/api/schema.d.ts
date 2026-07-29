@@ -55,10 +55,11 @@ export interface paths {
   };
   "/groups/{id}/messages": {
     /**
-     * A page of a group's message history, oldest first. The initial open sends
-     * `limit` (and `since`, the read mark, so the entire unread tail is included);
-     * `before`+`limit` then walks earlier pages. With no query it returns the whole
-     * log.
+     * A contiguous window of a group's message history, oldest first. One shape drives
+     * every navigation: the initial open (`before` + `since`), paging earlier
+     * (`anchor` + `before`), paging later (`anchor` + `after`), and jumping to an
+     * arbitrary line (`anchor` + `before` + `after`). With no query it returns the
+     * whole log.
      */
     get: operations["list_messages"];
     /**
@@ -831,28 +832,28 @@ export interface operations {
     };
   };
   /**
-   * A page of a group's message history, oldest first. The initial open sends
-   * `limit` (and `since`, the read mark, so the entire unread tail is included);
-   * `before`+`limit` then walks earlier pages. With no query it returns the whole
-   * log.
+   * A contiguous window of a group's message history, oldest first. One shape drives
+   * every navigation: the initial open (`before` + `since`), paging earlier
+   * (`anchor` + `before`), paging later (`anchor` + `after`), and jumping to an
+   * arbitrary line (`anchor` + `before` + `after`). With no query it returns the
+   * whole log.
    */
   list_messages: {
     parameters: {
       query?: {
         /**
-         * @description Page upward: return only messages strictly older than this message id (the
-         * oldest line already loaded). Takes precedence over `since`.
+         * @description The line to build the window around (its id). Omitted, the window ends at
+         * the newest line — the initial open and "jump to latest".
          */
-        before?: string | null;
+        anchor?: string | null;
+        /** @description How many lines before the anchor (or before the tail) to include. */
+        before?: number | null;
+        /** @description How many lines after the anchor to include. Ignored without an `anchor`. */
+        after?: number | null;
         /**
-         * @description Cap the result to the newest N messages of the selected range, so the
-         * default page is the tail of history.
-         */
-        limit?: number | null;
-        /**
-         * @description The client's read mark (epoch millis). On the initial page (no `before`)
-         * the tail is extended back far enough to include every message newer than
-         * this, so the whole unread run is loaded even when it exceeds `limit`.
+         * @description The client's read mark (epoch millis), for the initial open only (no
+         * `anchor`): the window is extended back to cover every line newer than this,
+         * so the whole unread run loads and its divider stays exact.
          */
         since?: number | null;
       };
@@ -862,7 +863,7 @@ export interface operations {
       };
     };
     responses: {
-      /** @description Message history page, oldest first */
+      /** @description Message history window, oldest first */
       200: {
         content: {
           "application/json": components["schemas"]["Message"][];

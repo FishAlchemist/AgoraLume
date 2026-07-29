@@ -13,7 +13,7 @@ import type {
   ChatApi,
   DebugHandler,
   DebugUsage,
-  HistoryPage,
+  HistoryWindow,
   MessageHandler,
   ReadHandler,
   ServerMeta,
@@ -51,32 +51,34 @@ export class MockChatApi implements ChatApi {
     return { mock: true, llm: false, persistent: false };
   }
 
-  async listMessages(groupId: string, opts?: HistoryPage): Promise<Message[]> {
-    // The log is kept oldest-first (seed order + appends), matching the server,
-    // so history paging is plain index slicing. Return a copy so callers never
-    // alias (and mutate) our internal array.
+  async listMessages(groupId: string, opts?: HistoryWindow): Promise<Message[]> {
+    // The log is kept oldest-first (seed order + appends), matching the server, so
+    // the window is plain index slicing. Return a copy so callers never alias (and
+    // mutate) our internal array. Mirrors the backend's `list_window` exactly.
     const all = this.messages[groupId] ?? [];
-    // "Load earlier": everything strictly before the cursor, capped to newest N.
-    // An unknown cursor yields an empty page ("no more history").
-    if (opts?.before) {
-      const idx = all.findIndex((m) => m.id === opts.before);
-      if (idx <= 0) return [];
-      const slice = all.slice(0, idx);
-      return opts.limit != null ? slice.slice(Math.max(0, slice.length - opts.limit)) : slice;
+    // Around a known line: the anchor plus its neighbours on each side. An unknown
+    // anchor is an empty window ("that line is gone"), not the whole log.
+    if (opts?.anchor != null) {
+      const idx = all.findIndex((m) => m.id === opts.anchor);
+      if (idx === -1) return [];
+      const start = Math.max(0, idx - (opts.before ?? 0));
+      const end = opts.after != null ? Math.min(all.length, idx + 1 + opts.after) : idx + 1;
+      return all.slice(start, end);
     }
-    // Initial page: the newest `limit`, extended back to include everything newer
-    // than `since` (the read mark) so the unread run is present — but capped at
-    // INITIAL_CAP so a large backlog doesn't load whole (older lines page in).
-    const byLimit = opts?.limit != null ? Math.max(0, all.length - opts.limit) : 0;
+    // The tail: end at the newest line. Reach the start back over `before`, then
+    // over the unread run (`since`) — the further of the two — but never past
+    // INITIAL_CAP, so a large backlog loads its tail and pages the rest in.
+    const end = all.length;
+    const byBefore = opts?.before != null ? Math.max(0, end - opts.before) : 0;
     const bySince =
       opts?.since != null
         ? (() => {
             const i = all.findIndex((m) => m.ts > (opts.since as number));
-            return i === -1 ? all.length : i;
+            return i === -1 ? end : i;
           })()
-        : all.length;
-    const byCap = Math.max(0, all.length - INITIAL_PAGE_CAP);
-    return all.slice(Math.max(Math.min(byLimit, bySince), byCap));
+        : end;
+    const byCap = Math.max(0, end - INITIAL_PAGE_CAP);
+    return all.slice(Math.max(Math.min(byBefore, bySince), byCap));
   }
 
   async sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {

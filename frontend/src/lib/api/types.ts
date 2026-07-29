@@ -16,16 +16,27 @@ export type MessageHandler = (message: Message) => void;
 /** A turn snapshot: the current processing round's trigger + per-member progress. */
 export type TurnHandler = (turn: Turn) => void;
 
-/** Options for paging message history — see {@link ChatApi.listMessages}. */
-export interface HistoryPage {
-  /** Return only messages strictly older than this message id (page upward). */
-  before?: string;
-  /** Cap to the newest N of the selected range (the default page is the tail). */
-  limit?: number;
+/**
+ * A window of message history to fetch — see {@link ChatApi.listMessages}. One
+ * shape drives every navigation: the initial open (`before` + `since`), paging
+ * earlier (`anchor` + `before`), paging later (`anchor` + `after`), and jumping to
+ * an arbitrary line (`anchor` + `before` + `after`).
+ */
+export interface HistoryWindow {
   /**
-   * The read mark (epoch millis). On the initial page (no `before`), the tail is
-   * extended back to include every message newer than this — so the whole unread
-   * run loads even when it exceeds `limit`, keeping the divider and count exact.
+   * The line to build the window around (its id): up to `before` lines older than
+   * it, the anchor itself, and up to `after` lines newer. Omitted, the window ends
+   * at the newest line — the initial open and "jump to latest".
+   */
+  anchor?: string;
+  /** How many lines before the anchor (or before the tail) to include. */
+  before?: number;
+  /** How many lines after the anchor to include. Ignored without an `anchor`. */
+  after?: number;
+  /**
+   * The read mark (epoch millis), for the initial open only (no `anchor`): the
+   * window is extended back to include every message newer than this — so the
+   * whole unread run loads even past `before`, keeping the divider and count exact.
    */
   since?: number;
 }
@@ -125,11 +136,12 @@ export interface ChatApi {
   probe(): Promise<ServerMeta | null>;
 
   /**
-   * A page of message history, oldest first. With no options the full log is
-   * returned; `limit` fetches the newest N (the initial tail); `before` walks
-   * earlier pages from the oldest line already loaded.
+   * A contiguous window of message history, oldest first. With no options the full
+   * log is returned; otherwise the window is built around `anchor` (or the tail),
+   * reaching `before` lines back and `after` lines forward — the one call behind
+   * the initial open, paging either direction, and jumping to an arbitrary line.
    */
-  listMessages(groupId: string, opts?: HistoryPage): Promise<Message[]>;
+  listMessages(groupId: string, opts?: HistoryWindow): Promise<Message[]>;
 
   /**
    * Sends a user message and resolves with the persisted message. `personaId`
