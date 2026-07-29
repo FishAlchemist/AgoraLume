@@ -509,10 +509,7 @@ export function ChatView({ group, personas }: Props) {
     if (!el) return;
     if (hasEarlier && el.scrollTop < AUTO_LOAD_MARGIN) {
       handleLoadEarlier();
-    } else if (
-      hasLater &&
-      el.scrollHeight - el.scrollTop - el.clientHeight < AUTO_LOAD_MARGIN
-    ) {
+    } else if (hasLater && el.scrollHeight - el.scrollTop - el.clientHeight < AUTO_LOAD_MARGIN) {
       handleLoadLater();
     }
   }, [viewport, hasEarlier, hasLater, handleLoadEarlier, handleLoadLater]);
@@ -614,12 +611,7 @@ export function ChatView({ group, personas }: Props) {
   return (
     <Stack h="100%" gap={0}>
       <Box flex={1} mih={0} pos="relative">
-        <ScrollArea
-          h="100%"
-          viewportRef={viewport}
-          p="md"
-          onScrollPositionChange={handleScroll}
-        >
+        <ScrollArea h="100%" viewportRef={viewport} p="md" onScrollPositionChange={handleScroll}>
           <MessageList
             dayGroups={dayGroups}
             firstUnreadId={firstUnreadId}
