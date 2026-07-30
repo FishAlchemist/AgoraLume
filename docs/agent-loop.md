@@ -195,8 +195,8 @@ entire loop is deterministically testable behind two injection seams:
 
 1. **`AgentBrain`** — the only seam a real LLM replaces. The bundled `RuleBrain`
    scripts decisions (e.g. "speak when addressed, otherwise pick a mood/read");
-   the `LlmBrain` in `llm.rs` is the real one, enabled with `AGORALUME_LLM=1`
-   plus the `AGORALUME_LLM_*` endpoint settings.
+   the `LlmBrain` in `llm.rs` is the real one, enabled via `llm.toml` (or the
+   Settings page) rather than an environment variable — see `llm_config.rs`.
 2. **Clock / event source** — injectable delays (or `tokio::time::pause()`) so a
    hard interrupt can be fired precisely mid-inference without flakiness.
 
@@ -207,5 +207,5 @@ carries only messages).
 
 > This matches the project stance: the API is production-grade; only the persistence
 > layer (the in-memory store) is provisional. Replies come from either the mock
-> `RuleBrain` (default) or the real `LlmBrain` (`AGORALUME_LLM=1`), kept cleanly
-> separated behind an unchanged orchestrator by the `AgentBrain` seam.
+> `RuleBrain` (default) or the real `LlmBrain` (`llm.toml`'s `enabled = true`),
+> kept cleanly separated behind an unchanged orchestrator by the `AgentBrain` seam.

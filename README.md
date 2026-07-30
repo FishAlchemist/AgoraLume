@@ -57,9 +57,11 @@ backend bound to loopback. Ports and the proxy target are configurable — see
 ### Real model replies
 
 By default personas use a rule-based mock (no API budget). To drive them with a
-real model, set `AGORALUME_LLM=1` and point it at any OpenAI-compatible endpoint
-(OpenAI, OpenRouter, Ollama, …) via the shell or a `.env` file — see
-[`.env.example`](.env.example).
+real model, edit `llm.toml` under the data dir (the server creates it, fully
+commented, on first run — see [`.env.example`](.env.example) for where the
+data dir lives) or use the Settings page in the running app, and point it at
+any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, …). Either way
+takes effect without a restart.
 
 ### Ship a bundle
 

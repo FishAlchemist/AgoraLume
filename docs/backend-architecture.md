@@ -86,12 +86,11 @@ Everything above is production orchestration. The _only_ component a real LLM
 replaces is the `AgentBrain` trait (`agent/brain.rs`): a pure prompt → decision
 function. The orchestrator owns all context assembly, so swapping the bundled rule
 brain (`agent/mock.rs`) for the LLM brain (`agent/llm.rs`) changes nothing else.
-The LLM brain is a rig-core extractor over any OpenAI-compatible endpoint; enable
-it with `AGORALUME_LLM=1` and set `AGORALUME_LLM_BASE_URL` / `AGORALUME_LLM_MODEL`
-(and `AGORALUME_LLM_API_KEY` if the endpoint needs one) — via the shell or a
-`.env` file beside the executable (see `.env.example`). This is what makes the
-loop testable without an LLM and connectable to one without a rewrite — detailed
-in [agent-loop.md](./agent-loop.md).
+The LLM brain is a rig-core extractor over any OpenAI-compatible endpoint;
+enable it in `llm.toml` under the data dir (`enabled = true`, `base_url`,
+`model`, `api_key`) or from the Settings page — see `llm_config.rs`. This is
+what makes the loop testable without an LLM and connectable to one without a
+rewrite — detailed in [agent-loop.md](./agent-loop.md).
 
 ## Persona memory & identity
 

@@ -10,7 +10,7 @@
 //! boundaries; a hard event preempts the turn, discarding the in-flight agent.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::Timelike as _;
@@ -54,32 +54,90 @@ pub struct LoopConfig {
 
 impl Default for LoopConfig {
     fn default() -> Self {
-        Self { max_rounds: 1, pace_ms: 450, seed: None, compress_after: 50, compress_keep: 20 }
+        Self {
+            max_rounds: 1,
+            pace_ms: 450,
+            seed: None,
+            compress_after: 50,
+            compress_keep: 20,
+        }
     }
 }
 
-/// The agent runtime bundled into [`AppState`]: the swappable brain and the loop
-/// tunables. Swap `brain` for an LLM-backed implementation and the same
-/// orchestrator drives a real model — nothing else changes.
-pub struct AgentRuntime {
+/// The mutable pieces of an [`AgentRuntime`], guarded together so a hot
+/// reconfiguration (see `AppState::apply_llm_settings`) swaps brain, loop
+/// tunables, and the mock flag as one atomic unit — a reader can never observe
+/// a config that came from a different model than the brain it's paired with.
+struct RuntimeInner {
+    brain: Arc<dyn AgentBrain>,
+    config: LoopConfig,
+    mock: bool,
+}
+
+/// A cheap point-in-time copy of the runtime — the brain `Arc` is cloned (a
+/// refcount bump), the loop config copied. Callers take exactly one of these
+/// per turn (or per compression / suggestion pass) and use it throughout, so a
+/// reconfiguration mid-turn can't split one turn's inferences across two
+/// models.
+#[derive(Clone)]
+pub struct RuntimeSnapshot {
     pub brain: Arc<dyn AgentBrain>,
     pub config: LoopConfig,
-    /// True when this is the mock data layer (rule brain) rather than a real
-    /// LLM-backed runtime. Surfaced through `/meta`.
     pub mock: bool,
+}
+
+/// The agent runtime bundled into [`AppState`]: the swappable brain and the loop
+/// tunables, behind a lock so `PATCH /llm/settings` can reconfigure it without a
+/// restart. Take a [`RuntimeSnapshot`] to read it; [`Self::swap`] is the only
+/// way to write it.
+pub struct AgentRuntime {
+    inner: RwLock<RuntimeInner>,
 }
 
 impl AgentRuntime {
     /// The default runtime: rule-based replies — no LLM, no persistence. The
     /// "mock" data layer behind the production API.
     pub fn mock() -> Self {
-        Self { brain: Arc::new(RuleBrain::new()), config: LoopConfig::default(), mock: true }
+        Self::new(Arc::new(RuleBrain::new()), LoopConfig::default(), true)
     }
 
-    /// A runtime driven by a real LLM brain. `mock` is false, so `/meta` reports
-    /// the server is talking to a model.
-    pub fn llm(brain: Arc<dyn AgentBrain>) -> Self {
-        Self { brain, config: LoopConfig::default(), mock: false }
+    pub fn new(brain: Arc<dyn AgentBrain>, config: LoopConfig, mock: bool) -> Self {
+        Self {
+            inner: RwLock::new(RuntimeInner {
+                brain,
+                config,
+                mock,
+            }),
+        }
+    }
+
+    /// A point-in-time snapshot of the brain, loop config, and mock flag. Take
+    /// this once per turn — see [`RuntimeSnapshot`].
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        let inner = self.inner.read().unwrap();
+        RuntimeSnapshot {
+            brain: inner.brain.clone(),
+            config: inner.config.clone(),
+            mock: inner.mock,
+        }
+    }
+
+    /// Whether this is the mock data layer (rule brain) rather than a real
+    /// LLM-backed runtime. Surfaced through `/meta`. Cheaper than
+    /// [`Self::snapshot`] when only the flag is needed.
+    pub fn is_mock(&self) -> bool {
+        self.inner.read().unwrap().mock
+    }
+
+    /// Replaces the brain, loop config, and mock flag as one atomic update —
+    /// how `PATCH /llm/settings` applies a reconfiguration without a restart.
+    /// A turn already holding a [`RuntimeSnapshot`] keeps running against the
+    /// old brain; only turns started after this call see the new one.
+    pub fn swap(&self, brain: Arc<dyn AgentBrain>, config: LoopConfig, mock: bool) {
+        let mut inner = self.inner.write().unwrap();
+        inner.brain = brain;
+        inner.config = config;
+        inner.mock = mock;
     }
 }
 
@@ -97,7 +155,11 @@ enum TurnOutcome {
 /// A group's coordinator task: it owns the command channel and runs turns one at
 /// a time, so there is never more than one turn in flight per group. A hard
 /// interrupt returns here and immediately re-runs with the preempting event.
-pub async fn coordinator_loop(state: Arc<AppState>, group_id: String, mut rx: mpsc::Receiver<Event>) {
+pub async fn coordinator_loop(
+    state: Arc<AppState>,
+    group_id: String,
+    mut rx: mpsc::Receiver<Event>,
+) {
     // The trigger of a turn suspended by a failed inference, held while the loop
     // is idle so a manual retry can resume it. Any fresh trigger clears it, which
     // is exactly the "once you send a message you can't retry" rule.
@@ -156,7 +218,9 @@ pub async fn coordinator_loop(state: Arc<AppState>, group_id: String, mut rx: mp
 /// short. Best-effort: a failed summarization is logged and the full transcript
 /// is kept, to be retried at the next boundary.
 async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
-    let runtime = &state.runtime;
+    // Snapshotted once for the whole pass: a reconfiguration landing mid-compress
+    // must not swap the brain out from under an in-flight summarization call.
+    let runtime = state.runtime.snapshot();
     let cfg = &runtime.config;
     if runtime.mock || cfg.compress_after == 0 {
         return;
@@ -177,8 +241,10 @@ async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
     }
     let to_fold = &tail[..fold_count];
     let through_id = to_fold.last().map(|line| line.id.clone());
-    let lines: Vec<String> =
-        to_fold.iter().map(|line| format!("{}: {}", line.name, line.text)).collect();
+    let lines: Vec<String> = to_fold
+        .iter()
+        .map(|line| format!("{}: {}", line.name, line.text))
+        .collect();
     let folded = lines.join("\n");
 
     let request = SummaryRequest {
@@ -194,7 +260,13 @@ async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
                 tracing::warn!(group = %group_id, "compression returned an empty summary; keeping the full transcript");
                 return;
             }
-            state.set_summary(group_id, GroupSummary { text: text.clone(), through_id });
+            state.set_summary(
+                group_id,
+                GroupSummary {
+                    text: text.clone(),
+                    through_id,
+                },
+            );
             // Record the summarizing call so its tokens count toward the usage /
             // cost panel, exactly like a decision. It is not an agent's turn, so it
             // rides under a synthetic "system" persona with a `summarize` action.
@@ -247,7 +319,9 @@ async fn run_turn(
     resuming: bool,
     rx: &mut mpsc::Receiver<Event>,
 ) -> TurnOutcome {
-    let runtime = &state.runtime;
+    // Snapshotted once for the whole turn: every member's decision this round
+    // uses the same brain, even if a reconfiguration lands mid-turn.
+    let runtime = state.runtime.snapshot();
     let cfg = &runtime.config;
 
     // The user's line every agent marks as read this turn (unlocks the composer).
@@ -268,12 +342,19 @@ async fn run_turn(
     // and including event triggers that leave no user message. A fresh trigger
     // (including one that preempted a running turn) is a new round; a retry keeps
     // the held turn's already-processed members and re-runs only the rest.
-    let member_ids =
-        state.workspace().turn_members(group_id).map(|(_, ids)| ids).unwrap_or_default();
+    let member_ids = state
+        .workspace()
+        .turn_members(group_id)
+        .map(|(_, ids)| ids)
+        .unwrap_or_default();
     if resuming {
         state.resume_turn(group_id);
     } else {
-        state.start_turn(group_id, turn_trigger(state, group_id, &trigger), &member_ids);
+        state.start_turn(
+            group_id,
+            turn_trigger(state, group_id, &trigger),
+            &member_ids,
+        );
     }
 
     let mut rng = Rng::new(cfg.seed.unwrap_or_else(time_seed));
@@ -292,9 +373,7 @@ async fn run_turn(
         // On a resume, re-run only the agents that have not yet read the pending
         // message — those who already responded (or read silently) are skipped,
         // so a retry picks up exactly where the failure left off.
-        if resuming
-            && let Some(target) = &read_target
-        {
+        if resuming && let Some(target) = &read_target {
             order.retain(|persona_id| !state.has_read(group_id, target, persona_id));
         }
         if order.is_empty() {
@@ -327,8 +406,7 @@ async fn run_turn(
             // Only the lines past the summary go in verbatim; the summary stands
             // in for everything before them.
             let tail = tail_after(&transcript, summary.through_id.as_deref());
-            let summary_text =
-                (!summary.text.trim().is_empty()).then_some(summary.text.as_str());
+            let summary_text = (!summary.text.trim().is_empty()).then_some(summary.text.as_str());
 
             // Assemble the prompt — the orchestrator owns context, so a brain is
             // just prompt-in/decision-out (the LLM boundary). The persona's
@@ -382,7 +460,11 @@ async fn run_turn(
                 }
             };
 
-            let Decision { outcome, usage, remembered } = decision;
+            let Decision {
+                outcome,
+                usage,
+                remembered,
+            } = decision;
 
             // A failed inference is not a silent read: record it, surface a
             // sanitized notice to the chat, and suspend the turn at this agent
@@ -410,7 +492,11 @@ async fn run_turn(
                     return TurnOutcome::Suspended(trigger);
                 }
             };
-            let Respond { action, message, mood } = respond;
+            let Respond {
+                action,
+                message,
+                mood,
+            } = respond;
 
             // Record exactly what this agent saw and decided (plus token cost),
             // for the debug panel. Cloned because the routing below consumes the
@@ -483,8 +569,11 @@ async fn run_turn(
             // else read (a mood or a silent read alike). This is the event-safe
             // counterpart to the read receipt above — it needs no trigger message,
             // so an environment-triggered round still shows per-member progress.
-            let member_state =
-                if reply_id.is_some() { TurnMemberState::Replied } else { TurnMemberState::Read };
+            let member_state = if reply_id.is_some() {
+                TurnMemberState::Replied
+            } else {
+                TurnMemberState::Read
+            };
             state.set_turn_member(group_id, &persona_id, member_state, reply_id);
 
             // Handover: fold any soft events into the context for the next agent.
@@ -528,17 +617,28 @@ fn turn_trigger(state: &AppState, group_id: &str, event: &Event) -> TurnTrigger 
     match event {
         Event::User { message_id } => {
             let found = state.list(group_id).into_iter().find_map(|m| match m {
-                Message::Conversation { id, persona_id, text, .. } if id == *message_id => {
-                    Some((persona_id, text))
-                }
+                Message::Conversation {
+                    id,
+                    persona_id,
+                    text,
+                    ..
+                } if id == *message_id => Some((persona_id, text)),
                 _ => None,
             });
             let (persona_id, text) = found.unwrap_or_default();
-            TurnTrigger::Message { message_id: message_id.clone(), persona_id, text }
+            TurnTrigger::Message {
+                message_id: message_id.clone(),
+                persona_id,
+                text,
+            }
         }
-        Event::Environment { description, .. } => TurnTrigger::Event { label: description.clone() },
+        Event::Environment { description, .. } => TurnTrigger::Event {
+            label: description.clone(),
+        },
         // A retry is resolved to its held trigger before run_turn — never here.
-        Event::Retry => TurnTrigger::Event { label: String::new() },
+        Event::Retry => TurnTrigger::Event {
+            label: String::new(),
+        },
     }
 }
 
@@ -551,7 +651,10 @@ fn emit_mood(state: &AppState, group_id: &str, persona_id: &str, mood: String) {
 /// the sanitized status + reason only, never the provider body. Like a mood, it
 /// is UI-only and never enters the Context other agents read.
 fn emit_error(state: &AppState, group_id: &str, persona_id: &str, error: BrainError) {
-    state.emit(group_id, Message::system(group_id, persona_id, error.status, error.reason));
+    state.emit(
+        group_id,
+        Message::system(group_id, persona_id, error.status, error.reason),
+    );
 }
 
 /// Cosmetic pacing between a mood and its message.
@@ -580,9 +683,16 @@ fn build_transcript(state: &AppState, group_id: &str) -> Vec<ContextLine> {
     messages
         .into_iter()
         .filter_map(|message| match message {
-            Message::Conversation { id, persona_id, text, ts, .. } => {
-                let name =
-                    workspace.persona(&persona_id).map_or(persona_id, |p| p.name);
+            Message::Conversation {
+                id,
+                persona_id,
+                text,
+                ts,
+                ..
+            } => {
+                let name = workspace
+                    .persona(&persona_id)
+                    .map_or(persona_id, |p| p.name);
                 Some(ContextLine { id, name, text, ts })
             }
             // Moods and system error notices are UI-only; agents reason over
@@ -624,7 +734,12 @@ fn build_persona(state: &AppState, id: &str) -> Option<AgentPersona> {
 /// prompt or no memories under its current hash, in which case the brain attaches
 /// no tool and the turn stays a single completion.
 fn recall_lines(state: &AppState, persona_id: &str) -> Vec<String> {
-    state.workspace().recallable_memories(persona_id).into_iter().map(|m| m.content).collect()
+    state
+        .workspace()
+        .recallable_memories(persona_id)
+        .into_iter()
+        .map(|m| m.content)
+        .collect()
 }
 
 /// Every persona in the workspace, as the member directory injected into each
@@ -663,7 +778,8 @@ const SUGGEST_CONTEXT_LINES: usize = 12;
 /// Assembles the same context a decision sees, plus the current local time and
 /// part of day so the openers fit the moment.
 pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
-    let runtime = &state.runtime;
+    // Snapshotted once for the whole pass, same reasoning as `maybe_compress`.
+    let runtime = state.runtime.snapshot();
 
     // The room's members (name + blurb + who's the user), for addressing.
     let members: Vec<MemberInfo> = state
@@ -671,7 +787,11 @@ pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
         .group_roster(&group_id)
         .unwrap_or_default()
         .into_iter()
-        .map(|m| MemberInfo { name: m.name, blurb: m.blurb, is_user: m.is_self })
+        .map(|m| MemberInfo {
+            name: m.name,
+            blurb: m.blurb,
+            is_user: m.is_self,
+        })
         .collect();
     // The user's own language, so openers are written in something they can send.
     let language = {
@@ -840,7 +960,11 @@ fn assemble_prompt(
     // variables vs. roster vs. the live conversation).
     let mut system = String::new();
     if !persona.system_prompt.is_empty() {
-        let _ = writeln!(system, "<persona>\n{}\n</persona>", persona.system_prompt.trim());
+        let _ = writeln!(
+            system,
+            "<persona>\n{}\n</persona>",
+            persona.system_prompt.trim()
+        );
     }
     if !persona.variables.is_empty() {
         // Sorted for a stable, reproducible prompt.
@@ -870,10 +994,14 @@ fn assemble_prompt(
     // as static context it keeps the decision a single completion (a tool loop's
     // follow-up turn 400s on providers like Gemini that require a per-call
     // `thought_signature` rig 0.40 can't round-trip).
-    let present: HashSet<String> =
-        roster.iter().map(|m| m.name.trim().to_ascii_lowercase()).collect();
-    let mut others =
-        directory.iter().filter(|m| !present.contains(&m.name.trim().to_ascii_lowercase())).peekable();
+    let present: HashSet<String> = roster
+        .iter()
+        .map(|m| m.name.trim().to_ascii_lowercase())
+        .collect();
+    let mut others = directory
+        .iter()
+        .filter(|m| !present.contains(&m.name.trim().to_ascii_lowercase()))
+        .peekable();
     if others.peek().is_some() {
         system.push_str("\n<directory>\n");
         for member in others {
@@ -955,7 +1083,11 @@ impl Rng {
     }
 
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
     }
 }
 
@@ -989,11 +1121,17 @@ mod tests {
 
     /// Deterministic, delay-free config so tests are reproducible and fast.
     fn cfg() -> LoopConfig {
-        LoopConfig { pace_ms: 0, seed: Some(7), ..LoopConfig::default() }
+        LoopConfig {
+            pace_ms: 0,
+            seed: Some(7),
+            ..LoopConfig::default()
+        }
     }
 
     fn app(brain: Arc<dyn AgentBrain>, config: LoopConfig) -> Arc<AppState> {
-        Arc::new(AppState::with_runtime(AgentRuntime { brain, config, mock: true }))
+        Arc::new(AppState::with_runtime(AgentRuntime::new(
+            brain, config, true,
+        )))
     }
 
     /// Stores a user line the way the send handler does, returning its id.
@@ -1139,7 +1277,11 @@ mod tests {
 
     /// How many system (error) notices a group's log holds.
     fn system_count(state: &AppState, group: &str) -> usize {
-        state.list(group).iter().filter(|m| matches!(m, Message::System { .. })).count()
+        state
+            .list(group)
+            .iter()
+            .filter(|m| matches!(m, Message::System { .. }))
+            .count()
     }
 
     #[tokio::test]
@@ -1147,7 +1289,14 @@ mod tests {
         let state = app(Arc::new(RuleBrain::seeded(42)), cfg());
         let mid = store_user(&state, "lab", "hello aria");
 
-        let outcome = run_once(&state, "lab", Event::User { message_id: mid.clone() }).await;
+        let outcome = run_once(
+            &state,
+            "lab",
+            Event::User {
+                message_id: mid.clone(),
+            },
+        )
+        .await;
         assert!(matches!(outcome, TurnOutcome::Done));
 
         // Both AI members of "lab" processed the message (read receipts recorded).
@@ -1167,13 +1316,22 @@ mod tests {
     async fn turn_tracks_each_members_progress() {
         let state = app(Arc::new(RuleBrain::seeded(42)), cfg());
         let mid = store_user(&state, "lab", "hello aria");
-        run_once(&state, "lab", Event::User { message_id: mid.clone() }).await;
+        run_once(
+            &state,
+            "lab",
+            Event::User {
+                message_id: mid.clone(),
+            },
+        )
+        .await;
 
         let turn = state.current_turn("lab").expect("a turn should exist");
         // The trigger carries the user's line whole, so the bar can render it even
         // when that message is outside the client's loaded window.
         match turn.trigger {
-            TurnTrigger::Message { message_id, text, .. } => {
+            TurnTrigger::Message {
+                message_id, text, ..
+            } => {
                 assert_eq!(message_id, mid);
                 assert_eq!(text, "hello aria");
             }
@@ -1184,7 +1342,10 @@ mod tests {
         assert_eq!(turn.members.len(), 2);
         for member in &turn.members {
             assert_ne!(member.state, TurnMemberState::Pending);
-            assert_eq!(member.reply_id.is_some(), member.state == TurnMemberState::Replied);
+            assert_eq!(
+                member.reply_id.is_some(),
+                member.state == TurnMemberState::Replied
+            );
         }
     }
 
@@ -1196,11 +1357,16 @@ mod tests {
         run_once(
             &state,
             "lab",
-            Event::Environment { description: "It starts to rain.".into(), urgent: false },
+            Event::Environment {
+                description: "It starts to rain.".into(),
+                urgent: false,
+            },
         )
         .await;
 
-        let turn = state.current_turn("lab").expect("an event turn should exist");
+        let turn = state
+            .current_turn("lab")
+            .expect("an event turn should exist");
         match turn.trigger {
             TurnTrigger::Event { label } => assert_eq!(label, "It starts to rain."),
             TurnTrigger::Message { .. } => panic!("expected an event trigger"),
@@ -1208,14 +1374,19 @@ mod tests {
         // Members are still tracked, so the bar shows processing progress for a
         // trigger that has no message behind it.
         assert_eq!(turn.members.len(), 2);
-        assert!(turn.members.iter().all(|m| m.state != TurnMemberState::Pending));
+        assert!(
+            turn.members
+                .iter()
+                .all(|m| m.state != TurnMemberState::Pending)
+        );
     }
 
     #[tokio::test]
     async fn window_pages_around_an_anchor_in_both_directions() {
         let state = app(Arc::new(RuleBrain::seeded(1)), cfg());
-        let ids: Vec<String> =
-            (0..10).map(|i| store_user(&state, "win", &format!("m{i}"))).collect();
+        let ids: Vec<String> = (0..10)
+            .map(|i| store_user(&state, "win", &format!("m{i}")))
+            .collect();
         let id = |i: usize| ids[i].as_str();
 
         // before + after around a middle line: the anchor plus its neighbours.
@@ -1235,7 +1406,11 @@ mod tests {
         assert_eq!(tail_ids, vec![id(7), id(8), id(9)]);
 
         // An unknown anchor is an empty window, not the whole log.
-        assert!(state.list_window("win", Some("nope"), Some(5), Some(5), None).is_empty());
+        assert!(
+            state
+                .list_window("win", Some("nope"), Some(5), Some(5), None)
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1248,9 +1423,15 @@ mod tests {
         state.mark_read("lab", &mid, "aria");
         state.emit("lab", Message::conversation("lab", "aria", "pizza!", None));
 
-        let turn = state.current_turn("lab").expect("a turn should reconstruct");
+        let turn = state
+            .current_turn("lab")
+            .expect("a turn should reconstruct");
         assert!(!turn.active);
-        let aria = turn.members.iter().find(|m| m.persona_id == "aria").unwrap();
+        let aria = turn
+            .members
+            .iter()
+            .find(|m| m.persona_id == "aria")
+            .unwrap();
         assert_eq!(aria.state, TurnMemberState::Replied);
         assert!(aria.reply_id.is_some());
         // Nox neither read nor replied — still pending.
@@ -1261,9 +1442,14 @@ mod tests {
     #[tokio::test]
     async fn silence_terminates_after_one_round() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let brain = Arc::new(CountingReadBrain { calls: calls.clone() });
+        let brain = Arc::new(CountingReadBrain {
+            calls: calls.clone(),
+        });
         // Allow up to 3 rounds; a fully-silent round must still stop after one.
-        let config = LoopConfig { max_rounds: 3, ..cfg() };
+        let config = LoopConfig {
+            max_rounds: 3,
+            ..cfg()
+        };
         let state = app(brain, config);
         let mid = store_user(&state, "lab", "hi");
         let mut stream = state.channel("lab").subscribe();
@@ -1295,10 +1481,20 @@ mod tests {
         let state = app(Arc::new(FailingBrain), cfg());
         let mid = store_user(&state, "lab", "hi");
 
-        let outcome = run_once(&state, "lab", Event::User { message_id: mid.clone() }).await;
+        let outcome = run_once(
+            &state,
+            "lab",
+            Event::User {
+                message_id: mid.clone(),
+            },
+        )
+        .await;
 
         // The turn suspends at the first failing agent rather than completing.
-        assert!(matches!(outcome, TurnOutcome::Suspended(Event::User { .. })));
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Suspended(Event::User { .. })
+        ));
         // Exactly one sanitized error notice reached the chat, carrying the code.
         assert_eq!(system_count(&state, "lab"), 1);
         let system = state
@@ -1318,20 +1514,43 @@ mod tests {
     #[tokio::test]
     async fn retry_resumes_only_the_unread_agent() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let state = app(Arc::new(ScriptedBrain { calls: calls.clone() }), cfg());
+        let state = app(
+            Arc::new(ScriptedBrain {
+                calls: calls.clone(),
+            }),
+            cfg(),
+        );
         let mid = store_user(&state, "lab", "hi");
 
         // Initial turn: agent #1 speaks (reads), agent #2 fails → suspend.
-        let outcome = run_once(&state, "lab", Event::User { message_id: mid.clone() }).await;
-        assert!(matches!(outcome, TurnOutcome::Suspended(Event::User { .. })));
+        let outcome = run_once(
+            &state,
+            "lab",
+            Event::User {
+                message_id: mid.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Suspended(Event::User { .. })
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(readers(&state, "lab", &mid).len(), 1); // only the speaker read
         assert_eq!(system_count(&state, "lab"), 1);
 
         // Retry (resuming): only the still-unread agent re-runs and now speaks.
         let (_tx, mut rx) = mpsc::channel::<Event>(8);
-        let outcome =
-            run_turn(&state, "lab", Event::User { message_id: mid.clone() }, true, &mut rx).await;
+        let outcome = run_turn(
+            &state,
+            "lab",
+            Event::User {
+                message_id: mid.clone(),
+            },
+            true,
+            &mut rx,
+        )
+        .await;
         assert!(matches!(outcome, TurnOutcome::Done));
         // One more decide call, not two — the agent that already spoke is skipped.
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -1343,7 +1562,9 @@ mod tests {
 
     #[tokio::test]
     async fn remembered_facts_are_persisted_under_the_current_identity() {
-        let brain = Arc::new(RememberingBrain { fact: "the user prefers tea".into() });
+        let brain = Arc::new(RememberingBrain {
+            fact: "the user prefers tea".into(),
+        });
         let state = app(brain, cfg());
         let mid = store_user(&state, "lab", "hi");
 
@@ -1360,7 +1581,10 @@ mod tests {
     #[test]
     fn moods_never_enter_the_transcript() {
         let state = AppState::with_runtime(AgentRuntime::mock());
-        state.emit("lab", Message::conversation("lab", "aria", "hello there", None));
+        state.emit(
+            "lab",
+            Message::conversation("lab", "aria", "hello there", None),
+        );
         state.emit("lab", Message::mood("lab", "nox", "🤔 thinking", None));
 
         let transcript = build_transcript(&state, "lab");
@@ -1379,9 +1603,21 @@ mod tests {
             variables: std::collections::HashMap::new(),
         };
         let roster = vec![
-            RosterMember { name: "You".into(), blurb: Some("Your own voice.".into()), is_self: true },
-            RosterMember { name: "Nox".into(), blurb: Some("Dry strategist.".into()), is_self: false },
-            RosterMember { name: "Sol".into(), blurb: None, is_self: false },
+            RosterMember {
+                name: "You".into(),
+                blurb: Some("Your own voice.".into()),
+                is_self: true,
+            },
+            RosterMember {
+                name: "Nox".into(),
+                blurb: Some("Dry strategist.".into()),
+                is_self: false,
+            },
+            RosterMember {
+                name: "Sol".into(),
+                blurb: None,
+                is_self: false,
+            },
         ];
         let prompt = assemble_prompt(&persona, &roster, &[], None, &[], &[], "");
         // The user is present and flagged "(the user)"; blurbs render when set,
@@ -1401,11 +1637,27 @@ mod tests {
         };
         // Aria is in the room; the directory also carries the user and someone
         // not present.
-        let roster = vec![RosterMember { name: "Aria".into(), blurb: None, is_self: false }];
+        let roster = vec![RosterMember {
+            name: "Aria".into(),
+            blurb: None,
+            is_self: false,
+        }];
         let directory = vec![
-            MemberInfo { name: "Aria".into(), blurb: None, is_user: false },
-            MemberInfo { name: "You".into(), blurb: Some("Your own voice.".into()), is_user: true },
-            MemberInfo { name: "Nox".into(), blurb: Some("Dry strategist.".into()), is_user: false },
+            MemberInfo {
+                name: "Aria".into(),
+                blurb: None,
+                is_user: false,
+            },
+            MemberInfo {
+                name: "You".into(),
+                blurb: Some("Your own voice.".into()),
+                is_user: true,
+            },
+            MemberInfo {
+                name: "Nox".into(),
+                blurb: Some("Dry strategist.".into()),
+                is_user: false,
+            },
         ];
         let prompt = assemble_prompt(&persona, &roster, &directory, None, &[], &[], "");
 
@@ -1426,8 +1678,15 @@ mod tests {
             variables: std::collections::HashMap::new(),
         };
         // A fixed RFC 3339 timestamp with offset renders in its own section.
-        let prompt =
-            assemble_prompt(&persona, &[], &[], None, &[], &[], "2026-07-25T15:30:00+08:00");
+        let prompt = assemble_prompt(
+            &persona,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            "2026-07-25T15:30:00+08:00",
+        );
         assert!(prompt.conversation.contains("<time>"));
         assert!(prompt.conversation.contains("2026-07-25T15:30:00+08:00"));
     }
@@ -1450,7 +1709,11 @@ mod tests {
         let prompt = assemble_prompt(&persona, &[], &[], None, &transcript, &[], "");
 
         // Each line is its own element, tagged with the sender and a send time.
-        assert!(prompt.conversation.contains("<message from=\"You\" time=\""));
+        assert!(
+            prompt
+                .conversation
+                .contains("<message from=\"You\" time=\"")
+        );
         assert!(prompt.conversation.contains("2026-"));
         assert!(prompt.conversation.contains("</message>"));
         // Angle brackets in the body are escaped so they can't break the frame.
@@ -1468,11 +1731,21 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Event>(8);
         // Queue a soft event: the first agent's select picks it up and folds it
         // in at the boundary, so the second agent sees it.
-        tx.send(Event::Environment { description: "It starts to rain.".into(), urgent: false })
-            .await
-            .unwrap();
+        tx.send(Event::Environment {
+            description: "It starts to rain.".into(),
+            urgent: false,
+        })
+        .await
+        .unwrap();
 
-        let outcome = run_turn(&state, "lab", Event::User { message_id: mid }, false, &mut rx).await;
+        let outcome = run_turn(
+            &state,
+            "lab",
+            Event::User { message_id: mid },
+            false,
+            &mut rx,
+        )
+        .await;
         assert!(matches!(outcome, TurnOutcome::Done));
 
         let seen = seen.lock().unwrap();
@@ -1486,22 +1759,39 @@ mod tests {
     async fn hard_interrupt_discards_inflight_agent() {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let brain = Arc::new(GatedBrain { entered: entered.clone(), release: release.clone() });
+        let brain = Arc::new(GatedBrain {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
         let state = app(brain, cfg());
         let mid = store_user(&state, "lab", "hello");
 
         let (tx, mut rx) = mpsc::channel::<Event>(8);
         let running = state.clone();
         let handle = tokio::spawn(async move {
-            run_turn(&running, "lab", Event::User { message_id: mid }, false, &mut rx).await
+            run_turn(
+                &running,
+                "lab",
+                Event::User { message_id: mid },
+                false,
+                &mut rx,
+            )
+            .await
         });
 
         // Once an agent is mid-inference, fire a hard event (a new user message).
         entered.notified().await;
-        tx.send(Event::User { message_id: "second".into() }).await.unwrap();
+        tx.send(Event::User {
+            message_id: "second".into(),
+        })
+        .await
+        .unwrap();
 
         let outcome = handle.await.unwrap();
-        assert!(matches!(outcome, TurnOutcome::Preempted(Event::User { .. })));
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Preempted(Event::User { .. })
+        ));
 
         // The interrupted agent's line was discarded — never committed anywhere.
         let leaked = state
@@ -1519,8 +1809,12 @@ mod tests {
             system_prompt: "You are Aria.".into(),
             variables: std::collections::HashMap::new(),
         };
-        let transcript =
-            vec![ContextLine { id: "m1".into(), name: "You".into(), text: "hi".into(), ts: 0 }];
+        let transcript = vec![ContextLine {
+            id: "m1".into(),
+            name: "You".into(),
+            text: "hi".into(),
+            ts: 0,
+        }];
         let prompt = assemble_prompt(
             &persona,
             &[],
@@ -1554,7 +1848,10 @@ mod tests {
         assert_eq!(tail_after(&transcript, None).len(), 4);
         // Compressed through "b" → only c, d remain live.
         let tail = tail_after(&transcript, Some("b"));
-        assert_eq!(tail.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["c", "d"]);
+        assert_eq!(
+            tail.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+            ["c", "d"]
+        );
         // A boundary that no longer exists falls back to the whole transcript.
         assert_eq!(tail_after(&transcript, Some("gone")).len(), 4);
     }
@@ -1562,20 +1859,30 @@ mod tests {
     #[tokio::test]
     async fn compression_folds_old_lines_and_shrinks_the_tail() {
         // High-water 3, keep 1: five lines must fold the oldest four, leave one.
-        let config = LoopConfig { compress_after: 3, compress_keep: 1, ..cfg() };
-        let state = Arc::new(AppState::with_runtime(AgentRuntime {
-            brain: Arc::new(JoinBrain),
+        let config = LoopConfig {
+            compress_after: 3,
+            compress_keep: 1,
+            ..cfg()
+        };
+        let state = Arc::new(AppState::with_runtime(AgentRuntime::new(
+            Arc::new(JoinBrain),
             config,
-            mock: false,
-        }));
+            false,
+        )));
         for i in 0..5 {
-            state.emit("lab", Message::conversation("lab", "aria", format!("line{i}"), None));
+            state.emit(
+                "lab",
+                Message::conversation("lab", "aria", format!("line{i}"), None),
+            );
         }
 
         maybe_compress(&state, "lab").await;
 
         let summary = state.summary("lab");
-        assert!(summary.through_id.is_some(), "a compression should have run");
+        assert!(
+            summary.through_id.is_some(),
+            "a compression should have run"
+        );
         // The four oldest lines are folded; the newest stays verbatim.
         assert!(summary.text.contains("line0"));
         assert!(summary.text.contains("line3"));
@@ -1590,14 +1897,21 @@ mod tests {
 
     #[tokio::test]
     async fn compression_is_skipped_below_the_high_water_mark() {
-        let config = LoopConfig { compress_after: 10, compress_keep: 2, ..cfg() };
-        let state = Arc::new(AppState::with_runtime(AgentRuntime {
-            brain: Arc::new(JoinBrain),
+        let config = LoopConfig {
+            compress_after: 10,
+            compress_keep: 2,
+            ..cfg()
+        };
+        let state = Arc::new(AppState::with_runtime(AgentRuntime::new(
+            Arc::new(JoinBrain),
             config,
-            mock: false,
-        }));
+            false,
+        )));
         for i in 0..4 {
-            state.emit("lab", Message::conversation("lab", "aria", format!("line{i}"), None));
+            state.emit(
+                "lab",
+                Message::conversation("lab", "aria", format!("line{i}"), None),
+            );
         }
 
         maybe_compress(&state, "lab").await;
@@ -1609,10 +1923,17 @@ mod tests {
     #[tokio::test]
     async fn mock_runtime_never_compresses() {
         // Same volume, but a mock runtime: compression must not run (no model).
-        let config = LoopConfig { compress_after: 1, compress_keep: 0, ..cfg() };
+        let config = LoopConfig {
+            compress_after: 1,
+            compress_keep: 0,
+            ..cfg()
+        };
         let state = app(Arc::new(RuleBrain::seeded(1)), config);
         for i in 0..5 {
-            state.emit("lab", Message::conversation("lab", "aria", format!("line{i}"), None));
+            state.emit(
+                "lab",
+                Message::conversation("lab", "aria", format!("line{i}"), None),
+            );
         }
 
         maybe_compress(&state, "lab").await;
@@ -1690,9 +2011,23 @@ mod tests {
         assert!(evening.len() >= 3);
         assert_ne!(morning, evening);
         // An unknown bucket falls back to the night set rather than empty.
-        assert!(!brain.suggest(&request("weird")).await.unwrap().prompts.is_empty());
+        assert!(
+            !brain
+                .suggest(&request("weird"))
+                .await
+                .unwrap()
+                .prompts
+                .is_empty()
+        );
         // The mock makes no LLM call, so it reports no usage.
-        assert!(brain.suggest(&request("morning")).await.unwrap().usage.is_none());
+        assert!(
+            brain
+                .suggest(&request("morning"))
+                .await
+                .unwrap()
+                .usage
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1700,11 +2035,23 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let brain = Arc::new(SuggestBrain {
             calls: calls.clone(),
-            prompts: vec!["What's new?".into(), "How's everyone?".into(), "Any plans?".into()],
-            usage: Some(TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cached_prompt_tokens: 0 }),
+            prompts: vec![
+                "What's new?".into(),
+                "How's everyone?".into(),
+                "Any plans?".into(),
+            ],
+            usage: Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_prompt_tokens: 0,
+            }),
         });
         let state = app(brain, cfg());
-        state.emit("lab", Message::conversation("lab", "aria", "hi there", None));
+        state.emit(
+            "lab",
+            Message::conversation("lab", "aria", "hi there", None),
+        );
         let mut stream = state.channel("lab").subscribe();
 
         generate_suggestions(state.clone(), "lab".to_string()).await;
@@ -1728,7 +2075,12 @@ mod tests {
         assert!(streamed, "a suggestions frame should have been broadcast");
 
         // The usage-bearing pass counted as one request (feeds the cost panel).
-        let total_requests: u64 = state.debug_totals().models.values().map(|m| m.requests).sum();
+        let total_requests: u64 = state
+            .debug_totals()
+            .models
+            .values()
+            .map(|m| m.requests)
+            .sum();
         assert_eq!(total_requests, 1);
 
         // The trace carries the exact prompt the pass ran on — its system guidance
@@ -1740,7 +2092,11 @@ mod tests {
             .find(|t| t.action == "suggest")
             .expect("the suggestion pass should record a trace");
         assert_eq!(trace.system, "suggest-guidance");
-        assert!(trace.conversation.contains("Aria: hi there"), "context was {:?}", trace.conversation);
+        assert!(
+            trace.conversation.contains("Aria: hi there"),
+            "context was {:?}",
+            trace.conversation
+        );
     }
 
     #[tokio::test]

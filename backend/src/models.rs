@@ -570,3 +570,218 @@ pub struct DebugUsage {
     #[serde(default)]
     pub models: Vec<ModelUsage>,
 }
+
+/// The `GET`/`PATCH /llm/settings` response: the live LLM provider
+/// configuration, with the API key stripped to a presence flag. Built by hand
+/// from [`crate::llm_config::LlmSettings`] (never derived by serializing it
+/// directly) — that's the one place a leaked key would slip out.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSettingsView {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Whether a key is currently stored. The key itself is never sent to a
+    /// client once saved.
+    pub has_api_key: bool,
+    pub max_tokens: u64,
+    pub max_rpm: u64,
+    pub max_retries: u32,
+    pub retry_base_ms: u64,
+    pub compress_after: usize,
+    pub compress_keep: usize,
+    pub compress_max_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::llm_config::Pricing>,
+}
+
+impl From<&crate::llm_config::LlmSettings> for LlmSettingsView {
+    fn from(s: &crate::llm_config::LlmSettings) -> Self {
+        Self {
+            enabled: s.enabled,
+            base_url: s.base_url.clone(),
+            model: s.model.clone(),
+            has_api_key: s.api_key.as_deref().is_some_and(|k| !k.is_empty()),
+            max_tokens: s.max_tokens,
+            max_rpm: s.max_rpm,
+            max_retries: s.max_retries,
+            retry_base_ms: s.retry_base_ms,
+            compress_after: s.compress_after,
+            compress_keep: s.compress_keep,
+            compress_max_tokens: s.compress_max_tokens,
+            pricing: s.pricing.clone(),
+        }
+    }
+}
+
+/// A partial update to the LLM provider configuration — every field is
+/// optional; an absent field leaves the current value alone. `baseUrl` /
+/// `model` / `apiKey` treat an empty string as "clear this field", matching the
+/// endpoint's other optional-string convention (there's never a reason to
+/// *store* an empty string here). `pricing` with both rates at zero clears the
+/// configured pricing (shows token counts only) rather than pinning a $0 rate.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The new key, or `""` to clear it. Omit entirely to leave the stored key
+    /// untouched — the frontend must never send this unless the operator
+    /// actually typed a new value, or every unrelated settings save would wipe
+    /// the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rpm: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_base_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress_after: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress_keep: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress_max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::llm_config::Pricing>,
+}
+
+impl LlmSettingsPatch {
+    /// Merges this patch onto a base configuration, field by field.
+    pub fn apply(self, base: &mut crate::llm_config::LlmSettings) {
+        if let Some(v) = self.enabled {
+            base.enabled = v;
+        }
+        if let Some(v) = self.base_url {
+            base.base_url = non_empty(v);
+        }
+        if let Some(v) = self.model {
+            base.model = non_empty(v);
+        }
+        if let Some(v) = self.api_key {
+            base.api_key = non_empty(v);
+        }
+        if let Some(v) = self.max_tokens {
+            base.max_tokens = v;
+        }
+        if let Some(v) = self.max_rpm {
+            base.max_rpm = v;
+        }
+        if let Some(v) = self.max_retries {
+            base.max_retries = v;
+        }
+        if let Some(v) = self.retry_base_ms {
+            base.retry_base_ms = v;
+        }
+        if let Some(v) = self.compress_after {
+            base.compress_after = v;
+        }
+        if let Some(v) = self.compress_keep {
+            base.compress_keep = v;
+        }
+        if let Some(v) = self.compress_max_tokens {
+            base.compress_max_tokens = v;
+        }
+        if let Some(v) = self.pricing {
+            base.pricing = (v.input_per_m != 0.0 || v.output_per_m != 0.0).then_some(v);
+        }
+    }
+}
+
+/// Trims and treats blank as "unset" — the `""`-clears-a-field convention
+/// [`LlmSettingsPatch::apply`] uses for its optional string fields.
+fn non_empty(s: String) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+#[cfg(test)]
+mod llm_settings_patch_tests {
+    use super::*;
+    use crate::llm_config::LlmSettings;
+
+    fn patch() -> LlmSettingsPatch {
+        LlmSettingsPatch {
+            enabled: None,
+            base_url: None,
+            model: None,
+            api_key: None,
+            max_tokens: None,
+            max_rpm: None,
+            max_retries: None,
+            retry_base_ms: None,
+            compress_after: None,
+            compress_keep: None,
+            compress_max_tokens: None,
+            pricing: None,
+        }
+    }
+
+    #[test]
+    fn an_absent_field_leaves_the_stored_value_untouched() {
+        let mut base = LlmSettings {
+            api_key: Some("sk-existing".to_string()),
+            ..LlmSettings::default()
+        };
+        patch().apply(&mut base);
+        assert_eq!(base.api_key.as_deref(), Some("sk-existing"));
+    }
+
+    #[test]
+    fn an_empty_string_clears_the_field() {
+        let mut base = LlmSettings {
+            api_key: Some("sk-existing".to_string()),
+            ..LlmSettings::default()
+        };
+        LlmSettingsPatch {
+            api_key: Some(String::new()),
+            ..patch()
+        }
+        .apply(&mut base);
+        assert_eq!(base.api_key, None);
+    }
+
+    #[test]
+    fn a_non_empty_string_replaces_the_field() {
+        let mut base = LlmSettings::default();
+        LlmSettingsPatch {
+            model: Some("gpt-4o-mini".to_string()),
+            ..patch()
+        }
+        .apply(&mut base);
+        assert_eq!(base.model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn zero_rates_clear_pricing_instead_of_pinning_a_zero_cost() {
+        let mut base = LlmSettings {
+            pricing: Some(crate::llm_config::Pricing {
+                input_per_m: 1.0,
+                cached_input_per_m: 1.0,
+                output_per_m: 1.0,
+                currency: "USD".to_string(),
+            }),
+            ..LlmSettings::default()
+        };
+        LlmSettingsPatch {
+            pricing: Some(crate::llm_config::Pricing {
+                input_per_m: 0.0,
+                cached_input_per_m: 0.0,
+                output_per_m: 0.0,
+                currency: "USD".to_string(),
+            }),
+            ..patch()
+        }
+        .apply(&mut base);
+        assert!(base.pricing.is_none());
+    }
+}

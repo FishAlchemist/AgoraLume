@@ -115,6 +115,21 @@ export interface paths {
     /** Liveness probe — cheap "is the server up" check. */
     get: operations["health"];
   };
+  "/llm/settings": {
+    /**
+     * The live LLM provider configuration. `apiKey` is never included — only
+     * `hasApiKey`, whether one is currently stored.
+     */
+    get: operations["get_llm_settings"];
+    /**
+     * Merges a partial update onto the LLM provider configuration and applies it
+     * immediately — no restart needed. The candidate configuration is validated
+     * (the brain it describes must actually build) before anything is swapped in
+     * or written to `llm.toml`; an invalid patch is rejected with 422 and changes
+     * nothing.
+     */
+    patch: operations["update_llm_settings"];
+  };
   "/meta": {
     /**
      * The server's mode, so the client can distinguish a mock build (no LLM,
@@ -352,6 +367,68 @@ export interface components {
       timeOfDay?: string;
     };
     /**
+     * @description A partial update to the LLM provider configuration — every field is
+     * optional; an absent field leaves the current value alone. `baseUrl` /
+     * `model` / `apiKey` treat an empty string as "clear this field", matching the
+     * endpoint's other optional-string convention (there's never a reason to
+     * *store* an empty string here). `pricing` with both rates at zero clears the
+     * configured pricing (shows token counts only) rather than pinning a $0 rate.
+     */
+    LlmSettingsPatch: {
+      /**
+       * @description The new key, or `""` to clear it. Omit entirely to leave the stored key
+       * untouched — the frontend must never send this unless the operator
+       * actually typed a new value, or every unrelated settings save would wipe
+       * the key.
+       */
+      apiKey?: string | null;
+      baseUrl?: string | null;
+      compressAfter?: number | null;
+      compressKeep?: number | null;
+      /** Format: int64 */
+      compressMaxTokens?: number | null;
+      enabled?: boolean | null;
+      /** Format: int32 */
+      maxRetries?: number | null;
+      /** Format: int64 */
+      maxRpm?: number | null;
+      /** Format: int64 */
+      maxTokens?: number | null;
+      model?: string | null;
+      pricing?: null | components["schemas"]["Pricing"];
+      /** Format: int64 */
+      retryBaseMs?: number | null;
+    };
+    /**
+     * @description The `GET`/`PATCH /llm/settings` response: the live LLM provider
+     * configuration, with the API key stripped to a presence flag. Built by hand
+     * from [`crate::llm_config::LlmSettings`] (never derived by serializing it
+     * directly) — that's the one place a leaked key would slip out.
+     */
+    LlmSettingsView: {
+      baseUrl?: string | null;
+      compressAfter: number;
+      compressKeep: number;
+      /** Format: int64 */
+      compressMaxTokens: number;
+      enabled: boolean;
+      /**
+       * @description Whether a key is currently stored. The key itself is never sent to a
+       * client once saved.
+       */
+      hasApiKey: boolean;
+      /** Format: int32 */
+      maxRetries: number;
+      /** Format: int64 */
+      maxRpm: number;
+      /** Format: int64 */
+      maxTokens: number;
+      model?: string | null;
+      pricing?: null | components["schemas"]["Pricing"];
+      /** Format: int64 */
+      retryBaseMs: number;
+    };
+    /**
      * @description One persona-scoped memory: a fact a character chose to remember. Tagged with
      * the persona identity hash ([`Persona::prompt_hash`]) that was in force when it
      * was written, so a later rewrite of the persona never recalls a previous
@@ -489,6 +566,34 @@ export interface components {
      * @enum {string}
      */
     PersonaKind: "user" | "ai";
+    /**
+     * @description Token pricing used to turn usage into an estimated cost. Rates are per
+     * 1,000,000 tokens, in `currency`. A rough operator-supplied estimate — models
+     * and providers differ — so the UI always labels the result "for reference".
+     * Doubles as a wire type (`GET`/`PATCH /llm/settings`), hence `camelCase`; the
+     * one place that reads a little unusual is its own corner of `llm.toml`.
+     */
+    Pricing: {
+      /**
+       * Format: double
+       * @description Price per 1M cached input tokens. Usually cheaper than fresh input;
+       * defaults to the fresh input rate when not set (a conservative estimate
+       * that shows no cache saving until a discounted rate is provided).
+       */
+      cachedInputPerM: number;
+      /** @description Currency label the rates are quoted in. */
+      currency: string;
+      /**
+       * Format: double
+       * @description Price per 1M fresh (non-cached) input tokens.
+       */
+      inputPerM: number;
+      /**
+       * Format: double
+       * @description Price per 1M output tokens.
+       */
+      outputPerM: number;
+    };
     /**
      * @description A user-assigned, git-tag-style name for a persona identity hash
      * ([`Persona::prompt_hash`]). Held in a side table so naming a version never
@@ -1043,6 +1148,47 @@ export interface operations {
     responses: {
       /** @description Service is up */
       200: {
+        content: {
+          "text/plain": string;
+        };
+      };
+    };
+  };
+  /**
+   * The live LLM provider configuration. `apiKey` is never included — only
+   * `hasApiKey`, whether one is currently stored.
+   */
+  get_llm_settings: {
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["LlmSettingsView"];
+        };
+      };
+    };
+  };
+  /**
+   * Merges a partial update onto the LLM provider configuration and applies it
+   * immediately — no restart needed. The candidate configuration is validated
+   * (the brain it describes must actually build) before anything is swapped in
+   * or written to `llm.toml`; an invalid patch is rejected with 422 and changes
+   * nothing.
+   */
+  update_llm_settings: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["LlmSettingsPatch"];
+      };
+    };
+    responses: {
+      /** @description Applied immediately; persisted to llm.toml */
+      200: {
+        content: {
+          "application/json": components["schemas"]["LlmSettingsView"];
+        };
+      };
+      /** @description e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct */
+      422: {
         content: {
           "text/plain": string;
         };

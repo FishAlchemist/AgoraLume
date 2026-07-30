@@ -7,14 +7,16 @@
 //! the API — just as the simulated turn will give way to a real LLM.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::event::Event;
-use crate::agent::turn::{AgentRuntime, coordinator_loop, current_time_of_day, generate_suggestions};
-use crate::config::Pricing;
+use crate::agent::turn::{
+    AgentRuntime, coordinator_loop, current_time_of_day, generate_suggestions,
+};
+use crate::llm_config::{LlmConfigStore, LlmSettings, Pricing};
 use crate::models::{
     AgentTrace, Cost, GroupSuggestions, Message, ReadReceipt, TokenUsage, Turn, TurnMember,
     TurnMemberState, TurnTrigger,
@@ -136,13 +138,16 @@ impl ModelTotals {
         self.total_tokens += usage.total_tokens;
         self.cached_prompt_tokens += usage.cached_prompt_tokens;
         let Some(pricing) = pricing else { return };
-        let trace_cost =
-            pricing.estimate(usage.prompt_tokens, usage.cached_prompt_tokens, usage.completion_tokens);
+        let trace_cost = pricing.estimate(
+            usage.prompt_tokens,
+            usage.cached_prompt_tokens,
+            usage.completion_tokens,
+        );
         self.cost = Some(match self.cost.take() {
             // Same currency: keep accruing. A currency change (an operator
-            // editing `AGORALUME_LLM_PRICE_CURRENCY`) starts a fresh running
-            // total under the new currency rather than silently summing two
-            // currencies together.
+            // editing the configured pricing's `currency`) starts a fresh
+            // running total under the new currency rather than silently summing
+            // two currencies together.
             Some(acc) if acc.currency == trace_cost.currency => acc.add(trace_cost),
             _ => trace_cost,
         });
@@ -211,8 +216,20 @@ pub struct AppState {
     /// LLM usage counters and recent traces for the debug panel.
     debug: Mutex<DebugState>,
     /// Token pricing for the estimated-cost readout, or `None` to show tokens
-    /// only. Set once at startup from config.
-    pricing: Option<Pricing>,
+    /// only. Set at startup and on every `PATCH /llm/settings` — see
+    /// [`Self::set_pricing`].
+    pricing: RwLock<Option<Pricing>>,
+    /// The live LLM provider configuration backing `GET`/`PATCH /llm/settings`.
+    /// Loaded from `llm.toml` at startup ([`Self::with_llm_config`]) and written
+    /// through on every successful update ([`Self::apply_llm_settings`]); never
+    /// re-read from disk after that, so a hand edit to the file while the server
+    /// is running takes effect on the next restart, not immediately.
+    llm_settings: Mutex<LlmSettings>,
+    /// Where [`Self::apply_llm_settings`] persists changes. `None` for the
+    /// in-memory test/dev constructors ([`Self::with_runtime`],
+    /// [`Self::with_persistence`]) — updates still apply live, just don't
+    /// survive a restart.
+    llm_store: Option<LlmConfigStore>,
 }
 
 impl AppState {
@@ -240,10 +257,17 @@ impl AppState {
         // The demo history only makes sense for a throwaway in-memory run; a
         // persisted server starts each group empty and fills it from disk on
         // first access, so nothing is seeded over the saved logs.
-        let messages = if persistence.is_some() { HashMap::new() } else { seed_messages() };
+        let messages = if persistence.is_some() {
+            HashMap::new()
+        } else {
+            seed_messages()
+        };
         // The usage counters and accrued cost survive a restart the same way;
         // the per-group trace rings stay empty (rebuilt live, never persisted).
-        let usage = persistence.as_ref().and_then(Persistence::load_usage).unwrap_or_default();
+        let usage = persistence
+            .as_ref()
+            .and_then(Persistence::load_usage)
+            .unwrap_or_default();
         Self {
             workspace: Mutex::new(workspace),
             messages: Mutex::new(messages),
@@ -257,15 +281,56 @@ impl AppState {
             persistence,
             loaded_groups: Mutex::new(HashSet::new()),
             active_groups: Mutex::new(HashSet::new()),
-            debug: Mutex::new(DebugState { models: usage.models, traces: HashMap::new() }),
-            pricing: None,
+            debug: Mutex::new(DebugState {
+                models: usage.models,
+                traces: HashMap::new(),
+            }),
+            pricing: RwLock::new(None),
+            llm_settings: Mutex::new(LlmSettings::default()),
+            llm_store: None,
         }
     }
 
-    /// Sets the token pricing used for the estimated-cost readout. Called once
-    /// at startup, before the state is shared, so it takes `&mut self`.
-    pub fn set_pricing(&mut self, pricing: Option<Pricing>) {
-        self.pricing = pricing;
+    /// Wires the live LLM provider configuration in: the settings backing
+    /// `GET /llm/settings`, where [`Self::apply_llm_settings`] persists future
+    /// changes, and the pricing that drives the cost readout. Called once at
+    /// startup, before the state is shared — a plain field assignment, not the
+    /// locked update path a running server uses.
+    pub fn with_llm_config(mut self, settings: LlmSettings, store: LlmConfigStore) -> Self {
+        self.set_pricing(settings.pricing.clone());
+        self.llm_settings = Mutex::new(settings);
+        self.llm_store = Some(store);
+        self
+    }
+
+    /// Sets the token pricing used for the estimated-cost readout.
+    pub fn set_pricing(&self, pricing: Option<Pricing>) {
+        *self.pricing.write().unwrap() = pricing;
+    }
+
+    /// The live LLM provider configuration (the `GET /llm/settings` payload,
+    /// before the API key is stripped for the wire).
+    pub fn llm_settings(&self) -> LlmSettings {
+        self.llm_settings.lock().unwrap().clone()
+    }
+
+    /// Applies a new LLM configuration: builds and validates the brain it
+    /// describes, and only once that succeeds — so `llm.toml` can never end up
+    /// holding a configuration that won't boot — swaps it into the live
+    /// [`AgentRuntime`], updates the pricing used for new traces, updates the
+    /// in-memory settings `GET /llm/settings` reads, and persists to disk (a
+    /// no-op without a store, e.g. the in-memory test constructors). Returns the
+    /// applied settings, or the validation error (a bad `PATCH` is rejected,
+    /// nothing changes).
+    pub fn apply_llm_settings(&self, settings: LlmSettings) -> Result<LlmSettings, String> {
+        let (brain, config, mock) = settings.build_parts()?;
+        self.runtime.swap(brain, config, mock);
+        self.set_pricing(settings.pricing.clone());
+        *self.llm_settings.lock().unwrap() = settings.clone();
+        if let Some(store) = &self.llm_store {
+            store.save(&settings);
+        }
+        Ok(settings)
     }
 
     /// Whether state is persisted to disk (survives a restart). Surfaced through
@@ -289,18 +354,24 @@ impl AppState {
     pub fn record_trace(&self, group_id: &str, trace: AgentTrace) {
         let snapshot = {
             let mut debug = self.debug.lock().unwrap();
-            let model_key = trace.model.clone().unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+            let model_key = trace
+                .model
+                .clone()
+                .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
             let entry = debug.models.entry(model_key).or_default();
             entry.requests += 1;
             if let Some(usage) = &trace.usage {
-                entry.add_usage(usage, self.pricing.as_ref());
+                let pricing = self.pricing.read().unwrap();
+                entry.add_usage(usage, pricing.as_ref());
             }
             let ring = debug.traces.entry(group_id.to_string()).or_default();
             ring.push_back(trace.clone());
             while ring.len() > DEBUG_TRACE_CAP {
                 ring.pop_front();
             }
-            DebugTotals { models: debug.models.clone() }
+            DebugTotals {
+                models: debug.models.clone(),
+            }
         };
         if let Some(persistence) = &self.persistence {
             persistence.save_usage(&snapshot);
@@ -310,7 +381,9 @@ impl AppState {
 
     /// A snapshot of the cumulative per-model usage and accrued cost.
     pub fn debug_totals(&self) -> DebugTotals {
-        DebugTotals { models: self.debug.lock().unwrap().models.clone() }
+        DebugTotals {
+            models: self.debug.lock().unwrap().models.clone(),
+        }
     }
 
     /// The recent traces for a group, oldest first.
@@ -338,17 +411,29 @@ impl AppState {
             return;
         }
         let disk = persistence.load_messages(group_id);
-        self.messages.lock().unwrap().entry(group_id.to_string()).or_insert(disk);
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(group_id.to_string())
+            .or_insert(disk);
         // The group's compressed history rides alongside its log — pulled in the
         // same first touch so a restart resumes from the saved summary rather than
         // re-summarizing (or worse, re-sending) the whole history.
         if let Some(summary) = persistence.load_summary(group_id) {
-            self.summaries.lock().unwrap().entry(group_id.to_string()).or_insert(summary);
+            self.summaries
+                .lock()
+                .unwrap()
+                .entry(group_id.to_string())
+                .or_insert(summary);
         }
         // Cached suggestions likewise — so a restart shows the stored openers
         // immediately instead of regenerating (and spending the LLM) on first open.
         if let Some(suggestions) = persistence.load_suggestions(group_id) {
-            self.suggestions.lock().unwrap().entry(group_id.to_string()).or_insert(suggestions);
+            self.suggestions
+                .lock()
+                .unwrap()
+                .entry(group_id.to_string())
+                .or_insert(suggestions);
         }
         loaded.insert(group_id.to_string());
     }
@@ -369,7 +454,13 @@ impl AppState {
         let Some(persistence) = &self.persistence else {
             return;
         };
-        let snapshot = self.messages.lock().unwrap().get(group_id).cloned().unwrap_or_default();
+        let snapshot = self
+            .messages
+            .lock()
+            .unwrap()
+            .get(group_id)
+            .cloned()
+            .unwrap_or_default();
         persistence.save_messages(group_id, &snapshot);
     }
 
@@ -378,14 +469,22 @@ impl AppState {
     /// the lines up to and including `through_id`.
     pub fn summary(&self, group_id: &str) -> GroupSummary {
         self.ensure_loaded(group_id);
-        self.summaries.lock().unwrap().get(group_id).cloned().unwrap_or_default()
+        self.summaries
+            .lock()
+            .unwrap()
+            .get(group_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Replaces a group's compressed history after a compression pass, persisting
     /// it so the summary survives a restart.
     pub fn set_summary(&self, group_id: &str, summary: GroupSummary) {
         self.ensure_loaded(group_id);
-        self.summaries.lock().unwrap().insert(group_id.to_string(), summary.clone());
+        self.summaries
+            .lock()
+            .unwrap()
+            .insert(group_id.to_string(), summary.clone());
         if let Some(persistence) = &self.persistence {
             persistence.save_summary(group_id, &summary);
         }
@@ -397,7 +496,12 @@ impl AppState {
     /// [`Self::request_suggestions`].
     pub fn suggestions(&self, group_id: &str) -> GroupSuggestions {
         self.ensure_loaded(group_id);
-        self.suggestions.lock().unwrap().get(group_id).cloned().unwrap_or_default()
+        self.suggestions
+            .lock()
+            .unwrap()
+            .get(group_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Kicks a background suggestion generation for a group when warranted, and
@@ -448,11 +552,16 @@ impl AppState {
             return;
         };
         self.ensure_loaded(group_id);
-        self.suggestions.lock().unwrap().insert(group_id.to_string(), suggestions.clone());
+        self.suggestions
+            .lock()
+            .unwrap()
+            .insert(group_id.to_string(), suggestions.clone());
         if let Some(persistence) = &self.persistence {
             persistence.save_suggestions(group_id, &suggestions);
         }
-        let _ = self.channel(group_id).send(StreamEvent::Suggestions(suggestions));
+        let _ = self
+            .channel(group_id)
+            .send(StreamEvent::Suggestions(suggestions));
     }
 
     /// The id of the most recent conversation line in a group's log (skipping
@@ -461,12 +570,16 @@ impl AppState {
     /// the latest message.
     fn last_conversation_id(&self, group_id: &str) -> Option<String> {
         self.ensure_loaded(group_id);
-        self.messages.lock().unwrap().get(group_id).and_then(|list| {
-            list.iter().rev().find_map(|m| match m {
-                Message::Conversation { id, .. } => Some(id.clone()),
-                _ => None,
+        self.messages
+            .lock()
+            .unwrap()
+            .get(group_id)
+            .and_then(|list| {
+                list.iter().rev().find_map(|m| match m {
+                    Message::Conversation { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
             })
-        })
     }
 
     /// Hands an event to a group's coordinator, spawning the coordinator task on
@@ -488,7 +601,11 @@ impl AppState {
             .entry(group_id.to_string())
             .or_insert_with(|| {
                 let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
-                tokio::spawn(coordinator_loop(self.clone(), group_id.to_string(), receiver));
+                tokio::spawn(coordinator_loop(
+                    self.clone(),
+                    group_id.to_string(),
+                    receiver,
+                ));
                 sender
             })
             .clone()
@@ -705,17 +822,29 @@ impl AppState {
         let trigger_idx = list.iter().rposition(
             |m| matches!(m, Message::Conversation { persona_id, .. } if *persona_id == self_id),
         )?;
-        let Message::Conversation { id: trigger_id, ts, text, read_by, .. } = &list[trigger_idx]
+        let Message::Conversation {
+            id: trigger_id,
+            ts,
+            text,
+            read_by,
+            ..
+        } = &list[trigger_idx]
         else {
             return None;
         };
-        let readers: HashSet<&str> =
-            read_by.as_deref().unwrap_or_default().iter().map(String::as_str).collect();
+        let readers: HashSet<&str> = read_by
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .collect();
         // The first reply per member after the trigger, until the user speaks
         // again — the avatar's jump target.
         let mut reply_of: HashMap<&str, &str> = HashMap::new();
         for m in &list[trigger_idx + 1..] {
-            let Message::Conversation { persona_id, id, .. } = m else { continue };
+            let Message::Conversation { persona_id, id, .. } = m else {
+                continue;
+            };
             if *persona_id == self_id {
                 break;
             }
@@ -732,7 +861,11 @@ impl AppState {
                 } else {
                     TurnMemberState::Pending
                 };
-                TurnMember { persona_id: pid.clone(), state, reply_id: reply.map(|id| id.to_string()) }
+                TurnMember {
+                    persona_id: pid.clone(),
+                    state,
+                    reply_id: reply.map(|id| id.to_string()),
+                }
             })
             .collect();
         Some(Turn {
@@ -830,7 +963,10 @@ impl AppState {
 
     /// Stores a turn snapshot as the group's current turn and broadcasts it.
     fn publish_turn(&self, group_id: &str, turn: Turn) {
-        self.turns.lock().unwrap().insert(group_id.to_string(), turn.clone());
+        self.turns
+            .lock()
+            .unwrap()
+            .insert(group_id.to_string(), turn.clone());
         let _ = self.channel(group_id).send(StreamEvent::Turn(turn));
     }
 }
@@ -875,4 +1011,103 @@ fn seed_messages() -> HashMap<String, Vec<Message>> {
             vec![Message::mood("lab", "nox", "🤔 focused", None)],
         ),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::now_ms;
+
+    #[test]
+    fn apply_llm_settings_rejects_an_incomplete_config_without_changing_anything() {
+        let state = AppState::with_runtime(AgentRuntime::mock());
+        let before = state.llm_settings().enabled;
+
+        // enabled with neither base_url nor model set: build_parts must reject
+        // this before anything is swapped or persisted.
+        let bad = LlmSettings {
+            enabled: true,
+            ..LlmSettings::default()
+        };
+        let err = state.apply_llm_settings(bad).unwrap_err();
+
+        assert!(err.contains("base_url"));
+        assert!(
+            state.runtime.is_mock(),
+            "the runtime must not have been swapped"
+        );
+        assert_eq!(
+            state.llm_settings().enabled,
+            before,
+            "settings must not have changed"
+        );
+    }
+
+    #[test]
+    fn apply_llm_settings_enabling_a_valid_endpoint_swaps_the_runtime() {
+        let state = AppState::with_runtime(AgentRuntime::mock());
+        let settings = LlmSettings {
+            enabled: true,
+            base_url: Some("http://localhost:11434/v1".to_string()),
+            model: Some("llama3.1".to_string()),
+            ..LlmSettings::default()
+        };
+
+        let applied = state
+            .apply_llm_settings(settings)
+            .expect("a valid endpoint applies");
+
+        assert!(applied.enabled);
+        assert!(
+            !state.runtime.is_mock(),
+            "the runtime must have been swapped to the real brain"
+        );
+    }
+
+    #[test]
+    fn apply_llm_settings_updates_the_pricing_used_by_new_traces() {
+        let state = AppState::with_runtime(AgentRuntime::mock());
+        let pricing = Pricing {
+            input_per_m: 1.0,
+            cached_input_per_m: 0.5,
+            output_per_m: 2.0,
+            currency: "USD".to_string(),
+        };
+        state
+            .apply_llm_settings(LlmSettings {
+                pricing: Some(pricing),
+                ..LlmSettings::default()
+            })
+            .expect("disabled config with pricing still applies");
+
+        state.record_trace(
+            "lab",
+            AgentTrace {
+                ts: now_ms(),
+                group_id: "lab".to_string(),
+                persona_id: "aria".to_string(),
+                persona_name: "Aria".to_string(),
+                system: String::new(),
+                conversation: String::new(),
+                action: "read".to_string(),
+                message: None,
+                mood: None,
+                usage: Some(TokenUsage {
+                    prompt_tokens: 1_000_000,
+                    completion_tokens: 0,
+                    total_tokens: 1_000_000,
+                    cached_prompt_tokens: 0,
+                }),
+                model: None,
+            },
+        );
+
+        let totals = state.debug_totals();
+        let cost = totals
+            .models
+            .get(UNKNOWN_MODEL)
+            .and_then(|m| m.cost.as_ref())
+            .expect("costed");
+        assert_eq!(cost.input, 1.0, "priced at the rate just applied");
+    }
 }

@@ -10,6 +10,7 @@
 
 mod agent;
 mod config;
+mod llm_config;
 mod models;
 mod persist;
 mod routes;
@@ -24,9 +25,9 @@ use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
-use crate::agent::llm::{LlmBrain, LlmConfig};
 use crate::agent::turn::AgentRuntime;
 use crate::config::Config;
+use crate::llm_config::LlmConfigStore;
 use crate::persist::Persistence;
 use crate::state::AppState;
 
@@ -60,58 +61,46 @@ async fn main() {
 
     let config = Config::from_env();
 
-    // Pick the agent runtime the config asks for. Mock is the default so a plain
-    // run never spends API budget; `AGORALUME_LLM` opts into a real model driven
-    // by the OpenAI-compatible `llm_*` settings.
-    let runtime = if config.llm {
-        let (Some(base_url), Some(model)) =
-            (config.llm_base_url.as_deref(), config.llm_model.as_deref())
-        else {
-            eprintln!(
-                "AGORALUME_LLM is set but the endpoint is not configured.\n\
-                 Set AGORALUME_LLM_BASE_URL (e.g. https://api.openai.com/v1 or \
-                 http://localhost:11434/v1) and AGORALUME_LLM_MODEL, plus \
-                 AGORALUME_LLM_API_KEY if your endpoint needs a key."
+    // The LLM provider configuration lives in `llm.toml` under the data dir now,
+    // not environment variables — see `llm_config` for why (hand-editable,
+    // hot-reloadable, and the one place that knows to never echo the API key
+    // back to a client). Always loaded (and, on first run, seeded) regardless of
+    // whether chat history persists below: losing a configured endpoint and key
+    // on a throwaway mock run would defeat the point of moving off env vars.
+    let llm_store = LlmConfigStore::new(&config.data_dir);
+    let llm_settings = llm_store.load();
+
+    // Building the runtime can fail (e.g. `enabled = true` with an incomplete
+    // endpoint, or a client that fails to construct) without taking the whole
+    // server down over one bad field: fall back to mock replies and say why, so
+    // the operator can fix it from the Settings page (applies immediately) or
+    // the file (takes effect on the next restart) rather than staring at a
+    // process that just exited.
+    let runtime = match llm_settings.build_runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "llm.toml has `enabled = true` but couldn't build a working LLM brain; \
+                 starting in mock mode instead"
             );
-            std::process::exit(1);
-        };
-        let api_key = config.llm_api_key.as_deref().unwrap_or("");
-        match LlmBrain::new(LlmConfig {
-            base_url,
-            model,
-            api_key,
-            max_tokens: config.llm_max_tokens,
-            summary_max_tokens: config.compress_max_tokens,
-            max_rpm: config.llm_max_rpm,
-            max_retries: config.llm_max_retries,
-            retry_base_ms: config.llm_retry_base_ms,
-        }) {
-            Ok(brain) => {
-                let mut runtime = AgentRuntime::llm(Arc::new(brain));
-                runtime.config.compress_after = config.compress_after;
-                runtime.config.compress_keep = config.compress_keep;
-                runtime
-            }
-            Err(e) => {
-                eprintln!("failed to initialise the LLM brain: {e}");
-                std::process::exit(1);
-            }
+            AgentRuntime::mock()
         }
-    } else {
-        AgentRuntime::mock()
     };
 
     // Persistence is optional: on, the workspace and chat logs live under the
-    // data dir and survive a restart; off, everything is in-memory.
-    let mut state = if config.persist {
+    // data dir and survive a restart; off, everything is in-memory. Defaults to
+    // whether a real model is configured — a real run is worth keeping, a mock
+    // demo is throwaway — but either can be forced via `AGORALUME_PERSIST`.
+    let persist = config.persist_override.unwrap_or(llm_settings.enabled);
+    let state = if persist {
         AppState::with_persistence(runtime, Persistence::new(&config.data_dir))
     } else {
         AppState::with_runtime(runtime)
-    };
-    // Token pricing (if configured) drives the debug panel's estimated cost.
-    state.set_pricing(config.pricing.clone());
+    }
+    .with_llm_config(llm_settings, llm_store);
     let state = Arc::new(state);
-    let app = routes::router(state);
+    let app = routes::router(state.clone());
 
     // Bundle mode: if a built frontend sits next to us, serve it from the same
     // origin as the API so one executable is the whole site. Unknown paths fall
@@ -158,12 +147,20 @@ async fn main() {
     let url = format!("http://{host}:{}", addr.port());
 
     // Reflect the actual reply source: a real model, or the rule-based mock.
-    let replies = if config.llm { "LLM-backed replies" } else { "simulated replies (mock)" };
-    let store = if config.persist { "persisted store" } else { "in-memory store" };
+    let replies = if state.runtime.is_mock() {
+        "simulated replies (mock)"
+    } else {
+        "LLM-backed replies"
+    };
+    let store = if persist {
+        "persisted store"
+    } else {
+        "in-memory store"
+    };
     tracing::info!(
         %url,
         data_dir = %config.data_dir,
-        persist = config.persist,
+        persist,
         serving_web = web_dir.is_some(),
         "AgoraLume backend listening ({store}; {replies})"
     );

@@ -464,6 +464,50 @@ paths:
             text/plain:
               schema:
                 type: string
+  /llm/settings:
+    get:
+      tags:
+      - llm
+      summary: |-
+        The live LLM provider configuration. `apiKey` is never included — only
+        `hasApiKey`, whether one is currently stored.
+      operationId: get_llm_settings
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LlmSettingsView'
+    patch:
+      tags:
+      - llm
+      summary: |-
+        Merges a partial update onto the LLM provider configuration and applies it
+        immediately — no restart needed. The candidate configuration is validated
+        (the brain it describes must actually build) before anything is swapped in
+        or written to `llm.toml`; an invalid patch is rejected with 422 and changes
+        nothing.
+      operationId: update_llm_settings
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LlmSettingsPatch'
+        required: true
+      responses:
+        '200':
+          description: Applied immediately; persisted to llm.toml
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LlmSettingsView'
+        '422':
+          description: e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct
+          content:
+            text/plain:
+              schema:
+                type: string
   /meta:
     get:
       tags:
@@ -1080,6 +1124,144 @@ components:
             The coarse time-of-day bucket the suggestions were tuned for
             (`morning` / `afternoon` / `evening` / `night`) — lets the server tell when
             they've gone stale against the clock, and the UI hint the framing.
+    LlmSettingsPatch:
+      type: object
+      description: |-
+        A partial update to the LLM provider configuration — every field is
+        optional; an absent field leaves the current value alone. `baseUrl` /
+        `model` / `apiKey` treat an empty string as "clear this field", matching the
+        endpoint's other optional-string convention (there's never a reason to
+        *store* an empty string here). `pricing` with both rates at zero clears the
+        configured pricing (shows token counts only) rather than pinning a $0 rate.
+      properties:
+        apiKey:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The new key, or `""` to clear it. Omit entirely to leave the stored key
+            untouched — the frontend must never send this unless the operator
+            actually typed a new value, or every unrelated settings save would wipe
+            the key.
+        baseUrl:
+          type:
+          - string
+          - 'null'
+        compressAfter:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        compressKeep:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        compressMaxTokens:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+        enabled:
+          type:
+          - boolean
+          - 'null'
+        maxRetries:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+        maxRpm:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+        maxTokens:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+        model:
+          type:
+          - string
+          - 'null'
+        pricing:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Pricing'
+        retryBaseMs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+    LlmSettingsView:
+      type: object
+      description: |-
+        The `GET`/`PATCH /llm/settings` response: the live LLM provider
+        configuration, with the API key stripped to a presence flag. Built by hand
+        from [`crate::llm_config::LlmSettings`] (never derived by serializing it
+        directly) — that's the one place a leaked key would slip out.
+      required:
+      - enabled
+      - hasApiKey
+      - maxTokens
+      - maxRpm
+      - maxRetries
+      - retryBaseMs
+      - compressAfter
+      - compressKeep
+      - compressMaxTokens
+      properties:
+        baseUrl:
+          type:
+          - string
+          - 'null'
+        compressAfter:
+          type: integer
+          minimum: 0
+        compressKeep:
+          type: integer
+          minimum: 0
+        compressMaxTokens:
+          type: integer
+          format: int64
+          minimum: 0
+        enabled:
+          type: boolean
+        hasApiKey:
+          type: boolean
+          description: |-
+            Whether a key is currently stored. The key itself is never sent to a
+            client once saved.
+        maxRetries:
+          type: integer
+          format: int32
+          minimum: 0
+        maxRpm:
+          type: integer
+          format: int64
+          minimum: 0
+        maxTokens:
+          type: integer
+          format: int64
+          minimum: 0
+        model:
+          type:
+          - string
+          - 'null'
+        pricing:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Pricing'
+        retryBaseMs:
+          type: integer
+          format: int64
+          minimum: 0
     Memory:
       type: object
       description: |-
@@ -1370,6 +1552,38 @@ components:
       enum:
       - user
       - ai
+    Pricing:
+      type: object
+      description: |-
+        Token pricing used to turn usage into an estimated cost. Rates are per
+        1,000,000 tokens, in `currency`. A rough operator-supplied estimate — models
+        and providers differ — so the UI always labels the result "for reference".
+        Doubles as a wire type (`GET`/`PATCH /llm/settings`), hence `camelCase`; the
+        one place that reads a little unusual is its own corner of `llm.toml`.
+      required:
+      - inputPerM
+      - cachedInputPerM
+      - outputPerM
+      - currency
+      properties:
+        cachedInputPerM:
+          type: number
+          format: double
+          description: |-
+            Price per 1M cached input tokens. Usually cheaper than fresh input;
+            defaults to the fresh input rate when not set (a conservative estimate
+            that shows no cache saving until a discounted rate is provided).
+        currency:
+          type: string
+          description: Currency label the rates are quoted in.
+        inputPerM:
+          type: number
+          format: double
+          description: Price per 1M fresh (non-cached) input tokens.
+        outputPerM:
+          type: number
+          format: double
+          description: Price per 1M output tokens.
     PromptLabel:
       type: object
       description: |-
@@ -1624,3 +1838,5 @@ tags:
   description: Chat rooms and their membership
 - name: settings
   description: Client preferences
+- name: llm
+  description: 'Operator: real-model provider configuration'

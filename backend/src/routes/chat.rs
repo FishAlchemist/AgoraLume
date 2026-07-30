@@ -47,7 +47,7 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
     // Liveness and mode are independent facts. `llm` = a real model drives the
     // agents (else the rule-based mock); `persistent` = state is written to disk.
     // "Mock" is the precise combination of neither: no LLM and no persistence.
-    let llm = !state.runtime.mock;
+    let llm = !state.runtime.is_mock();
     let persistent = state.persistent();
     Json(ServerMeta {
         mock: !llm && !persistent,

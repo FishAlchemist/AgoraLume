@@ -7,6 +7,7 @@
 //! `openapi.yml` with the binary's `--dump-openapi` flag.
 
 mod chat;
+mod llm;
 mod workspace;
 
 use std::sync::Arc;
@@ -40,7 +41,8 @@ use crate::state::AppState;
         (name = "departments", description = "Sub-units within an organization"),
         (name = "personas", description = "User identities and AI agents"),
         (name = "groups", description = "Chat rooms and their membership"),
-        (name = "settings", description = "Client preferences")
+        (name = "settings", description = "Client preferences"),
+        (name = "llm", description = "Operator: real-model provider configuration")
     )
 )]
 struct ApiDoc;
@@ -51,13 +53,19 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(chat::router())
         .merge(workspace::router())
+        .merge(llm::router())
 }
 
 /// Builds the runtime router with CORS and request tracing.
 pub fn router(state: Arc<AppState>) -> Router {
     // The frontend is a separate static origin (its dev server, or wherever the
-    // SPA is hosted), so allow cross-origin access. These endpoints carry no
-    // credentials, so a wildcard origin is safe.
+    // SPA is hosted), so allow cross-origin access. No request needs cookies or
+    // other ambient browser credentials, so a wildcard origin doesn't grant a
+    // page access to another user's session the way it would with cookie auth.
+    // It does mean the whole API — including `PATCH /llm/settings`, which can
+    // update the stored provider key — is reachable, unauthenticated, from any
+    // page open in the same browser; that's the same trust model as the rest of
+    // this API (no auth anywhere yet), not something new to this route.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
