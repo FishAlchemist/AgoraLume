@@ -28,6 +28,15 @@ pub struct Config {
     /// when the SPA is actually being served (bundle mode); a plain API run
     /// never launches a browser. On by default; set `AGORALUME_OPEN=0` to skip.
     pub open_browser: bool,
+    /// Origins allowed to make cross-origin requests, from a comma-separated
+    /// `AGORALUME_CORS_ORIGINS` (e.g. `http://localhost:5173,https://chat.example.com`).
+    /// `None` (unset) keeps the permissive default — any origin — since the
+    /// frontend's origin isn't fixed (a dev server on some port, or wherever
+    /// the SPA ends up hosted) and most setups have no fixed origin to name.
+    /// An operator who does know theirs can lock this down without rebuilding
+    /// the binary; see `routes::router` for what this buys against a request
+    /// like `PATCH /llm/settings` from an unrelated page in the same browser.
+    pub cors_allowed_origins: Option<Vec<String>>,
 }
 
 impl Config {
@@ -67,14 +76,35 @@ impl Config {
                 )
             })
             .unwrap_or(true);
+        let cors_allowed_origins = env_csv_opt("AGORALUME_CORS_ORIGINS");
         Self {
             bind,
             data_dir,
             persist_override,
             web_dir,
             open_browser,
+            cors_allowed_origins,
         }
     }
+}
+
+/// Reads a comma-separated list, trimming whitespace and dropping empty
+/// entries. `None` when the variable is unset or every entry was empty.
+fn env_csv_opt(name: &str) -> Option<Vec<String>> {
+    let raw = std::env::var(name).ok()?;
+    let items = parse_csv(&raw);
+    if items.is_empty() { None } else { Some(items) }
+}
+
+/// Splits a comma-separated string, trimming whitespace and dropping empty
+/// entries. Pulled out of [`env_csv_opt`] so the parsing itself is testable
+/// without touching process-wide environment state.
+fn parse_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Reads a tri-state boolean flag: `None` when unset, else `Some(true)` for
@@ -87,4 +117,24 @@ fn env_flag_opt(name: &str) -> Option<bool> {
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_csv_trims_and_drops_blanks() {
+        let got = parse_csv(" http://localhost:5173 ,, https://chat.example.com ,");
+        assert_eq!(
+            got,
+            vec!["http://localhost:5173", "https://chat.example.com"]
+        );
+    }
+
+    #[test]
+    fn parse_csv_all_blank_is_empty() {
+        assert!(parse_csv(" , , ").is_empty());
+        assert!(parse_csv("").is_empty());
+    }
 }

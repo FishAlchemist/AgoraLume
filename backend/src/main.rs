@@ -100,7 +100,7 @@ async fn main() {
     }
     .with_llm_config(llm_settings, llm_store);
     let state = Arc::new(state);
-    let app = routes::router(state.clone());
+    let app = routes::router(state.clone(), config.cors_allowed_origins.as_deref());
 
     // Bundle mode: if a built frontend sits next to us, serve it from the same
     // origin as the API so one executable is the whole site. Unknown paths fall

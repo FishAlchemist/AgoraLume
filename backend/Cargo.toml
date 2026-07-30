@@ -30,3 +30,6 @@ webbrowser = "1.2.1"
 # `test-util` (not part of tokio's `full`) enables paused-clock tests, so the
 # rate limiter's timing can be asserted without real waits.
 tokio = { version = "1.53.1", features = ["test-util"] }
+# `util` brings `ServiceExt::oneshot`, for driving the router directly in CORS
+# preflight tests without binding a real socket.
+tower = { version = "0.5", features = ["util"] }
