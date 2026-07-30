@@ -122,6 +122,64 @@ export interface DebugUsage {
 }
 
 /**
+ * Token pricing rates, per 1,000,000 tokens — the operator's estimate behind
+ * {@link DebugUsage.estimatedCost}. Distinct from {@link Cost}: this is the
+ * configured *rate*, not a computed total.
+ */
+export interface PricingSettings {
+  inputPerM: number;
+  cachedInputPerM: number;
+  outputPerM: number;
+  currency: string;
+}
+
+/**
+ * The live LLM provider configuration — `GET`/`PATCH /llm/settings`. Operator
+ * config for a self-hosted backend, not part of the {@link ChatApi} contract:
+ * see `lib/api/llmSettings.ts`. The API key is never included, only
+ * {@link hasApiKey}.
+ */
+export interface LlmSettingsView {
+  enabled: boolean;
+  baseUrl?: string | null;
+  model?: string | null;
+  /** Whether a key is currently stored; the key itself is never sent here. */
+  hasApiKey: boolean;
+  maxTokens: number;
+  maxRpm: number;
+  maxRetries: number;
+  retryBaseMs: number;
+  compressAfter: number;
+  compressKeep: number;
+  compressMaxTokens: number;
+  pricing?: PricingSettings | null;
+}
+
+/**
+ * A partial update to the LLM provider configuration. Every field is
+ * optional and independent: an omitted field leaves the stored value
+ * untouched. `baseUrl` / `model` / `apiKey` treat `""` as "clear this field".
+ * `apiKey` must be omitted (not sent as `""` or the empty string) unless the
+ * operator actually typed a new key — sending it on every unrelated save
+ * would wipe the stored key. `pricing` with both rates at `0` clears the
+ * configured pricing.
+ */
+export interface LlmSettingsPatch {
+  enabled?: boolean;
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
+  maxTokens?: number;
+  maxRpm?: number;
+  maxRetries?: number;
+  retryBaseMs?: number;
+  compressAfter?: number;
+  compressKeep?: number;
+  compressMaxTokens?: number;
+  pricing?: PricingSettings;
+}
+
+/**
  * What the data source offers. `mock` means no LLM and no persistence (the
  * in-memory build) — distinct from whether the backend is reachable. The
  * in-browser mock reports `mock: true` too.
