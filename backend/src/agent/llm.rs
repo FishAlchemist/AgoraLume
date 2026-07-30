@@ -1101,6 +1101,10 @@ impl AgentBrain for LlmBrain {
             }
         }
     }
+
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model)
+    }
 }
 
 #[cfg(test)]

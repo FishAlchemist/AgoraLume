@@ -16,8 +16,8 @@ use crate::agent::event::Event;
 use crate::agent::turn::{AgentRuntime, coordinator_loop, current_time_of_day, generate_suggestions};
 use crate::config::Pricing;
 use crate::models::{
-    AgentTrace, GroupSuggestions, Message, ReadReceipt, Turn, TurnMember, TurnMemberState,
-    TurnTrigger,
+    AgentTrace, Cost, GroupSuggestions, Message, ReadReceipt, TokenUsage, Turn, TurnMember,
+    TurnMemberState, TurnTrigger,
 };
 use crate::persist::Persistence;
 use crate::workspace::Workspace;
@@ -84,17 +84,69 @@ struct SuggestGate {
     last_started_ms: i64,
 }
 
-/// Cumulative LLM usage since startup, plus recent per-group traces — the data
-/// behind the debug/usage panel.
+/// Cumulative LLM usage, plus recent per-group traces — the data behind the
+/// debug/usage panel. `models` (keyed by model name) is seeded from disk when
+/// persistence is on (see [`AppState::build`]) and survives a restart; the
+/// per-group traces are rebuilt fresh each run — cheap to lose, expensive to
+/// keep growing forever.
 #[derive(Default)]
 struct DebugState {
-    requests: u64,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-    cached_prompt_tokens: u64,
+    /// Usage and accrued cost, broken down by model — e.g. after switching
+    /// providers mid-run, each model keeps its own running total. Traces from a
+    /// brain with no real model (the rule-based mock) land under the
+    /// `"unknown"` key.
+    models: HashMap<String, ModelTotals>,
     /// Recent traces per group, oldest first, capped at [`DEBUG_TRACE_CAP`].
     traces: HashMap<String, VecDeque<AgentTrace>>,
+}
+
+/// The fallback key for [`DebugState::models`] when a trace carries no model
+/// name — the rule-based mock, or a scripted test brain.
+const UNKNOWN_MODEL: &str = "unknown";
+
+/// One model's running usage and accrued cost. Mirrors [`crate::models::ModelUsage`]
+/// (the wire type), but stays internal: it's the accumulator, not the response
+/// shape — [`AppState::debug_totals`]'s caller derives the grand totals and
+/// `Vec<ModelUsage>` from a map of these.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelTotals {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_prompt_tokens: u64,
+    /// The running spend for this model, accrued one trace at a time at the
+    /// rate configured when *that* trace was recorded (see
+    /// [`AppState::record_trace`]) — so a later change to the configured rates
+    /// never reprices history. `None` until pricing has been configured for at
+    /// least one recorded trace against this model.
+    pub cost: Option<Cost>,
+}
+
+impl ModelTotals {
+    /// Folds one trace's token usage (and, when pricing is configured, its
+    /// cost) in. Does *not* bump `requests` — the caller counts every trace as
+    /// a request regardless of whether it carried usage (the mock brain's
+    /// traces carry none), so that increment happens once in
+    /// [`AppState::record_trace`] rather than here.
+    fn add_usage(&mut self, usage: &TokenUsage, pricing: Option<&Pricing>) {
+        self.prompt_tokens += usage.prompt_tokens;
+        self.completion_tokens += usage.completion_tokens;
+        self.total_tokens += usage.total_tokens;
+        self.cached_prompt_tokens += usage.cached_prompt_tokens;
+        let Some(pricing) = pricing else { return };
+        let trace_cost =
+            pricing.estimate(usage.prompt_tokens, usage.cached_prompt_tokens, usage.completion_tokens);
+        self.cost = Some(match self.cost.take() {
+            // Same currency: keep accruing. A currency change (an operator
+            // editing `AGORALUME_LLM_PRICE_CURRENCY`) starts a fresh running
+            // total under the new currency rather than silently summing two
+            // currencies together.
+            Some(acc) if acc.currency == trace_cost.currency => acc.add(trace_cost),
+            _ => trace_cost,
+        });
+    }
 }
 
 /// A group's compressed older history. `text` is the running summary the
@@ -108,15 +160,14 @@ pub struct GroupSummary {
     pub through_id: Option<String>,
 }
 
-/// A snapshot of the cumulative usage counters, for building the `/debug/usage`
-/// response outside the lock.
-#[derive(Clone, Copy, Default)]
+/// A snapshot of the cumulative per-model usage, for building the
+/// `/debug/usage` response outside the lock and for persisting to disk. The
+/// on-disk shape is bare (no version envelope) — losing this file just resets
+/// the readout to zero, not a data loss.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DebugTotals {
-    pub requests: u64,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    pub cached_prompt_tokens: u64,
+    pub models: HashMap<String, ModelTotals>,
 }
 
 pub struct AppState {
@@ -190,6 +241,9 @@ impl AppState {
         // persisted server starts each group empty and fills it from disk on
         // first access, so nothing is seeded over the saved logs.
         let messages = if persistence.is_some() { HashMap::new() } else { seed_messages() };
+        // The usage counters and accrued cost survive a restart the same way;
+        // the per-group trace rings stay empty (rebuilt live, never persisted).
+        let usage = persistence.as_ref().and_then(Persistence::load_usage).unwrap_or_default();
         Self {
             workspace: Mutex::new(workspace),
             messages: Mutex::new(messages),
@@ -203,7 +257,7 @@ impl AppState {
             persistence,
             loaded_groups: Mutex::new(HashSet::new()),
             active_groups: Mutex::new(HashSet::new()),
-            debug: Mutex::new(DebugState::default()),
+            debug: Mutex::new(DebugState { models: usage.models, traces: HashMap::new() }),
             pricing: None,
         }
     }
@@ -214,49 +268,49 @@ impl AppState {
         self.pricing = pricing;
     }
 
-    /// The configured token pricing, if any.
-    pub fn pricing(&self) -> Option<&Pricing> {
-        self.pricing.as_ref()
-    }
-
     /// Whether state is persisted to disk (survives a restart). Surfaced through
     /// `/meta`.
     pub fn persistent(&self) -> bool {
         self.persistence.is_some()
     }
 
-    /// Records a debug trace of one agent inference: accumulate its usage into
-    /// the running totals, keep it in the group's recent-trace ring, and stream
-    /// it to any open debug panels. Every inference is one request.
+    /// Records a debug trace of one agent inference: accumulate its usage (and,
+    /// when pricing is configured, its cost) into the running per-model totals,
+    /// keep it in the group's recent-trace ring, persist the totals, and stream
+    /// the trace to any open debug panels. Every inference is one request,
+    /// filed under the model that produced it (or [`UNKNOWN_MODEL`] for a brain
+    /// with no real model).
+    ///
+    /// Cost is priced *at this moment*, with whatever rates are configured right
+    /// now, and added to that model's running total — not recomputed later from
+    /// lifetime tokens. That way a future change to the configured rates (or a
+    /// switch to a different model) never reprices history; it only changes
+    /// what new traces cost.
     pub fn record_trace(&self, group_id: &str, trace: AgentTrace) {
-        {
+        let snapshot = {
             let mut debug = self.debug.lock().unwrap();
-            debug.requests += 1;
+            let model_key = trace.model.clone().unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+            let entry = debug.models.entry(model_key).or_default();
+            entry.requests += 1;
             if let Some(usage) = &trace.usage {
-                debug.prompt_tokens += usage.prompt_tokens;
-                debug.completion_tokens += usage.completion_tokens;
-                debug.total_tokens += usage.total_tokens;
-                debug.cached_prompt_tokens += usage.cached_prompt_tokens;
+                entry.add_usage(usage, self.pricing.as_ref());
             }
             let ring = debug.traces.entry(group_id.to_string()).or_default();
             ring.push_back(trace.clone());
             while ring.len() > DEBUG_TRACE_CAP {
                 ring.pop_front();
             }
+            DebugTotals { models: debug.models.clone() }
+        };
+        if let Some(persistence) = &self.persistence {
+            persistence.save_usage(&snapshot);
         }
         let _ = self.channel(group_id).send(StreamEvent::Debug(trace));
     }
 
-    /// A snapshot of the cumulative usage counters.
+    /// A snapshot of the cumulative per-model usage and accrued cost.
     pub fn debug_totals(&self) -> DebugTotals {
-        let debug = self.debug.lock().unwrap();
-        DebugTotals {
-            requests: debug.requests,
-            prompt_tokens: debug.prompt_tokens,
-            completion_tokens: debug.completion_tokens,
-            total_tokens: debug.total_tokens,
-            cached_prompt_tokens: debug.cached_prompt_tokens,
-        }
+        DebugTotals { models: self.debug.lock().unwrap().models.clone() }
     }
 
     /// The recent traces for a group, oldest first.

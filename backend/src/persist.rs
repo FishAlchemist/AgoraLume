@@ -7,6 +7,7 @@
 //! messages/<group_id>.json     one group's chat log (loaded lazily, saved on change)
 //! summaries/<group_id>.json    one group's compressed older history (loaded with its log)
 //! suggestions/<group_id>.json  one group's cached conversation starters (loaded with its log)
+//! usage.json                   cumulative LLM usage counters + accrued cost (loaded at startup)
 //! ```
 //!
 //! Splitting the message logs off the workspace means a running server only
@@ -32,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{GroupSuggestions, Message};
-use crate::state::GroupSummary;
+use crate::state::{DebugTotals, GroupSummary};
 use crate::workspace::WorkspaceSnapshot;
 
 /// On-disk format version for `workspace.json`. Bump this **only** on a breaking
@@ -79,6 +80,10 @@ impl Persistence {
 
     fn suggestions_path(&self, group_id: &str) -> PathBuf {
         self.dir.join("suggestions").join(format!("{}.json", sanitize(group_id)))
+    }
+
+    fn usage_path(&self) -> PathBuf {
+        self.dir.join("usage.json")
     }
 
     /// Loads the persisted workspace, or `None` when there is no saved file yet
@@ -228,6 +233,35 @@ impl Persistence {
             tracing::warn!(group = %group_id, error = %e, "failed to persist cached suggestions");
         }
     }
+
+    /// Loads the cumulative LLM usage counters and accrued cost, or `None` when
+    /// there is no saved file yet (a fresh install) or it is unreadable/corrupt —
+    /// in which case the caller starts the counters at zero. Unlike
+    /// `workspace.json`, a lost or corrupt file is not quarantined: it just
+    /// resets a readout, not user-authored data.
+    pub fn load_usage(&self) -> Option<DebugTotals> {
+        let path = self.usage_path();
+        let bytes = std::fs::read(&path).ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(totals) => Some(totals),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ignoring corrupt usage totals; starting the counters at zero"
+                );
+                None
+            }
+        }
+    }
+
+    /// Writes the cumulative usage counters and accrued cost out. Called after
+    /// every recorded trace; failures are logged, not fatal.
+    pub fn save_usage(&self, totals: &DebugTotals) {
+        if let Err(e) = write_atomic(&self.usage_path(), totals) {
+            tracing::warn!(error = %e, "failed to persist usage totals");
+        }
+    }
 }
 
 /// Serializes `value` as pretty JSON and writes it atomically: a sibling temp
@@ -277,6 +311,8 @@ fn quarantine(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Cost;
+    use crate::state::ModelTotals;
     use crate::workspace::Workspace;
 
     /// A fresh, unique scratch directory under the system temp dir.
@@ -284,6 +320,53 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agoralume-persist-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn usage_round_trips_and_survives_a_restart() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+
+        assert!(store.load_usage().is_none(), "nothing saved yet");
+
+        let mut totals = DebugTotals::default();
+        totals.models.insert(
+            "gpt-4o-mini".to_string(),
+            ModelTotals {
+                requests: 3,
+                prompt_tokens: 100,
+                completion_tokens: 40,
+                total_tokens: 140,
+                cached_prompt_tokens: 10,
+                cost: Some(Cost {
+                    currency: "USD".to_string(),
+                    input: 0.001,
+                    cached_input: 0.0001,
+                    output: 0.002,
+                    total: 0.0031,
+                }),
+            },
+        );
+        store.save_usage(&totals);
+
+        let loaded = store.load_usage().expect("load");
+        let model = loaded.models.get("gpt-4o-mini").expect("the model entry round-trips");
+        assert_eq!(model.requests, 3);
+        assert_eq!(model.total_tokens, 140);
+        assert_eq!(model.cost.as_ref().unwrap().total, 0.0031);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_usage_file_is_ignored_not_fatal() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+        std::fs::write(store.usage_path(), b"not json").unwrap();
+
+        assert!(store.load_usage().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

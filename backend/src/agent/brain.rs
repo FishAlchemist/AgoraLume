@@ -259,4 +259,12 @@ pub trait AgentBrain: Send + Sync {
     async fn suggest(&self, _request: &SuggestionRequest) -> Result<Suggestions, BrainError> {
         Ok(Suggestions::default())
     }
+
+    /// The model name driving this brain, for the usage panel's per-model
+    /// breakdown. `None` for a brain with no real model (the mock, and the test
+    /// brains); [`crate::agent::llm::LlmBrain`] overrides it with the configured
+    /// model name.
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
 }

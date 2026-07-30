@@ -484,12 +484,16 @@ pub struct AgentTrace {
     /// Tokens this inference cost; absent for the mock brain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    /// The model that produced this inference (e.g. `gpt-4o-mini`); absent for
+    /// the mock brain, which runs no model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// An estimated cost breakdown for the accumulated usage. Always an estimate:
 /// rates are operator-supplied and providers/models differ, so the UI labels it
 /// "for reference only".
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Cost {
     /// Currency label the rates are in (e.g. `USD`).
@@ -504,8 +508,45 @@ pub struct Cost {
     pub total: f64,
 }
 
-/// Cumulative LLM usage across the whole server since startup — the global
-/// "total usage" view. `GET /debug/usage`.
+impl Cost {
+    /// Adds another cost breakdown into this one, component-wise. Used to
+    /// accumulate the running total one trace at a time, at the rate that was
+    /// in effect *when that trace was recorded* — so a later change to the
+    /// configured rates never reprices history.
+    pub fn add(self, other: Cost) -> Cost {
+        Cost {
+            currency: self.currency,
+            input: self.input + other.input,
+            cached_input: self.cached_input + other.cached_input,
+            output: self.output + other.output,
+            total: self.total + other.total,
+        }
+    }
+}
+
+/// One model's slice of the cumulative usage — e.g. after switching providers
+/// or models mid-run, each keeps its own running total rather than blending
+/// into a single undifferentiated number. Part of [`DebugUsage::models`].
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    /// The model name (e.g. `gpt-4o-mini`), or `"unknown"` for traces from a
+    /// brain that runs no real model (the rule-based mock).
+    pub model: String,
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_prompt_tokens: u64,
+    /// Present once at least one costed trace has been recorded for this
+    /// model; absent when pricing was never configured while it was in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<Cost>,
+}
+
+/// Cumulative LLM usage across the whole server (since first run, when
+/// persisted; since startup otherwise) — the global "total usage" view.
+/// `GET /debug/usage`.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugUsage {
@@ -518,7 +559,14 @@ pub struct DebugUsage {
     /// Cached prompt tokens ÷ prompt tokens, in `0.0..=1.0`; `0` before any
     /// usage is seen. How much the cache is saving.
     pub cache_hit_ratio: f64,
-    /// Present only when pricing is configured. An estimate.
+    /// The running total, accrued one trace at a time at whatever rate was
+    /// configured when each trace was recorded. Present once at least one
+    /// costed trace has been recorded; absent when pricing has never been
+    /// configured. Always an estimate — see [`Cost`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost: Option<Cost>,
+    /// The same totals broken down by model, largest (by total tokens) first.
+    /// Empty until the first inference is recorded.
+    #[serde(default)]
+    pub models: Vec<ModelUsage>,
 }

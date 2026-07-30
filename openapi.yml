@@ -12,9 +12,12 @@ paths:
       tags:
       - service
       summary: |-
-        Cumulative LLM usage since startup — the global "total usage" readout:
-        request count, token breakdown, cache-hit ratio, and an estimated cost when
-        pricing is configured (always an estimate, for reference only).
+        Cumulative LLM usage — the global "total usage" readout: request count,
+        token breakdown, cache-hit ratio, the running estimated cost (always an
+        estimate, for reference only), and the same totals broken down by model.
+        When persistence is on, this survives a server restart; the cost is accrued
+        one trace at a time at whatever rate was configured when each trace was
+        recorded, so a later change to the configured rates never reprices history.
       operationId: debug_usage
       responses:
         '200':
@@ -858,6 +861,13 @@ components:
           - string
           - 'null'
           description: The spoken line, when it spoke.
+        model:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The model that produced this inference (e.g. `gpt-4o-mini`); absent for
+            the mock brain, which runs no model.
         mood:
           type:
           - string
@@ -913,8 +923,9 @@ components:
     DebugUsage:
       type: object
       description: |-
-        Cumulative LLM usage across the whole server since startup — the global
-        "total usage" view. `GET /debug/usage`.
+        Cumulative LLM usage across the whole server (since first run, when
+        persisted; since startup otherwise) — the global "total usage" view.
+        `GET /debug/usage`.
       required:
       - requests
       - promptTokens
@@ -941,7 +952,18 @@ components:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/Cost'
-            description: Present only when pricing is configured. An estimate.
+            description: |-
+              The running total, accrued one trace at a time at whatever rate was
+              configured when each trace was recorded. Present once at least one
+              costed trace has been recorded; absent when pricing has never been
+              configured. Always an estimate — see [`Cost`].
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelUsage'
+          description: |-
+            The same totals broken down by model, largest (by total tokens) first.
+            Empty until the first inference is recorded.
         promptTokens:
           type: integer
           format: int64
@@ -1204,6 +1226,52 @@ components:
             type: integer
             format: int64
       description: One chat line. Tagged by `kind`, matching the TypeScript `Message` union.
+    ModelUsage:
+      type: object
+      description: |-
+        One model's slice of the cumulative usage — e.g. after switching providers
+        or models mid-run, each keeps its own running total rather than blending
+        into a single undifferentiated number. Part of [`DebugUsage::models`].
+      required:
+      - model
+      - requests
+      - promptTokens
+      - completionTokens
+      - totalTokens
+      - cachedPromptTokens
+      properties:
+        cachedPromptTokens:
+          type: integer
+          format: int64
+          minimum: 0
+        completionTokens:
+          type: integer
+          format: int64
+          minimum: 0
+        estimatedCost:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Cost'
+            description: |-
+              Present once at least one costed trace has been recorded for this
+              model; absent when pricing was never configured while it was in use.
+        model:
+          type: string
+          description: |-
+            The model name (e.g. `gpt-4o-mini`), or `"unknown"` for traces from a
+            brain that runs no real model (the rule-based mock).
+        promptTokens:
+          type: integer
+          format: int64
+          minimum: 0
+        requests:
+          type: integer
+          format: int64
+          minimum: 0
+        totalTokens:
+          type: integer
+          format: int64
+          minimum: 0
     Organization:
       type: object
       description: |-

@@ -211,6 +211,7 @@ async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
                     message: Some(text),
                     mood: None,
                     usage: result.usage,
+                    model: runtime.brain.model_name().map(str::to_string),
                 },
             );
             tracing::debug!(
@@ -402,6 +403,7 @@ async fn run_turn(
                             message: Some(error.reason.clone()),
                             mood: None,
                             usage,
+                            model: runtime.brain.model_name().map(str::to_string),
                         },
                     );
                     emit_error(state, group_id, &persona_id, error);
@@ -426,6 +428,7 @@ async fn run_turn(
                     message: message.clone(),
                     mood: mood.clone(),
                     usage,
+                    model: runtime.brain.model_name().map(str::to_string),
                 },
             );
 
@@ -731,6 +734,7 @@ pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
                         message: Some(result.prompts.join("\n")),
                         mood: None,
                         usage: Some(usage),
+                        model: runtime.brain.model_name().map(str::to_string),
                     },
                 );
             }
@@ -1724,7 +1728,8 @@ mod tests {
         assert!(streamed, "a suggestions frame should have been broadcast");
 
         // The usage-bearing pass counted as one request (feeds the cost panel).
-        assert_eq!(state.debug_totals().requests, 1);
+        let total_requests: u64 = state.debug_totals().models.values().map(|m| m.requests).sum();
+        assert_eq!(total_requests, 1);
 
         // The trace carries the exact prompt the pass ran on — its system guidance
         // and the recent context — so the debug panel shows what informed the

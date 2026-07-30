@@ -12,9 +12,12 @@ type OneOf<T extends any[]> = T extends [infer Only] ? Only : T extends [infer A
 export interface paths {
   "/debug/usage": {
     /**
-     * Cumulative LLM usage since startup — the global "total usage" readout:
-     * request count, token breakdown, cache-hit ratio, and an estimated cost when
-     * pricing is configured (always an estimate, for reference only).
+     * Cumulative LLM usage — the global "total usage" readout: request count,
+     * token breakdown, cache-hit ratio, the running estimated cost (always an
+     * estimate, for reference only), and the same totals broken down by model.
+     * When persistence is on, this survives a server restart; the cost is accrued
+     * one trace at a time at whatever rate was configured when each trace was
+     * recorded, so a later change to the configured rates never reprices history.
      */
     get: operations["debug_usage"];
   };
@@ -206,6 +209,11 @@ export interface components {
       groupId: string;
       /** @description The spoken line, when it spoke. */
       message?: string | null;
+      /**
+       * @description The model that produced this inference (e.g. `gpt-4o-mini`); absent for
+       * the mock brain, which runs no model.
+       */
+      model?: string | null;
       /** @description The mood, when it showed one. */
       mood?: string | null;
       personaId: string;
@@ -246,8 +254,9 @@ export interface components {
       total: number;
     };
     /**
-     * @description Cumulative LLM usage across the whole server since startup — the global
-     * "total usage" view. `GET /debug/usage`.
+     * @description Cumulative LLM usage across the whole server (since first run, when
+     * persisted; since startup otherwise) — the global "total usage" view.
+     * `GET /debug/usage`.
      */
     DebugUsage: {
       /**
@@ -261,6 +270,11 @@ export interface components {
       /** Format: int64 */
       completionTokens: number;
       estimatedCost?: null | components["schemas"]["Cost"];
+      /**
+       * @description The same totals broken down by model, largest (by total tokens) first.
+       * Empty until the first inference is recorded.
+       */
+      models?: components["schemas"]["ModelUsage"][];
       /** Format: int64 */
       promptTokens: number;
       /**
@@ -406,6 +420,29 @@ export interface components {
       /** Format: int64 */
       ts: number;
     }]>;
+    /**
+     * @description One model's slice of the cumulative usage — e.g. after switching providers
+     * or models mid-run, each keeps its own running total rather than blending
+     * into a single undifferentiated number. Part of [`DebugUsage::models`].
+     */
+    ModelUsage: {
+      /** Format: int64 */
+      cachedPromptTokens: number;
+      /** Format: int64 */
+      completionTokens: number;
+      estimatedCost?: null | components["schemas"]["Cost"];
+      /**
+       * @description The model name (e.g. `gpt-4o-mini`), or `"unknown"` for traces from a
+       * brain that runs no real model (the rule-based mock).
+       */
+      model: string;
+      /** Format: int64 */
+      promptTokens: number;
+      /** Format: int64 */
+      requests: number;
+      /** Format: int64 */
+      totalTokens: number;
+    };
     /**
      * @description A bucket for classifying personas that also carries shared template
      * variables its members inherit.
@@ -613,9 +650,12 @@ export type external = Record<string, never>;
 export interface operations {
 
   /**
-   * Cumulative LLM usage since startup — the global "total usage" readout:
-   * request count, token breakdown, cache-hit ratio, and an estimated cost when
-   * pricing is configured (always an estimate, for reference only).
+   * Cumulative LLM usage — the global "total usage" readout: request count,
+   * token breakdown, cache-hit ratio, the running estimated cost (always an
+   * estimate, for reference only), and the same totals broken down by model.
+   * When persistence is on, this survives a server restart; the cost is accrued
+   * one trace at a time at whatever rate was configured when each trace was
+   * recorded, so a later change to the configured rates never reprices history.
    */
   debug_usage: {
     responses: {

@@ -16,7 +16,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::agent::event::Event as AgentEvent;
-use crate::models::{AgentTrace, DebugUsage, GroupSuggestions, Message, ServerMeta};
+use crate::models::{AgentTrace, Cost, DebugUsage, GroupSuggestions, Message, ModelUsage, ServerMeta};
 use crate::state::{AppState, StreamEvent};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
@@ -57,29 +57,67 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
     })
 }
 
-/// Cumulative LLM usage since startup — the global "total usage" readout:
-/// request count, token breakdown, cache-hit ratio, and an estimated cost when
-/// pricing is configured (always an estimate, for reference only).
+/// Cumulative LLM usage — the global "total usage" readout: request count,
+/// token breakdown, cache-hit ratio, the running estimated cost (always an
+/// estimate, for reference only), and the same totals broken down by model.
+/// When persistence is on, this survives a server restart; the cost is accrued
+/// one trace at a time at whatever rate was configured when each trace was
+/// recorded, so a later change to the configured rates never reprices history.
 #[utoipa::path(get, path = "/debug/usage", tag = "service",
     responses((status = 200, description = "Cumulative LLM usage", body = DebugUsage)))]
 async fn debug_usage(State(state): State<Arc<AppState>>) -> Json<DebugUsage> {
     let totals = state.debug_totals();
-    let cache_hit_ratio = if totals.prompt_tokens > 0 {
-        totals.cached_prompt_tokens as f64 / totals.prompt_tokens as f64
-    } else {
-        0.0
-    };
-    let estimated_cost = state.pricing().map(|pricing| {
-        pricing.estimate(totals.prompt_tokens, totals.cached_prompt_tokens, totals.completion_tokens)
-    });
+
+    // The grand totals aren't kept separately — they're the sum of the
+    // per-model entries, computed here so there is exactly one place that can
+    // drift out of sync with the breakdown: nowhere.
+    let mut requests = 0u64;
+    let mut prompt_tokens = 0u64;
+    let mut completion_tokens = 0u64;
+    let mut total_tokens = 0u64;
+    let mut cached_prompt_tokens = 0u64;
+    let mut estimated_cost: Option<Cost> = None;
+
+    let mut models: Vec<ModelUsage> = totals
+        .models
+        .into_iter()
+        .map(|(model, m)| {
+            requests += m.requests;
+            prompt_tokens += m.prompt_tokens;
+            completion_tokens += m.completion_tokens;
+            total_tokens += m.total_tokens;
+            cached_prompt_tokens += m.cached_prompt_tokens;
+            if let Some(cost) = &m.cost {
+                estimated_cost = Some(match estimated_cost.take() {
+                    Some(acc) if acc.currency == cost.currency => acc.add(cost.clone()),
+                    _ => cost.clone(),
+                });
+            }
+            ModelUsage {
+                model,
+                requests: m.requests,
+                prompt_tokens: m.prompt_tokens,
+                completion_tokens: m.completion_tokens,
+                total_tokens: m.total_tokens,
+                cached_prompt_tokens: m.cached_prompt_tokens,
+                estimated_cost: m.cost,
+            }
+        })
+        .collect();
+    models.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
+
+    let cache_hit_ratio =
+        if prompt_tokens > 0 { cached_prompt_tokens as f64 / prompt_tokens as f64 } else { 0.0 };
+
     Json(DebugUsage {
-        requests: totals.requests,
-        prompt_tokens: totals.prompt_tokens,
-        completion_tokens: totals.completion_tokens,
-        total_tokens: totals.total_tokens,
-        cached_prompt_tokens: totals.cached_prompt_tokens,
+        requests,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cached_prompt_tokens,
         cache_hit_ratio,
         estimated_cost,
+        models,
     })
 }
 
