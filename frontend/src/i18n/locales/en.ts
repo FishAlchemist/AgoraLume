@@ -228,6 +228,9 @@ export const en = {
     noReply: 'Read — stayed silent',
     mockNote:
       'The mock backend makes no LLM calls. Connect an LLM backend to see usage and prompts.',
+    showDetails: 'Show details',
+    byModel: 'By model',
+    unknownModel: 'Mock (no real model)',
   },
   settings: {
     title: 'Settings',
@@ -254,6 +257,9 @@ export const en = {
     useMock: 'Use mock',
     connectedTo: 'Backend: {{url}}',
     usingMock: 'Using the in-browser mock (no LLM, in-memory).',
+    usageTitle: 'LLM cost',
+    usagePersisted: 'Persistence is on: survives a server restart.',
+    usageNotPersisted: 'No persistence: resets on server restart.',
   },
 };
 

@@ -150,6 +150,7 @@ export class MockChatApi implements ChatApi {
       totalTokens: 0,
       cachedPromptTokens: 0,
       cacheHitRatio: 0,
+      models: [],
     };
   }
 

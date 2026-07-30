@@ -227,6 +227,9 @@ export const zhHant: TranslationSchema = {
     decision: '決定',
     noReply: '已讀 —— 保持沉默',
     mockNote: 'Mock 後端不會呼叫 LLM。連上 LLM 後端即可看到使用量與提示。',
+    showDetails: '顯示明細',
+    byModel: '依模型',
+    unknownModel: '模擬（無實際模型）',
   },
   settings: {
     title: '設定',
@@ -252,5 +255,8 @@ export const zhHant: TranslationSchema = {
     useMock: '使用模擬',
     connectedTo: '後端:{{url}}',
     usingMock: '使用瀏覽器內建模擬(無 LLM、純記憶體)。',
+    usageTitle: 'LLM 花費',
+    usagePersisted: '已啟用持久化：重啟伺服器不會歸零。',
+    usageNotPersisted: '未啟用持久化：重啟伺服器後會歸零。',
   },
 };

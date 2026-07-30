@@ -1,6 +1,5 @@
 import {
   Accordion,
-  Alert,
   Badge,
   Code,
   Divider,
@@ -20,30 +19,15 @@ import { useBackendStatus } from '../lib/useBackendStatus';
 import { useConnection } from '../store/connection';
 import type { Persona } from '../types';
 import { CopyIconButton } from './CopyIconButton';
+import { UsageSummary } from './UsageSummary';
 
 interface Props {
   groupId: string;
   personas: Map<string, Persona>;
 }
 
-const fmt = (n: number) => n.toLocaleString();
-const pct = (ratio: number) => `${(ratio * 100).toFixed(1)}%`;
 /** First 8 hex chars — enough to tell identity versions apart at a glance. */
 const shortHash = (hash: string) => hash.slice(0, 8);
-
-/** One labelled figure in the usage summary. */
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <Stack gap={0} miw={64}>
-      <Text size="xs" c="dimmed">
-        {label}
-      </Text>
-      <Text fw={600} ff="monospace">
-        {value}
-      </Text>
-    </Stack>
-  );
-}
 
 /**
  * A collapsible debug panel for a group: the backend's cumulative LLM usage
@@ -108,59 +92,10 @@ export function DebugPanel({ groupId, personas }: Props) {
     };
   }, [groupId, backendUrl]);
 
-  const cost = usage?.estimatedCost;
-
   return (
     <Paper withBorder radius="md" p="sm" m="md" mb={0}>
       <Stack gap="xs">
-        <Group justify="space-between" align="center">
-          <Text fw={700} size="sm">
-            {t('debug.usage')}
-          </Text>
-          {usage && usage.promptTokens > 0 && (
-            <Tooltip label={t('debug.cacheHit')}>
-              <Badge variant="light" color="teal">
-                {t('debug.cacheHit')} {pct(usage.cacheHitRatio)}
-              </Badge>
-            </Tooltip>
-          )}
-        </Group>
-
-        <Group gap="lg" wrap="wrap">
-          <Stat label={t('debug.requests')} value={fmt(usage?.requests ?? 0)} />
-          <Stat label={t('debug.inputTokens')} value={fmt(usage?.promptTokens ?? 0)} />
-          <Stat label={t('debug.outputTokens')} value={fmt(usage?.completionTokens ?? 0)} />
-          <Stat label={t('debug.totalTokens')} value={fmt(usage?.totalTokens ?? 0)} />
-          <Stat label={t('debug.cached')} value={fmt(usage?.cachedPromptTokens ?? 0)} />
-        </Group>
-
-        {cost ? (
-          <Tooltip
-            multiline
-            w={240}
-            label={`${t('debug.costHint')}\n${cost.currency} · in ${cost.input.toFixed(4)} · cached ${cost.cachedInput.toFixed(4)} · out ${cost.output.toFixed(4)}`}
-          >
-            <Text size="sm">
-              {t('debug.cost')}:{' '}
-              <Text span fw={700} ff="monospace">
-                {cost.total.toFixed(4)} {cost.currency}
-              </Text>{' '}
-              <Text span size="xs" c="dimmed">
-                ({t('debug.costHint')})
-              </Text>
-            </Text>
-          </Tooltip>
-        ) : (
-          <Text size="xs" c="dimmed">
-            {t('debug.noCost')}
-          </Text>
-        )}
-
-        {status.mock && (
-          <Alert color="yellow" variant="light" py={6}>
-            <Text size="xs">{t('debug.mockNote')}</Text>
-          </Alert>
-        )}
+        <UsageSummary usage={usage} mock={status.mock} />
 
         <Divider />
 

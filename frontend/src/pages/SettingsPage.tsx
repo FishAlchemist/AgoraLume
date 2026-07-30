@@ -12,14 +12,22 @@ import {
   Title,
   useMantineColorScheme,
 } from '@mantine/core';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { DataSourceBadge } from '../components/DataSourceBadge';
+import { UsageSummary } from '../components/UsageSummary';
 import { UI_LANGUAGES } from '../i18n';
+import { api } from '../lib/api';
+import type { DebugUsage, ServerMeta } from '../lib/api/types';
 import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
 import { useWorkspace } from '../store/workspace';
 import type { UiLanguage } from '../types';
+
+/** How often to re-poll the LLM cost readout while Settings is open. No global
+ * SSE channel exists (each `debug` stream is per-group), so this just polls,
+ * matching `useBackendStatus`'s cadence. */
+const USAGE_POLL_MS = 8_000;
 
 const FONT_SIZES = [
   { value: '13', labelKey: 'settings.fontS' },
@@ -99,8 +107,53 @@ export function SettingsPage() {
         </Stack>
 
         <ConnectionSettings />
+
+        <UsageSettings />
       </Stack>
     </Box>
+  );
+}
+
+/**
+ * The LLM cost readout, folded into Settings as a low-key section rather than
+ * a top-level nav destination — this app is a multi-persona chatroom, and a
+ * billing dashboard sitting next to Chat/Personas/Organizations read as out of
+ * place. See `UsageSummary` for how the number itself stays the only thing
+ * shown at a glance, with everything else behind "show details".
+ */
+function UsageSettings() {
+  const { t } = useTranslation();
+  const [usage, setUsage] = useState<DebugUsage | null>(null);
+  const [meta, setMeta] = useState<ServerMeta | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const load = () => {
+      void api.getUsage().then((u) => {
+        if (active) setUsage(u);
+      });
+      void api.probe().then((m) => {
+        if (active) setMeta(m);
+      });
+    };
+    load();
+    const id = setInterval(load, USAGE_POLL_MS);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  return (
+    <Stack gap={4}>
+      <Title order={6}>{t('settings.usageTitle')}</Title>
+      <UsageSummary usage={usage} mock={meta?.mock} title={null} />
+      {meta && (
+        <Text size="xs" c={meta.persistent ? 'teal' : 'dimmed'}>
+          {meta.persistent ? t('settings.usagePersisted') : t('settings.usageNotPersisted')}
+        </Text>
+      )}
+    </Stack>
   );
 }
 

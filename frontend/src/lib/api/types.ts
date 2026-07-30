@@ -80,6 +80,8 @@ export interface AgentTrace {
   message?: string;
   mood?: string;
   usage?: TokenUsage | null;
+  /** The model that produced this inference; absent for the mock brain. */
+  model?: string | null;
 }
 
 export type DebugHandler = (trace: AgentTrace) => void;
@@ -93,7 +95,19 @@ export interface Cost {
   total: number;
 }
 
-/** Cumulative LLM usage since the backend started — the "total usage" readout. */
+/** One model's slice of the cumulative usage — see {@link DebugUsage.models}. */
+export interface ModelUsage {
+  /** The model name, or `"unknown"` for a brain with no real model (the mock). */
+  model: string;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedPromptTokens: number;
+  estimatedCost?: Cost | null;
+}
+
+/** Cumulative LLM usage across the whole server — the "total usage" readout. */
 export interface DebugUsage {
   requests: number;
   promptTokens: number;
@@ -103,6 +117,8 @@ export interface DebugUsage {
   /** Cached ÷ prompt tokens, `0..1`. */
   cacheHitRatio: number;
   estimatedCost?: Cost | null;
+  /** The same totals broken down by model, largest (by total tokens) first. */
+  models: ModelUsage[];
 }
 
 /**
