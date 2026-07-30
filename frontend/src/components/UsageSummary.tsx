@@ -52,6 +52,14 @@ interface Props {
    * directly above this component.
    */
   title?: ReactNode | null;
+  /**
+   * Overrides the "no cost yet" hint shown when pricing isn't configured.
+   * `debug.noCost` points the reader at Settings — wrong when this component
+   * is already rendering *inside* Settings (self-referential), so the
+   * Settings page passes a hint that points at the Advanced panel above it
+   * instead.
+   */
+  noCostHint?: ReactNode;
 }
 
 /**
@@ -62,7 +70,7 @@ interface Props {
  * a collapsed "show details" toggle so it doesn't compete for attention in an
  * app that's fundamentally about the chat, not the billing.
  */
-export function UsageSummary({ usage, mock, title }: Props) {
+export function UsageSummary({ usage, mock, title, noCostHint }: Props) {
   const { t } = useTranslation();
   const cost = usage?.estimatedCost;
   const models = usage?.models ?? [];
@@ -85,7 +93,7 @@ export function UsageSummary({ usage, mock, title }: Props) {
             </Text>
           ) : (
             <Text size="sm" c="dimmed">
-              {t('debug.noCost')}
+              {noCostHint ?? t('debug.noCost')}
             </Text>
           )}
         </Stack>

@@ -234,6 +234,7 @@ export const en = {
   },
   settings: {
     title: 'Settings',
+    general: 'General',
     appearance: 'Appearance',
     uiLanguage: 'Interface language',
     uiLanguageHint: 'The language the app is displayed in.',
@@ -258,6 +259,7 @@ export const en = {
     connectedTo: 'Backend: {{url}}',
     usingMock: 'Using the in-browser mock (no LLM, in-memory).',
     usageTitle: 'LLM cost',
+    usageNoRate: 'No rate configured yet — see the model settings above.',
     usagePersisted: 'Persistence is on: survives a server restart.',
     usageNotPersisted: 'No persistence: resets on server restart.',
     llmTitle: 'Real model (LLM)',

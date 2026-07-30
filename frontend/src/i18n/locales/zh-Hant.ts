@@ -233,6 +233,7 @@ export const zhHant: TranslationSchema = {
   },
   settings: {
     title: '設定',
+    general: '一般',
     appearance: '外觀',
     uiLanguage: '介面語言',
     uiLanguageHint: '應用程式顯示所用的語言。',
@@ -256,6 +257,7 @@ export const zhHant: TranslationSchema = {
     connectedTo: '後端:{{url}}',
     usingMock: '使用瀏覽器內建模擬(無 LLM、純記憶體)。',
     usageTitle: 'LLM 花費',
+    usageNoRate: '尚未設定費率——請見上方的模型設定。',
     usagePersisted: '已啟用持久化：重啟伺服器不會歸零。',
     usageNotPersisted: '未啟用持久化：重啟伺服器後會歸零。',
     llmTitle: '真實模型（LLM）',

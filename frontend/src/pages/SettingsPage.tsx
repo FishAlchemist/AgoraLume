@@ -3,6 +3,7 @@ import {
   Alert,
   Box,
   Button,
+  Divider,
   Group,
   NumberInput,
   Paper,
@@ -16,6 +17,7 @@ import {
   Title,
   useMantineColorScheme,
 } from '@mantine/core';
+import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { DataSourceBadge } from '../components/DataSourceBadge';
@@ -41,6 +43,45 @@ const FONT_SIZES = [
   { value: '22', labelKey: 'settings.fontXl' },
 ] as const;
 
+/**
+ * One category card: a bordered `Paper` with its own heading, so the settings
+ * page reads as a handful of distinct groups (general, appearance, connection,
+ * model) instead of one long flat list where a model-tuning field sits flush
+ * against a font-size picker. `extra` is a right-aligned slot in the header
+ * row (used for `DataSourceBadge`, so it reads next to the section it
+ * describes rather than floating in the connection form below it).
+ */
+function SettingsSection({
+  title,
+  description,
+  extra,
+  children,
+}: {
+  title: string;
+  description?: string;
+  extra?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <Paper withBorder radius="md" p={{ base: 'md', sm: 'lg' }}>
+      <Stack gap="md">
+        <Box>
+          <Group justify="space-between" align="center">
+            <Title order={4}>{title}</Title>
+            {extra}
+          </Group>
+          {description && (
+            <Text size="xs" c="dimmed" mt={2}>
+              {description}
+            </Text>
+          )}
+        </Box>
+        <Stack gap="lg">{children}</Stack>
+      </Stack>
+    </Paper>
+  );
+}
+
 export function SettingsPage() {
   const { t } = useTranslation();
   const settings = useWorkspace((s) => s.settings);
@@ -50,72 +91,84 @@ export function SettingsPage() {
   const { colorScheme, setColorScheme } = useMantineColorScheme();
 
   return (
-    <Box p="lg" maw={560}>
+    <Box p="lg" maw={640}>
       <Title order={3} mb="lg">
         {t('settings.title')}
       </Title>
       <Stack gap="lg">
-        <Switch
-          checked={readOnly}
-          onChange={(e) => setReadOnly(e.currentTarget.checked)}
-          label={t('readonly.settingsLabel')}
-          description={t('readonly.settingsHint')}
-        />
-
-        <Select
-          label={t('settings.uiLanguage')}
-          description={t('settings.uiLanguageHint')}
-          value={settings.uiLanguage}
-          onChange={(v) => v && updateSettings({ uiLanguage: v as UiLanguage })}
-          allowDeselect={false}
-          disabled={readOnly}
-          data={UI_LANGUAGES}
-        />
-
-        <TextInput
-          label={t('settings.nativeLanguage')}
-          description={t('settings.nativeLanguageHint', { token: '{{user_language}}' })}
-          value={settings.nativeLanguage}
-          onChange={(e) => updateSettings({ nativeLanguage: e.currentTarget.value })}
-          disabled={readOnly}
-          placeholder="繁體中文"
-        />
-
-        <Stack gap={4}>
-          <Title order={6}>{t('settings.colorScheme')}</Title>
-          <SegmentedControl
-            value={colorScheme === 'dark' ? 'dark' : 'light'}
-            onChange={(v) => setColorScheme(v as 'light' | 'dark')}
-            data={[
-              { value: 'light', label: t('settings.colorSchemeLight') },
-              { value: 'dark', label: t('settings.colorSchemeDark') },
-            ]}
+        <SettingsSection title={t('settings.general')}>
+          <Switch
+            checked={readOnly}
+            onChange={(e) => setReadOnly(e.currentTarget.checked)}
+            label={t('readonly.settingsLabel')}
+            description={t('readonly.settingsHint')}
           />
-        </Stack>
+        </SettingsSection>
 
-        <Stack gap={4}>
-          <Title order={6}>{t('settings.chatFontSize')}</Title>
-          <Text size="xs" c="dimmed">
-            {t('settings.chatFontSizeHint')}
-          </Text>
-          <SegmentedControl
-            value={String(settings.chatFontSize ?? 15)}
-            onChange={(v) => updateSettings({ chatFontSize: Number(v) })}
+        <SettingsSection title={t('settings.appearance')}>
+          <Select
+            label={t('settings.uiLanguage')}
+            description={t('settings.uiLanguageHint')}
+            value={settings.uiLanguage}
+            onChange={(v) => v && updateSettings({ uiLanguage: v as UiLanguage })}
+            allowDeselect={false}
             disabled={readOnly}
-            data={FONT_SIZES.map((f) => ({ value: f.value, label: t(f.labelKey) }))}
+            data={UI_LANGUAGES}
           />
-          <Paper withBorder radius="md" p="sm" mt={4}>
-            <Text style={{ fontSize: `${settings.chatFontSize ?? 15}px` }}>
-              {t('settings.chatFontSample')}
+
+          <TextInput
+            label={t('settings.nativeLanguage')}
+            description={t('settings.nativeLanguageHint', { token: '{{user_language}}' })}
+            value={settings.nativeLanguage}
+            onChange={(e) => updateSettings({ nativeLanguage: e.currentTarget.value })}
+            disabled={readOnly}
+            placeholder="繁體中文"
+          />
+
+          <Stack gap={4}>
+            <Title order={5}>{t('settings.colorScheme')}</Title>
+            <SegmentedControl
+              value={colorScheme === 'dark' ? 'dark' : 'light'}
+              onChange={(v) => setColorScheme(v as 'light' | 'dark')}
+              data={[
+                { value: 'light', label: t('settings.colorSchemeLight') },
+                { value: 'dark', label: t('settings.colorSchemeDark') },
+              ]}
+            />
+          </Stack>
+
+          <Stack gap={4}>
+            <Title order={5}>{t('settings.chatFontSize')}</Title>
+            <Text size="xs" c="dimmed">
+              {t('settings.chatFontSizeHint')}
             </Text>
-          </Paper>
-        </Stack>
+            <SegmentedControl
+              value={String(settings.chatFontSize ?? 15)}
+              onChange={(v) => updateSettings({ chatFontSize: Number(v) })}
+              disabled={readOnly}
+              data={FONT_SIZES.map((f) => ({ value: f.value, label: t(f.labelKey) }))}
+            />
+            <Paper withBorder radius="md" p="sm" mt={4}>
+              <Text style={{ fontSize: `${settings.chatFontSize ?? 15}px` }}>
+                {t('settings.chatFontSample')}
+              </Text>
+            </Paper>
+          </Stack>
+        </SettingsSection>
 
-        <ConnectionSettings />
+        <SettingsSection
+          title={t('settings.connectionTitle')}
+          description={t('settings.connectionHint')}
+          extra={<DataSourceBadge />}
+        >
+          <ConnectionSettings />
+        </SettingsSection>
 
-        <UsageSettings />
-
-        <LlmProviderSettings />
+        <SettingsSection title={t('settings.llmTitle')}>
+          <LlmProviderSettings />
+          <Divider label={t('settings.usageTitle')} labelPosition="left" />
+          <UsageSettings />
+        </SettingsSection>
       </Stack>
     </Box>
   );
@@ -153,8 +206,12 @@ function UsageSettings() {
 
   return (
     <Stack gap={4}>
-      <Title order={6}>{t('settings.usageTitle')}</Title>
-      <UsageSummary usage={usage} mock={meta?.mock} title={null} />
+      <UsageSummary
+        usage={usage}
+        mock={meta?.mock}
+        title={null}
+        noCostHint={t('settings.usageNoRate')}
+      />
       {meta && (
         <Text size="xs" c={meta.persistent ? 'teal' : 'dimmed'}>
           {meta.persistent ? t('settings.usagePersisted') : t('settings.usageNotPersisted')}
@@ -183,13 +240,6 @@ function ConnectionSettings() {
 
   return (
     <Stack gap={4}>
-      <Group justify="space-between" align="center">
-        <Title order={6}>{t('settings.connectionTitle')}</Title>
-        <DataSourceBadge />
-      </Group>
-      <Text size="xs" c="dimmed">
-        {t('settings.connectionHint')}
-      </Text>
       <Group align="flex-end" gap="xs" wrap="nowrap">
         <TextInput
           flex={1}
@@ -306,17 +356,12 @@ function LlmProviderSettings() {
   const { t } = useTranslation();
   const backendUrl = useConnection((s) => s.backendUrl);
 
-  return (
-    <Stack gap={4}>
-      <Title order={6}>{t('settings.llmTitle')}</Title>
-      {backendUrl ? (
-        <LlmProviderForm backendUrl={backendUrl} />
-      ) : (
-        <Text size="xs" c="dimmed">
-          {t('settings.llmNeedsBackend')}
-        </Text>
-      )}
-    </Stack>
+  return backendUrl ? (
+    <LlmProviderForm backendUrl={backendUrl} />
+  ) : (
+    <Text size="xs" c="dimmed">
+      {t('settings.llmNeedsBackend')}
+    </Text>
   );
 }
 
