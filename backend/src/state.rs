@@ -1465,12 +1465,21 @@ impl AppState {
     /// it was issued for — `routes::auth::login` surfaces that as the
     /// response's `role` field, so the frontend knows an admin session has
     /// no workspace to route to.
+    ///
+    /// An unknown username still pays [`crate::auth::DUMMY_PASSWORD_HASH`]'s
+    /// Argon2 cost before returning `None`, matching the cost a known
+    /// username's wrong-password attempt pays — see that constant's doc
+    /// comment for why: without it, response timing alone reveals which
+    /// usernames exist.
     pub fn login(&self, username: &str, password: &str) -> Option<(crate::auth::IssuedTokens, Subject)> {
         if username == crate::auth::ADMIN_USERNAME {
             return verify_password_hash(password, &self.admin_password_hash)
                 .then(|| (self.tokens.issue(Subject::Admin), Subject::Admin));
         }
-        let (account_id, account) = self.find_account_by_username(username)?;
+        let Some((account_id, account)) = self.find_account_by_username(username) else {
+            verify_password_hash(password, &crate::auth::DUMMY_PASSWORD_HASH);
+            return None;
+        };
         account.verify_password(password).then(|| {
             let subject = Subject::Account(account_id);
             (self.tokens.issue(subject.clone()), subject)
@@ -1947,6 +1956,51 @@ mod tests {
         // Re-fetching the same id returns the same cached instance, not a
         // fresh (and therefore empty) one.
         assert_eq!(state.account_by_id("a").debug_totals().models["gpt-4o-mini"].prompt_tokens, 100);
+    }
+
+    #[test]
+    fn login_takes_similar_time_for_an_unknown_username_as_a_wrong_password() {
+        // Regression guard for the timing side-channel `AppState::login` used
+        // to have: a miss on `find_account_by_username` used to return in
+        // microseconds, while a known username's wrong-password attempt paid
+        // Argon2's ~tens-of-ms cost — the response time alone revealed which
+        // usernames existed. `login` now burns the same cost on both paths
+        // via `auth::DUMMY_PASSWORD_HASH`; this asserts they stay in the same
+        // ballpark rather than pinning an exact duration (inherently noisy on
+        // a shared CI runner, hence the generous ratio bounds).
+        let operator = Arc::new(OperatorState::new(AgentRuntime::mock()));
+        let data_dir = std::env::temp_dir().join(format!("agoralume-login-timing-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(operator, Some(data_dir), "test")
+            .with_admin_auth(Some(crate::auth::hash_password("admin-pw")), false);
+        state
+            .create_account("alice", "alice-pw")
+            .expect("account creation succeeds with a persistent data dir");
+
+        let time = |username: &str, password: &str| {
+            let start = std::time::Instant::now();
+            state.login(username, password);
+            start.elapsed()
+        };
+
+        // Warm up both paths: the first Argon2 call in a process can be
+        // slower than steady state (page faults, lazy CPU feature detection),
+        // and the first miss additionally pays to initialize
+        // `DUMMY_PASSWORD_HASH` (a `LazyLock`) on top of verifying against
+        // it — excluding that from the measured sample below, not double
+        // Argon2 cost, is the point of this test.
+        time("alice", "warmup");
+        time("nobody-at-all", "warmup");
+
+        let known_wrong = time("alice", "not-alice-pw");
+        let unknown = time("someone-who-does-not-exist", "whatever");
+
+        let ratio = unknown.as_secs_f64() / known_wrong.as_secs_f64();
+        assert!(
+            (0.3..3.0).contains(&ratio),
+            "unknown username took {unknown:?} vs {known_wrong:?} for a known one with the wrong \
+             password (ratio {ratio:.2}) — response timing may again reveal whether a username \
+             exists"
+        );
     }
 
     /// A minimal trace for one group, with usage attributed to `model`.

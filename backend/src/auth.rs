@@ -92,6 +92,17 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
+/// An Argon2 hash of no password anyone will ever type, verified against on
+/// every login for a username [`AppState::login`](crate::state::AppState::login)
+/// can't find. Argon2 is deliberately slow (~tens of ms); a lookup that misses
+/// used to return in microseconds while a real account's wrong-password
+/// attempt paid that full cost, so measuring the response time alone told an
+/// attacker whether a username existed — no password guessing needed.
+/// Verifying against this dummy hash on the miss path burns the same cost as
+/// the hit path, so the two are indistinguishable by timing.
+pub static DUMMY_PASSWORD_HASH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| hash_password("no account will ever have this exact password"));
+
 /// A random password an operator can read off a log line and type in by
 /// hand: alphanumeric only (no `+`/`/`/`=` to fumble), and excludes visually
 /// ambiguous characters (`0`/`O`, `1`/`l`/`I`).
