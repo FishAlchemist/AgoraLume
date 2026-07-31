@@ -225,6 +225,7 @@ export const zhHant: TranslationSchema = {
     system: '系統',
     systemUnknown: '版本不明',
     context: '上下文（公共訊息）',
+    charCount: '{{n}} 字',
     decision: '決定',
     noReply: '已讀 —— 保持沉默',
     mockNote: 'Mock 後端不會呼叫 LLM。連上 LLM 後端即可看到使用量與提示。',

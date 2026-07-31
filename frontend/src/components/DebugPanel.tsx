@@ -5,6 +5,7 @@ import {
   Code,
   Divider,
   Group,
+  Pagination,
   Paper,
   ScrollArea,
   Stack,
@@ -24,6 +25,29 @@ import { CopyIconButton } from './CopyIconButton';
 import { UsageSummary } from './UsageSummary';
 
 const fmt = (n: number) => n.toLocaleString();
+
+/** Traces per page — rendering all of them at once is what made opening a busy
+ * group's panel janky (each row's prompt/context text is not cheap to mount). */
+const TRACES_PER_PAGE = 5;
+
+/** "850ms" below 1s, else "1.2s" — coarse enough to spot a slow call at a glance. */
+function formatDuration(ms: number | null | undefined): string | null {
+  if (ms == null) return null;
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Date + clock time for the trace title — traces can span multiple days, so a
+ * bare "14:23:05" isn't enough to tell today's from yesterday's. Full local
+ * date-time lives in the hover title regardless. */
+function formatTraceTime(ts: number, locale: string): string {
+  return new Date(ts).toLocaleString(locale, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
 
 interface Props {
   groupId: string;
@@ -51,6 +75,7 @@ export function DebugPanel({ groupId, personas }: Props) {
   // Traces carry no server id, so tag each with a monotonic client id for a
   // stable React key and accordion value.
   const [entries, setEntries] = useState<{ id: number; trace: AgentTrace }[]>([]);
+  const [tracePage, setTracePage] = useState(1);
   const nextId = useRef(0);
   // Refetch the totals on each new trace, coalescing bursts into one request.
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -61,6 +86,7 @@ export function DebugPanel({ groupId, personas }: Props) {
     setPersonaUsage([]);
     setLabels({});
     setEntries([]);
+    setTracePage(1);
     nextId.current = 0;
 
     const loadUsage = () => {
@@ -127,20 +153,44 @@ export function DebugPanel({ groupId, personas }: Props) {
   // run a turn yet shouldn't show every member at a flat zero.
   const activePersonaUsage = personaUsage.filter((entry) => entry.usage.requests > 0);
 
+  // Newest first, sliced to one page — a group can run 20+ turns, and mounting
+  // every trace's prompt/context text at once is what made opening the panel
+  // janky. Always paginated (even a single page) so the control's position
+  // doesn't jump around as history grows.
+  const reversed = [...entries].reverse();
+  const totalPages = Math.max(1, Math.ceil(reversed.length / TRACES_PER_PAGE));
+  const currentPage = Math.min(tracePage, totalPages);
+  const pageEntries = reversed.slice(
+    (currentPage - 1) * TRACES_PER_PAGE,
+    currentPage * TRACES_PER_PAGE,
+  );
+
   return (
     <Paper withBorder radius="md" p="sm" m="md" mb={0}>
       <Stack gap="xs">
         <UsageSummary usage={usage} mock={status.mock} title={t('debug.groupUsage')} />
 
         {activePersonaUsage.length > 0 && (
-          <Stack gap={4}>
-            <Text size="xs" fw={600} c="dimmed">
-              {t('debug.byPersona')}
-            </Text>
-            {activePersonaUsage.map((entry) => (
-              <PersonaUsageRow key={entry.personaId} entry={entry} personas={personas} />
-            ))}
-          </Stack>
+          <Accordion variant="separated" chevronPosition="left">
+            {/* Collapsed by default — a group can have dozens of characters, so
+                folding this away keeps the always-visible billing summary short. */}
+            <Accordion.Item value="by-persona">
+              <Accordion.Control>
+                <Text size="xs" fw={600} c="dimmed">
+                  {t('debug.byPersona')} ({activePersonaUsage.length})
+                </Text>
+              </Accordion.Control>
+              <Accordion.Panel>
+                <ScrollArea.Autosize mah={200}>
+                  <Stack gap={4}>
+                    {activePersonaUsage.map((entry) => (
+                      <PersonaUsageRow key={entry.personaId} entry={entry} personas={personas} />
+                    ))}
+                  </Stack>
+                </ScrollArea.Autosize>
+              </Accordion.Panel>
+            </Accordion.Item>
+          </Accordion>
         )}
 
         <Divider />
@@ -173,19 +223,29 @@ export function DebugPanel({ groupId, personas }: Props) {
             {t('debug.empty')}
           </Text>
         ) : (
-          <ScrollArea.Autosize mah={320}>
-            <Accordion variant="separated" chevronPosition="left">
-              {[...entries].reverse().map(({ id, trace }) => (
-                <TraceItem
-                  key={id}
-                  value={String(id)}
-                  trace={trace}
-                  personas={personas}
-                  labels={labels}
-                />
-              ))}
-            </Accordion>
-          </ScrollArea.Autosize>
+          <>
+            <ScrollArea.Autosize mah={320}>
+              <Accordion variant="separated" chevronPosition="left">
+                {pageEntries.map(({ id, trace }) => (
+                  <TraceItem
+                    key={id}
+                    value={String(id)}
+                    trace={trace}
+                    personas={personas}
+                    labels={labels}
+                  />
+                ))}
+              </Accordion>
+            </ScrollArea.Autosize>
+            <Group justify="center">
+              <Pagination
+                size="xs"
+                value={currentPage}
+                onChange={setTracePage}
+                total={totalPages}
+              />
+            </Group>
+          </>
         )}
       </Stack>
     </Paper>
@@ -233,30 +293,46 @@ function TraceItem({
   personas: Map<string, Persona>;
   labels: Record<string, string>;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const persona = personas.get(trace.personaId);
   const name = persona?.name ?? trace.personaName;
   const hash = persona?.promptHash;
   const versionLabel = hash ? labels[hash] : undefined;
   const spoke = trace.message ?? (trace.mood ? '' : undefined);
+  const duration = formatDuration(trace.durationMs);
+  const time = formatTraceTime(trace.ts, i18n.language);
+  const fullTime = new Date(trace.ts).toLocaleString(i18n.language);
+  const contextText = trace.conversation.trim();
 
   return (
     <Accordion.Item value={value}>
       <Accordion.Control>
-        <Group gap="xs" wrap="nowrap">
-          <Text fw={600} size="sm" truncate>
-            {name}
-          </Text>
-          <Badge size="xs" variant="light">
-            {trace.action}
-          </Badge>
-          {trace.usage && (
-            <Text size="xs" c="dimmed" ff="monospace">
-              {t('debug.inputTokens')} {fmt(trace.usage.promptTokens)} → {t('debug.outputTokens')}{' '}
-              {fmt(trace.usage.completionTokens)}
+        <Stack gap={2}>
+          <Group gap="xs" wrap="nowrap">
+            <Text fw={600} size="sm" truncate>
+              {name}
             </Text>
-          )}
-        </Group>
+            <Badge size="xs" variant="light">
+              {trace.action}
+            </Badge>
+          </Group>
+          <Group gap={8} wrap="wrap">
+            <Text size="xs" c="dimmed" title={fullTime}>
+              {time}
+            </Text>
+            {duration && (
+              <Text size="xs" c="dimmed" ff="monospace">
+                {duration}
+              </Text>
+            )}
+            {trace.usage && (
+              <Text size="xs" c="dimmed" ff="monospace">
+                {t('debug.inputTokens')} {fmt(trace.usage.promptTokens)} → {t('debug.outputTokens')}{' '}
+                {fmt(trace.usage.completionTokens)}
+              </Text>
+            )}
+          </Group>
+        </Stack>
       </Accordion.Control>
       <Accordion.Panel>
         <Stack gap={6}>
@@ -288,8 +364,8 @@ function TraceItem({
           <Accordion variant="contained" chevronPosition="left">
             <CollapsibleText
               value="context"
-              label={t('debug.context')}
-              text={trace.conversation.trim()}
+              label={`${t('debug.context')} · ${t('debug.charCount', { n: fmt(contextText.length) })}`}
+              text={contextText}
             />
           </Accordion>
           <Text size="xs" fw={600} c="dimmed">

@@ -82,6 +82,8 @@ export interface AgentTrace {
   usage?: TokenUsage | null;
   /** The model that produced this inference; absent for the mock brain. */
   model?: string | null;
+  /** Wall-clock time the brain call took, in milliseconds. */
+  durationMs?: number | null;
 }
 
 export type DebugHandler = (trace: AgentTrace) => void;

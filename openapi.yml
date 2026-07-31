@@ -988,6 +988,12 @@ components:
         conversation:
           type: string
           description: The conversation/context text the agent read (the "public" messages).
+        durationMs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Wall-clock time the brain call took, in milliseconds.
         groupId:
           type: string
         message:

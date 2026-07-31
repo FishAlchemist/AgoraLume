@@ -1245,6 +1245,7 @@ mod tests {
                     cached_prompt_tokens: 0,
                 }),
                 model: None,
+                duration_ms: None,
             },
         );
 
@@ -1281,6 +1282,7 @@ mod tests {
                 cached_prompt_tokens: 0,
             }),
             model: Some(model.to_string()),
+            duration_ms: Some(42),
         }
     }
 

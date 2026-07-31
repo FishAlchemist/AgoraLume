@@ -488,6 +488,9 @@ pub struct AgentTrace {
     /// the mock brain, which runs no model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Wall-clock time the brain call took, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
 }
 
 /// An estimated cost breakdown for the accumulated usage. Always an estimate:

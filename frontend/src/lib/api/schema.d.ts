@@ -255,6 +255,11 @@ export interface components {
       action: string;
       /** @description The conversation/context text the agent read (the "public" messages). */
       conversation: string;
+      /**
+       * Format: int64
+       * @description Wall-clock time the brain call took, in milliseconds.
+       */
+      durationMs?: number | null;
       groupId: string;
       /** @description The spoken line, when it spoke. */
       message?: string | null;

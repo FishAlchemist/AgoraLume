@@ -225,6 +225,7 @@ export const en = {
     system: 'System',
     systemUnknown: 'version n/a',
     context: 'Context (public messages)',
+    charCount: '{{n}} chars',
     decision: 'Decision',
     noReply: 'Read — stayed silent',
     mockNote:

@@ -251,7 +251,10 @@ async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
         prior: (!summary.text.trim().is_empty()).then(|| summary.text.clone()),
         lines,
     };
-    match runtime.brain.summarize(&request).await {
+    let started = std::time::Instant::now();
+    let summarized = runtime.brain.summarize(&request).await;
+    let duration_ms = started.elapsed().as_millis() as i64;
+    match summarized {
         Ok(result) => {
             let text = result.text.trim().to_string();
             // A blank result would silently drop the folded lines — skip rather
@@ -284,6 +287,7 @@ async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
                     mood: None,
                     usage: result.usage,
                     model: runtime.brain.model_name().map(str::to_string),
+                    duration_ms: Some(duration_ms),
                 },
             );
             tracing::debug!(
@@ -435,7 +439,11 @@ async fn run_turn(
 
             // The single inference, watched for interrupts. `&mut fut` is only
             // dropped on a hard interrupt (discard); a soft event loops back and
-            // re-polls it, so the in-flight agent keeps running.
+            // re-polls it, so the in-flight agent keeps running. Timed end-to-end
+            // (including any soft-event handling in between, which runs
+            // concurrently via `select!` rather than delaying `fut`) for the debug
+            // panel's per-trace duration.
+            let started = std::time::Instant::now();
             let decision = {
                 let mut fut = std::pin::pin!(runtime.brain.decide(&prompt));
                 loop {
@@ -459,6 +467,7 @@ async fn run_turn(
                     }
                 }
             };
+            let duration_ms = started.elapsed().as_millis() as i64;
 
             let Decision {
                 outcome,
@@ -486,6 +495,7 @@ async fn run_turn(
                             mood: None,
                             usage,
                             model: runtime.brain.model_name().map(str::to_string),
+                            duration_ms: Some(duration_ms),
                         },
                     );
                     emit_error(state, group_id, &persona_id, error);
@@ -515,6 +525,7 @@ async fn run_turn(
                     mood: mood.clone(),
                     usage,
                     model: runtime.brain.model_name().map(str::to_string),
+                    duration_ms: Some(duration_ms),
                 },
             );
 
@@ -827,7 +838,10 @@ pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
         min_count: SUGGEST_MIN,
     };
 
-    match runtime.brain.suggest(&request).await {
+    let started = std::time::Instant::now();
+    let suggested = runtime.brain.suggest(&request).await;
+    let duration_ms = started.elapsed().as_millis() as i64;
+    match suggested {
         Ok(result) => {
             if result.prompts.is_empty() {
                 // Nothing usable — keep whatever was cached, just release the gate.
@@ -855,6 +869,7 @@ pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
                         mood: None,
                         usage: Some(usage),
                         model: runtime.brain.model_name().map(str::to_string),
+                        duration_ms: Some(duration_ms),
                     },
                 );
             }
