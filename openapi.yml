@@ -994,6 +994,16 @@ components:
           - 'null'
           format: int64
           description: Wall-clock time the brain call took, in milliseconds.
+        estimatedCost:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Cost'
+            description: |-
+              This one call's own estimated cost, priced at the rate configured when
+              it was recorded. Filled in by [`crate::state::AppState::record_trace`]
+              (the caller never sets it), so it starts `None` at construction and is
+              absent whenever pricing isn't configured. Always an estimate — see
+              [`Cost`].
         groupId:
           type: string
         message:

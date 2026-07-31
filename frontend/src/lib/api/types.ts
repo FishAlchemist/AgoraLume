@@ -84,6 +84,9 @@ export interface AgentTrace {
   model?: string | null;
   /** Wall-clock time the brain call took, in milliseconds. */
   durationMs?: number | null;
+  /** This one call's own estimated cost, at the rate configured when it was
+   * recorded; absent when pricing isn't configured. Always an estimate. */
+  estimatedCost?: Cost | null;
 }
 
 export type DebugHandler = (trace: AgentTrace) => void;

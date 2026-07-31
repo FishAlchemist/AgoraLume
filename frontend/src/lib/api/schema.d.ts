@@ -260,6 +260,7 @@ export interface components {
        * @description Wall-clock time the brain call took, in milliseconds.
        */
       durationMs?: number | null;
+      estimatedCost?: null | components["schemas"]["Cost"];
       groupId: string;
       /** @description The spoken line, when it spoke. */
       message?: string | null;

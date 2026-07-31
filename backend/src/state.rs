@@ -372,7 +372,7 @@ impl AppState {
     /// lifetime tokens. That way a future change to the configured rates (or a
     /// switch to a different model) never reprices history; it only changes
     /// what new traces cost.
-    pub fn record_trace(&self, group_id: &str, trace: AgentTrace) {
+    pub fn record_trace(&self, group_id: &str, mut trace: AgentTrace) {
         self.ensure_loaded(group_id);
         self.ensure_persona_loaded(group_id, &trace.persona_id);
         let (snapshot, group_snapshot, persona_snapshot) = {
@@ -382,6 +382,19 @@ impl AppState {
                 .clone()
                 .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
             let pricing = self.pricing.read().unwrap();
+
+            // This one call's own cost, at today's rate — a further breakdown of
+            // the running totals below, for spotting an unusually expensive
+            // single inference rather than only a group/persona's cumulative
+            // spend. `None` whenever pricing isn't configured, exactly like the
+            // accumulated totals.
+            if let (Some(usage), Some(rate)) = (&trace.usage, pricing.as_ref()) {
+                trace.estimated_cost = Some(rate.estimate(
+                    usage.prompt_tokens,
+                    usage.cached_prompt_tokens,
+                    usage.completion_tokens,
+                ));
+            }
 
             let entry = debug.models.entry(model_key.clone()).or_default();
             entry.requests += 1;
@@ -1246,6 +1259,7 @@ mod tests {
                 }),
                 model: None,
                 duration_ms: None,
+                estimated_cost: None,
             },
         );
 
@@ -1256,6 +1270,19 @@ mod tests {
             .and_then(|m| m.cost.as_ref())
             .expect("costed");
         assert_eq!(cost.input, 1.0, "priced at the rate just applied");
+
+        // The trace itself, not just the rolled-up totals, should carry its
+        // own cost — that's what lets the debug panel show a single call's
+        // spend rather than only the group/persona's cumulative total.
+        let stored = state.debug_traces("lab");
+        let trace_cost = stored[0]
+            .estimated_cost
+            .as_ref()
+            .expect("the stored trace carries its own estimated cost");
+        assert_eq!(
+            trace_cost.input, 1.0,
+            "one trace's own cost, priced the same as the totals it fed"
+        );
     }
 
     /// A minimal trace for one group, with usage attributed to `model`.
@@ -1283,6 +1310,7 @@ mod tests {
             }),
             model: Some(model.to_string()),
             duration_ms: Some(42),
+            estimated_cost: None,
         }
     }
 

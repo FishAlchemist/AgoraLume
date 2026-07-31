@@ -288,6 +288,9 @@ async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
                     usage: result.usage,
                     model: runtime.brain.model_name().map(str::to_string),
                     duration_ms: Some(duration_ms),
+                    // Filled in centrally by `record_trace`, which alone knows
+                    // the currently configured pricing.
+                    estimated_cost: None,
                 },
             );
             tracing::debug!(
@@ -496,6 +499,7 @@ async fn run_turn(
                             usage,
                             model: runtime.brain.model_name().map(str::to_string),
                             duration_ms: Some(duration_ms),
+                            estimated_cost: None,
                         },
                     );
                     emit_error(state, group_id, &persona_id, error);
@@ -526,6 +530,9 @@ async fn run_turn(
                     usage,
                     model: runtime.brain.model_name().map(str::to_string),
                     duration_ms: Some(duration_ms),
+                    // Filled in centrally by `record_trace`, which alone knows
+                    // the currently configured pricing.
+                    estimated_cost: None,
                 },
             );
 
@@ -870,6 +877,7 @@ pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
                         usage: Some(usage),
                         model: runtime.brain.model_name().map(str::to_string),
                         duration_ms: Some(duration_ms),
+                        estimated_cost: None,
                     },
                 );
             }

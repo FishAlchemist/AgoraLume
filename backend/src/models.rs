@@ -491,6 +491,13 @@ pub struct AgentTrace {
     /// Wall-clock time the brain call took, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
+    /// This one call's own estimated cost, priced at the rate configured when
+    /// it was recorded. Filled in by [`crate::state::AppState::record_trace`]
+    /// (the caller never sets it), so it starts `None` at construction and is
+    /// absent whenever pricing isn't configured. Always an estimate — see
+    /// [`Cost`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<Cost>,
 }
 
 /// An estimated cost breakdown for the accumulated usage. Always an estimate:

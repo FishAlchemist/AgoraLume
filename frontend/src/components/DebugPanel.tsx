@@ -331,6 +331,11 @@ function TraceItem({
                 {fmt(trace.usage.completionTokens)}
               </Text>
             )}
+            {trace.estimatedCost && (
+              <Text size="xs" c="dimmed" ff="monospace">
+                {trace.estimatedCost.total.toFixed(4)} {trace.estimatedCost.currency}
+              </Text>
+            )}
           </Group>
         </Stack>
       </Accordion.Control>
