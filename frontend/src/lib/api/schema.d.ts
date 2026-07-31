@@ -179,7 +179,9 @@ export interface paths {
   "/v1beta/llm/settings": {
     /**
      * The live LLM provider configuration. `apiKey` is never included — only
-     * `hasApiKey`, whether one is currently stored.
+     * `hasApiKey`, whether one is currently stored. Requires an authenticated
+     * caller (see [`AuthenticatedSubject`]) — this is shared server config, not
+     * per-account data, but still not something an anonymous guest should read.
      */
     get: operations["get_llm_settings"];
     /**
@@ -1429,6 +1431,12 @@ export interface operations {
           "application/json": components["schemas"]["LlmModelsView"];
         };
       };
+      /** @description Missing or invalid access token */
+      401: {
+        content: {
+          "text/plain": string;
+        };
+      };
       /** @description empty baseUrl, no usable key, or the endpoint rejected the request */
       422: {
         content: {
@@ -1439,13 +1447,21 @@ export interface operations {
   };
   /**
    * The live LLM provider configuration. `apiKey` is never included — only
-   * `hasApiKey`, whether one is currently stored.
+   * `hasApiKey`, whether one is currently stored. Requires an authenticated
+   * caller (see [`AuthenticatedSubject`]) — this is shared server config, not
+   * per-account data, but still not something an anonymous guest should read.
    */
   get_llm_settings: {
     responses: {
       200: {
         content: {
           "application/json": components["schemas"]["LlmSettingsView"];
+        };
+      };
+      /** @description Missing or invalid access token */
+      401: {
+        content: {
+          "text/plain": string;
         };
       };
     };
@@ -1468,6 +1484,12 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["LlmSettingsView"];
+        };
+      };
+      /** @description Missing or invalid access token */
+      401: {
+        content: {
+          "text/plain": string;
         };
       };
       /** @description e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct */

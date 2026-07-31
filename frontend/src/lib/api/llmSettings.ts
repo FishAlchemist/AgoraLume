@@ -1,3 +1,4 @@
+import { authFetch } from './authFetch';
 import type { LlmModelsView, LlmSettingsPatch, LlmSettingsView } from './types';
 import { versionedBase } from './version';
 
@@ -8,12 +9,22 @@ import { versionedBase } from './version';
  * usage), which the in-browser mock also implements. Configuring a backend's
  * real-model *provider* is meaningless without a real backend, so this talks
  * to a `baseUrl` directly rather than routing through the mock/HTTP split —
- * callers (the Settings page) only render this section when one is connected.
+ * callers (the Settings page) only render this section when a backend is
+ * connected. Every call here goes through `authFetch`, not a bare `fetch`,
+ * because the backend requires an authenticated caller on all three routes
+ * (see `AuthenticatedSubject` in `backend/src/state.rs`) — that's the actual
+ * enforcement. This deliberately does not try to guess and pre-block an
+ * unauthenticated caller on the frontend: an anonymous guest just gets the
+ * real 401 (and its detail text) back from the server, same as anyone else
+ * a token stops working for.
  */
 
 async function getJson<T>(baseUrl: string, path: string): Promise<T> {
-  const res = await fetch(`${baseUrl}${path}`, { headers: { Accept: 'application/json' } });
-  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
+  const res = await authFetch(`${baseUrl}${path}`, { headers: { Accept: 'application/json' } });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(detail || `GET ${path} failed: ${res.status}`);
+  }
   return (await res.json()) as T;
 }
 
@@ -32,7 +43,7 @@ export async function updateLlmSettings(
   baseUrl: string,
   patch: LlmSettingsPatch,
 ): Promise<LlmSettingsView> {
-  const res = await fetch(`${versionedBase(baseUrl)}/llm/settings`, {
+  const res = await authFetch(`${versionedBase(baseUrl)}/llm/settings`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
@@ -58,7 +69,7 @@ export async function listLlmModels(
   backendUrl: string,
   query: { baseUrl: string; apiKey?: string },
 ): Promise<LlmModelsView> {
-  const res = await fetch(`${versionedBase(backendUrl)}/llm/models`, {
+  const res = await authFetch(`${versionedBase(backendUrl)}/llm/models`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(query),

@@ -14,7 +14,7 @@ use utoipa_axum::routes;
 
 use crate::agent::llm::normalize_base_url;
 use crate::models::{LlmModelsQuery, LlmModelsView, LlmSettingsPatch, LlmSettingsView};
-use crate::state::AppState;
+use crate::state::{AppState, AuthenticatedSubject};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new().routes(routes!(
@@ -25,10 +25,18 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
 }
 
 /// The live LLM provider configuration. `apiKey` is never included — only
-/// `hasApiKey`, whether one is currently stored.
+/// `hasApiKey`, whether one is currently stored. Requires an authenticated
+/// caller (see [`AuthenticatedSubject`]) — this is shared server config, not
+/// per-account data, but still not something an anonymous guest should read.
 #[utoipa::path(get, path = "/llm/settings", tag = "llm",
-    responses((status = 200, body = LlmSettingsView)))]
-async fn get_llm_settings(State(s): State<Arc<AppState>>) -> Json<LlmSettingsView> {
+    responses(
+        (status = 200, body = LlmSettingsView),
+        (status = 401, description = "Missing or invalid access token", body = String),
+    ))]
+async fn get_llm_settings(
+    _subject: AuthenticatedSubject,
+    State(s): State<Arc<AppState>>,
+) -> Json<LlmSettingsView> {
     Json(LlmSettingsView::from(&s.llm_settings()))
 }
 
@@ -41,9 +49,11 @@ async fn get_llm_settings(State(s): State<Arc<AppState>>) -> Json<LlmSettingsVie
     request_body = LlmSettingsPatch,
     responses(
         (status = 200, description = "Applied immediately; persisted to llm.toml", body = LlmSettingsView),
+        (status = 401, description = "Missing or invalid access token", body = String),
         (status = 422, description = "e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct", body = String),
     ))]
 async fn update_llm_settings(
+    AuthenticatedSubject(subject): AuthenticatedSubject,
     State(s): State<Arc<AppState>>,
     Json(patch): Json<LlmSettingsPatch>,
 ) -> Result<Json<LlmSettingsView>, (StatusCode, String)> {
@@ -52,6 +62,14 @@ async fn update_llm_settings(
     let applied = s
         .apply_llm_settings(settings)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    // `subject` is always `Subject::Admin` when auth isn't enforced (mock mode,
+    // `AGORALUME_AUTH_DISABLED`) — that's `AuthenticatedSubject`'s bypass value,
+    // not a real admin login, so it isn't logged as one.
+    if s.auth_required() {
+        tracing::info!(?subject, "LLM provider settings updated");
+    } else {
+        tracing::info!("LLM provider settings updated (auth not enforced on this server)");
+    }
     Ok(Json(LlmSettingsView::from(&applied)))
 }
 
@@ -66,9 +84,11 @@ async fn update_llm_settings(
     request_body = LlmModelsQuery,
     responses(
         (status = 200, body = LlmModelsView),
+        (status = 401, description = "Missing or invalid access token", body = String),
         (status = 422, description = "empty baseUrl, no usable key, or the endpoint rejected the request", body = String),
     ))]
 async fn list_llm_models(
+    _subject: AuthenticatedSubject,
     State(s): State<Arc<AppState>>,
     Json(query): Json<LlmModelsQuery>,
 ) -> Result<Json<LlmModelsView>, (StatusCode, String)> {

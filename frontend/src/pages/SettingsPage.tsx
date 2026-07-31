@@ -411,7 +411,15 @@ function buildPatch(draft: LlmDraft, apiKey?: string): LlmSettingsPatch {
  * Operator config for the real-model provider — endpoint, key, tuning,
  * pricing. Only meaningful against a real backend (configuring a backend's
  * LLM without a backend is a contradiction), so this renders a hint instead
- * of a form when the app is on the in-browser mock.
+ * of a form when the app is on the in-browser mock. It's also shared server
+ * config, not per-account data — the backend requires an authenticated
+ * caller on all three routes (see `AuthenticatedSubject` in
+ * `backend/src/state.rs`) and is the sole enforcement of that. This
+ * deliberately does *not* pre-hide the form for a guest based on client-side
+ * state: it renders the same form either way and lets the real request 401,
+ * surfacing the backend's actual rejection (see `LlmProviderForm`'s load and
+ * save error handling) — a client-side guess here would just be one more
+ * thing that can drift from what the server actually enforces.
  */
 function LlmProviderSettings() {
   const { t } = useTranslation();

@@ -625,6 +625,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LlmModelsView'
+        '401':
+          description: Missing or invalid access token
+          content:
+            text/plain:
+              schema:
+                type: string
         '422':
           description: empty baseUrl, no usable key, or the endpoint rejected the request
           content:
@@ -637,7 +643,9 @@ paths:
       - llm
       summary: |-
         The live LLM provider configuration. `apiKey` is never included — only
-        `hasApiKey`, whether one is currently stored.
+        `hasApiKey`, whether one is currently stored. Requires an authenticated
+        caller (see [`AuthenticatedSubject`]) — this is shared server config, not
+        per-account data, but still not something an anonymous guest should read.
       operationId: get_llm_settings
       responses:
         '200':
@@ -646,6 +654,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LlmSettingsView'
+        '401':
+          description: Missing or invalid access token
+          content:
+            text/plain:
+              schema:
+                type: string
     patch:
       tags:
       - llm
@@ -669,6 +683,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LlmSettingsView'
+        '401':
+          description: Missing or invalid access token
+          content:
+            text/plain:
+              schema:
+                type: string
         '422':
           description: e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct
           content:

@@ -79,11 +79,11 @@ pub fn router(state: Arc<AppState>, cors_allowed_origins: Option<&[String]>) -> 
     // SPA is hosted), so allow cross-origin access. By default that's *any*
     // origin: no request needs cookies or other ambient browser credentials, so
     // a wildcard doesn't grant a page access to another user's session the way
-    // it would with cookie auth. It does mean the whole API — including
-    // `PATCH /llm/settings`, which can update the stored provider key — is
-    // reachable, unauthenticated, from any page open in the same browser;
-    // that's the same trust model as the rest of this API (no auth anywhere
-    // yet), not something new to this route.
+    // it would with cookie auth. Every route that needs it (per-account data
+    // via `CurrentAccount`, operator config like `PATCH /llm/settings` via
+    // `AuthenticatedSubject`) still requires its own bearer token when auth is
+    // enforced — a wildcard origin doesn't bypass that, it just means any page
+    // that already *has* a valid token for this server can send it cross-origin.
     //
     // An operator who *does* know their frontend's origin can set
     // `AGORALUME_CORS_ORIGINS` to lock this down. `PATCH`/`DELETE` and our
@@ -409,6 +409,31 @@ mod tests {
 
         let (status, _) =
             post_json(app, "/auth/refresh", serde_json::json!({ "refreshToken": refresh_token })).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn llm_settings_401s_without_a_token_when_auth_is_enforced() {
+        let (status, _) = get_json(router(not_mock_state(None, false), None), "/llm/settings").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn llm_settings_accepts_an_admin_token_unlike_a_per_account_route() {
+        // Unlike `CurrentAccount` routes, `/llm/settings` isn't tied to any one
+        // account — it's operator-level config, so (for now — see
+        // `AuthenticatedSubject`'s docs) either role's token is enough, not
+        // just a regular account's.
+        let app = router(not_mock_state(None, false), None);
+        let (_, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "admin", "password": "admin-pw" }),
+        )
+        .await;
+        let access_token = tokens["accessToken"].as_str().expect("an access token");
+
+        let status = get_json_authed(app, "/llm/settings", access_token).await;
         assert_eq!(status, StatusCode::OK);
     }
 

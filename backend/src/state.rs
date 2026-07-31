@@ -1549,6 +1549,50 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for CurrentAccount {
     }
 }
 
+/// Proof the request carries *some* valid session — an account or the admin
+/// role, either one — for handlers that only need "not anonymous", not a
+/// particular account's data. Used by the operator-level LLM provider routes
+/// (`routes::llm`): reading or changing the shared provider config/key isn't
+/// tied to any one account, but must not be reachable by an anonymous guest.
+/// Unlike [`CurrentAccount`], this never resolves the token further into an
+/// `AccountState` — there's nothing account-shaped to load for `Subject::Admin`.
+///
+/// Narrowing this to admin-only belongs with a future round (account
+/// management/admin dashboard) once the frontend has any notion of "this
+/// session is the admin role" to gate on — `POST /auth/login` doesn't
+/// currently disclose which kind of subject a token belongs to. For now any
+/// authenticated caller passes, matching the scope of the bug this fixed: an
+/// unauthenticated guest silently writing shared server config.
+pub struct AuthenticatedSubject(pub Subject);
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for AuthenticatedSubject {
+    type Rejection = AuthRejection;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        // Same bypass condition as `CurrentAccount` — see `AppState::auth_required`,
+        // documented as "exactly the same condition [`CurrentAccount`] bypasses
+        // on". Diverging here would make `authRequired: false` (from `/meta`) a
+        // lie for these routes specifically, breaking mock mode and
+        // `AGORALUME_AUTH_DISABLED` dev setups for no reason.
+        if state.operator.runtime.is_mock() || state.auth_disabled {
+            return Ok(AuthenticatedSubject(Subject::Admin));
+        }
+        let token = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or(AuthRejection::MissingToken)?;
+        state
+            .verify_access_token(token)
+            .map(AuthenticatedSubject)
+            .ok_or(AuthRejection::InvalidToken)
+    }
+}
+
 /// Orders member states so [`AccountState::set_turn_member`] only ever advances one.
 fn state_rank(state: TurnMemberState) -> u8 {
     match state {
