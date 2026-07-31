@@ -10,7 +10,7 @@ type XOR<T, U> = (T | U) extends object ? (Without<T, U> & U) | (Without<U, T> &
 type OneOf<T extends any[]> = T extends [infer Only] ? Only : T extends [infer A, infer B, ...infer Rest] ? OneOf<[XOR<A, B>, ...Rest]> : never;
 
 export interface paths {
-  "/debug/usage": {
+  "/v1beta/debug/usage": {
     /**
      * Cumulative LLM usage — the global "total usage" readout: request count,
      * token breakdown, cache-hit ratio, the running estimated cost (always an
@@ -21,7 +21,7 @@ export interface paths {
      */
     get: operations["debug_usage"];
   };
-  "/debug/usage/by-persona": {
+  "/v1beta/debug/usage/by-persona": {
     /**
      * Usage broken down by persona, site-wide — the global analogue of
      * [`group_debug_usage_by_persona`], for spotting which character is
@@ -32,25 +32,25 @@ export interface paths {
      */
     get: operations["global_debug_usage_by_persona"];
   };
-  "/departments": {
+  "/v1beta/departments": {
     get: operations["list_depts"];
     post: operations["create_dept"];
   };
-  "/departments/{id}": {
+  "/v1beta/departments/{id}": {
     get: operations["get_dept"];
     delete: operations["delete_dept"];
     patch: operations["update_dept"];
   };
-  "/groups": {
+  "/v1beta/groups": {
     get: operations["list_groups"];
     post: operations["create_group"];
   };
-  "/groups/{id}": {
+  "/v1beta/groups/{id}": {
     get: operations["get_group"];
     delete: operations["delete_group"];
     patch: operations["update_group"];
   };
-  "/groups/{id}/debug/traces": {
+  "/v1beta/groups/{id}/debug/traces": {
     /**
      * Recent agent traces for a group — the exact prompt each character received
      * and what it decided — for hydrating the debug panel. Live updates then arrive
@@ -58,7 +58,7 @@ export interface paths {
      */
     get: operations["debug_traces"];
   };
-  "/groups/{id}/debug/usage": {
+  "/v1beta/groups/{id}/debug/usage": {
     /**
      * One group's own cumulative LLM usage — independent of every other group's,
      * unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
@@ -71,7 +71,7 @@ export interface paths {
      */
     get: operations["group_debug_usage"];
   };
-  "/groups/{id}/debug/usage/by-persona": {
+  "/v1beta/groups/{id}/debug/usage/by-persona": {
     /**
      * A group's usage broken down by persona — which character is driving the
      * spend, within that group's own total from [`group_debug_usage`]. Covers
@@ -80,7 +80,7 @@ export interface paths {
      */
     get: operations["group_debug_usage_by_persona"];
   };
-  "/groups/{id}/events": {
+  "/v1beta/groups/{id}/events": {
     /**
      * Posts an environment event into a group — rain, time passing, an emergency —
      * letting the world outside the chat influence the agents. Accepted and queued
@@ -89,7 +89,7 @@ export interface paths {
      */
     post: operations["post_event"];
   };
-  "/groups/{id}/messages": {
+  "/v1beta/groups/{id}/messages": {
     /**
      * A contiguous window of a group's message history, oldest first. One shape drives
      * every navigation: the initial open (`before` + `since`), paging earlier
@@ -105,7 +105,7 @@ export interface paths {
      */
     post: operations["send_message"];
   };
-  "/groups/{id}/retry": {
+  "/v1beta/groups/{id}/retry": {
     /**
      * Resumes a turn that was suspended by a failed agent inference: the agents who
      * have not yet read the pending message respond to the current chat. A no-op if
@@ -114,7 +114,7 @@ export interface paths {
      */
     post: operations["retry_turn"];
   };
-  "/groups/{id}/stream": {
+  "/v1beta/groups/{id}/stream": {
     /**
      * Server-Sent Events for a group: default `message` events (AI replies and
      * moods), named `read` events (read receipts), named `activity` events (the
@@ -123,7 +123,7 @@ export interface paths {
      */
     get: operations["stream"];
   };
-  "/groups/{id}/suggestions": {
+  "/v1beta/groups/{id}/suggestions": {
     /**
      * Cached conversation-starter suggestions for a group. Returned immediately from
      * the server-side cache; if they're stale (the conversation moved on, or the
@@ -134,7 +134,7 @@ export interface paths {
      */
     get: operations["get_suggestions"];
   };
-  "/groups/{id}/suggestions/regenerate": {
+  "/v1beta/groups/{id}/suggestions/regenerate": {
     /**
      * Forces a fresh suggestion generation for a group (the composer's "give me
      * other ideas" action). Accepted and generated in the background; the result
@@ -144,11 +144,11 @@ export interface paths {
      */
     post: operations["regenerate_suggestions"];
   };
-  "/health": {
+  "/v1beta/health": {
     /** Liveness probe — cheap "is the server up" check. */
     get: operations["health"];
   };
-  "/llm/models": {
+  "/v1beta/llm/models": {
     /**
      * Lists the models a provider endpoint offers, so the Settings page can offer
      * a picker instead of a blind text field. `apiKey` is optional: when omitted,
@@ -160,7 +160,7 @@ export interface paths {
      */
     post: operations["list_llm_models"];
   };
-  "/llm/settings": {
+  "/v1beta/llm/settings": {
     /**
      * The live LLM provider configuration. `apiKey` is never included — only
      * `hasApiKey`, whether one is currently stored.
@@ -175,23 +175,23 @@ export interface paths {
      */
     patch: operations["update_llm_settings"];
   };
-  "/meta": {
+  "/v1beta/meta": {
     /**
      * The server's mode, so the client can distinguish a mock build (no LLM,
      * in-memory) from a production one — separately from mere reachability.
      */
     get: operations["meta"];
   };
-  "/organizations": {
+  "/v1beta/organizations": {
     get: operations["list_orgs"];
     post: operations["create_org"];
   };
-  "/organizations/{id}": {
+  "/v1beta/organizations/{id}": {
     get: operations["get_org"];
     delete: operations["delete_org"];
     patch: operations["update_org"];
   };
-  "/personas": {
+  "/v1beta/personas": {
     get: operations["list_personas"];
     /**
      * Creates a persona. Rejects (409) a duplicate name (names are globally unique)
@@ -199,7 +199,7 @@ export interface paths {
      */
     post: operations["create_persona"];
   };
-  "/personas/{id}": {
+  "/v1beta/personas/{id}": {
     get: operations["get_persona"];
     /**
      * Deletes a persona. Refuses (409) to remove the last remaining user identity,
@@ -212,7 +212,7 @@ export interface paths {
      */
     patch: operations["update_persona"];
   };
-  "/personas/{personaId}/memories": {
+  "/v1beta/personas/{personaId}/memories": {
     /**
      * Every memory a persona has accumulated, across all of its identity versions,
      * newest first. The memory-management UI groups the result by `promptHash`/label.
@@ -225,28 +225,28 @@ export interface paths {
      */
     post: operations["create_memory"];
   };
-  "/personas/{personaId}/memories/{memoryId}": {
+  "/v1beta/personas/{personaId}/memories/{memoryId}": {
     /**
      * Deletes one of a persona's memories. 404 when no such memory belongs to that
      * persona.
      */
     delete: operations["delete_memory"];
   };
-  "/prompt-labels": {
+  "/v1beta/prompt-labels": {
     /**
      * All user-assigned names for persona identity hashes. The memory UI reads this
      * to show a friendly label (e.g. "bar 版") next to a persona's prompt version.
      */
     get: operations["list_prompt_labels"];
   };
-  "/prompt-labels/{hash}": {
+  "/v1beta/prompt-labels/{hash}": {
     /**
      * Names an identity hash, or clears its name when the label is blank. Idempotent
      * (PUT), keyed by the full hash the client already holds from the persona.
      */
     put: operations["set_prompt_label"];
   };
-  "/settings": {
+  "/v1beta/settings": {
     get: operations["get_settings"];
     patch: operations["update_settings"];
   };

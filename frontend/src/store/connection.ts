@@ -10,9 +10,19 @@ const forceMock = import.meta.env.VITE_USE_MOCK === '1';
 // with VITE_SAME_ORIGIN=1 makes the app default to that origin (a real,
 // non-empty URL, so every `if (backendUrl)` consumer treats it as a live
 // backend) instead of the in-browser mock.
+//
+// VITE_API_PREFIX adds an edge segment (e.g. `/api`) ahead of that origin —
+// set by the two builds that transit the Vite proxy, `dev:proxy` (interactive)
+// and `build:proxy` (built assets, used by `start:single`); Vite strips it
+// before forwarding (see vite.config.ts), which has no bare passthrough, so
+// an edge always requires it. `build:bundle` — the real single-binary bundle
+// from `scripts/bundle.mjs`, served by the Rust process directly with no edge
+// in front of it — deliberately never sets this, since there's nothing there
+// to strip it back off.
+const apiPrefix = import.meta.env.VITE_API_PREFIX?.trim() || '';
 const sameOrigin =
   import.meta.env.VITE_SAME_ORIGIN === '1' && typeof window !== 'undefined'
-    ? window.location.origin
+    ? `${window.location.origin}${apiPrefix}`
     : null;
 const initialBackendUrl = forceMock ? null : envUrl || sameOrigin || null;
 

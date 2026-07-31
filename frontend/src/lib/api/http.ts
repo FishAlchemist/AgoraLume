@@ -1,4 +1,5 @@
 import type { GroupSuggestions, Message, Turn } from '../../types';
+import { versionedBase } from './version';
 import type {
   ActivityHandler,
   AgentTrace,
@@ -215,9 +216,11 @@ class SharedStreams {
 export class HttpChatApi implements ChatApi {
   // All four subscription kinds share one SSE connection per group.
   private readonly streams: SharedStreams;
+  private readonly baseUrl: string;
 
-  constructor(private readonly baseUrl: string) {
-    this.streams = new SharedStreams(baseUrl);
+  constructor(rawBaseUrl: string) {
+    this.baseUrl = versionedBase(rawBaseUrl);
+    this.streams = new SharedStreams(this.baseUrl);
   }
 
   private async getJson<T>(path: string): Promise<T> {

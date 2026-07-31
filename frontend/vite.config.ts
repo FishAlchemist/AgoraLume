@@ -5,22 +5,23 @@ import { defineConfig, loadEnv } from 'vite';
 // anywhere; at runtime it talks to a backend chosen by VITE_API_BASE_URL, the
 // serving origin (VITE_SAME_ORIGIN=1, the bundle), or the in-browser mock.
 //
-// The dev proxy below reproduces the bundle's single-origin shape while keeping
-// hot reload: `pnpm dev:proxy` serves the SPA in same-origin mode and forwards
-// the backend's top-level route prefixes to it, so the whole app is reachable
-// on Vite's one port. Client routes live under the URL hash (HashRouter), so
-// proxying these real paths never shadows SPA navigation.
-const API_PREFIXES = [
-  '/health',
-  '/meta',
-  '/debug',
-  '/organizations',
-  '/departments',
-  '/personas',
-  '/groups',
-  '/settings',
-  '/llm',
-];
+// The dev proxy below reproduces an edge-fronted deployment while keeping hot
+// reload: `pnpm dev:proxy` serves the SPA in same-origin mode and forwards
+// `/api`-prefixed traffic to the backend, so the whole app is reachable on
+// Vite's one port. This is one fixed rule, not a per-resource list that needs
+// a new line every time a route is added — the backend itself lives entirely
+// under one version prefix (`API_VERSION` in backend/src/routes/mod.rs) and
+// is never mounted under `/api` (it's its own API service, not a sub-resource
+// of one); `/api` here plays the role an operator's own edge (Nginx, etc.)
+// would in a real multi-service deployment. Only two builds ever run through
+// this proxy — `dev:proxy`/`dev:single` and `build:proxy`'s output (used by
+// `start:single`) — and both set `VITE_API_PREFIX=/api`, so there is no bare,
+// unprefixed passthrough here: an edge always requires going through `/api`.
+// (`build:bundle`'s output — the real single-binary bundle from
+// `scripts/bundle.mjs` — has no edge in front of it at all: the Rust process
+// serves its own `/v1beta` routes directly, so it deliberately stays
+// bare-root and never transits this proxy.) Client routes live under the URL
+// hash (HashRouter), so proxying `/api` never shadows SPA navigation.
 
 // This config runs under Node; declare the globals we read so the app's
 // browser-only tsconfig type-checks it without pulling in @types/node.
@@ -54,10 +55,15 @@ export default defineConfig(({ mode }) => {
     strictPort: devPort !== undefined,
     // changeOrigin rewrites the Host header to the target; SSE (/groups/:id/
     // stream) streams straight through since the proxy doesn't buffer plain
-    // HTTP responses.
-    proxy: Object.fromEntries(
-      API_PREFIXES.map((path) => [path, { target: proxyTarget, changeOrigin: true }]),
-    ),
+    // HTTP responses. The rewrite only ever trims the literal `/api` segment,
+    // so it's version-agnostic — a version bump never touches this file.
+    proxy: {
+      '/api': {
+        target: proxyTarget,
+        changeOrigin: true,
+        rewrite: (path: string) => path.replace(/^\/api/, ''),
+      },
+    },
   };
 
   return {

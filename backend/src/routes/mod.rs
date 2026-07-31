@@ -50,10 +50,23 @@ struct ApiDoc;
 /// Assembles the full API as an `OpenApiRouter`, the single definition both the
 /// running server and the spec generator draw from.
 fn api() -> OpenApiRouter<Arc<AppState>> {
-    OpenApiRouter::with_openapi(ApiDoc::openapi())
+    OpenApiRouter::new()
         .merge(chat::router())
         .merge(workspace::router())
         .merge(llm::router())
+}
+
+/// The wire contract's version segment. Every route lives under this one
+/// prefix — nothing in `api()` knows its own mount point — so bumping the
+/// contract (`/v1beta` to `/v1`) is this one line, mirrored on the frontend by
+/// `API_VERSION` in `frontend/src/lib/api/version.ts`.
+const API_VERSION: &str = "/v1beta";
+
+/// `api()` nested under [`API_VERSION`], carrying the top-level OpenAPI
+/// metadata. `.nest()` prefixes the generated paths to match, so the spec and
+/// the router can never disagree about where a route lives.
+fn versioned_api() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::with_openapi(ApiDoc::openapi()).nest(API_VERSION, api())
 }
 
 /// Builds the runtime router with CORS and request tracing. `cors_allowed_origins`
@@ -91,7 +104,7 @@ pub fn router(state: Arc<AppState>, cors_allowed_origins: Option<&[String]>) -> 
         ])
         .allow_headers(Any);
 
-    let (router, _) = api().split_for_parts();
+    let (router, _) = versioned_api().split_for_parts();
     router
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -139,7 +152,7 @@ fn allow_origin_from(origins: Option<&[String]>) -> AllowOrigin {
 
 /// The generated OpenAPI document, for serving or writing to `openapi.yml`.
 pub fn openapi() -> OpenApiDoc {
-    api().into_openapi()
+    versioned_api().into_openapi()
 }
 
 #[cfg(test)]
@@ -155,11 +168,12 @@ mod tests {
     /// headers a browser adds automatically) for a `PATCH /llm/settings` from
     /// `origin`, and returns the `Access-Control-Allow-Origin` response header
     /// if one came back — absence is exactly what tells a real browser not to
-    /// send the follow-up `PATCH`.
+    /// send the follow-up `PATCH`. Unversioned path in, [`API_VERSION`] applied
+    /// here — same reason as [`get_json`].
     async fn preflight_allow_origin(router: Router, origin: &str) -> Option<String> {
         let request = Request::builder()
             .method("OPTIONS")
-            .uri("/llm/settings")
+            .uri(format!("{API_VERSION}/llm/settings"))
             .header(header::ORIGIN, origin)
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PATCH")
             .body(Body::empty())
@@ -176,13 +190,17 @@ mod tests {
         Arc::new(AppState::with_runtime(AgentRuntime::mock()))
     }
 
-    /// GETs `path` through the fully assembled router and returns the parsed
-    /// JSON body — end-to-end through actual route dispatch, not just the
-    /// `AppState` method underneath, so a route that got shadowed or
-    /// mis-registered (as opposed to a wrong-answer bug in the method itself)
-    /// would show up here.
+    /// GETs `path` (unversioned, e.g. `/debug/usage` — [`API_VERSION`] is
+    /// applied here, the one place a version bump touches this test module)
+    /// through the fully assembled router and returns the parsed JSON body —
+    /// end-to-end through actual route dispatch, not just the `AppState`
+    /// method underneath, so a route that got shadowed or mis-registered (as
+    /// opposed to a wrong-answer bug in the method itself) would show up here.
     async fn get_json(router: Router, path: &str) -> (StatusCode, serde_json::Value) {
-        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let request = Request::builder()
+            .uri(format!("{API_VERSION}{path}"))
+            .body(Body::empty())
+            .unwrap();
         let response = router.oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();

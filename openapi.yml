@@ -7,7 +7,7 @@ info:
     identifier: AGPL-3.0-only
   version: 0.1.0
 paths:
-  /debug/usage:
+  /v1beta/debug/usage:
     get:
       tags:
       - service
@@ -26,7 +26,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DebugUsage'
-  /debug/usage/by-persona:
+  /v1beta/debug/usage/by-persona:
     get:
       tags:
       - service
@@ -47,7 +47,7 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/PersonaUsage'
-  /departments:
+  /v1beta/departments:
     get:
       tags:
       - departments
@@ -78,7 +78,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Department'
-  /departments/{id}:
+  /v1beta/departments/{id}:
     get:
       tags:
       - departments
@@ -138,7 +138,7 @@ paths:
                 $ref: '#/components/schemas/Department'
         '404':
           description: ''
-  /groups:
+  /v1beta/groups:
     get:
       tags:
       - groups
@@ -169,7 +169,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Group'
-  /groups/{id}:
+  /v1beta/groups/{id}:
     get:
       tags:
       - groups
@@ -229,7 +229,7 @@ paths:
                 $ref: '#/components/schemas/Group'
         '404':
           description: ''
-  /groups/{id}/debug/traces:
+  /v1beta/groups/{id}/debug/traces:
     get:
       tags:
       - chat
@@ -254,7 +254,7 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/AgentTrace'
-  /groups/{id}/debug/usage:
+  /v1beta/groups/{id}/debug/usage:
     get:
       tags:
       - chat
@@ -284,7 +284,7 @@ paths:
                 $ref: '#/components/schemas/DebugUsage'
         '404':
           description: Unknown group
-  /groups/{id}/debug/usage/by-persona:
+  /v1beta/groups/{id}/debug/usage/by-persona:
     get:
       tags:
       - chat
@@ -312,7 +312,7 @@ paths:
                   $ref: '#/components/schemas/PersonaUsage'
         '404':
           description: Unknown group
-  /groups/{id}/events:
+  /v1beta/groups/{id}/events:
     post:
       tags:
       - chat
@@ -340,7 +340,7 @@ paths:
           description: Event accepted
         '404':
           description: Unknown group
-  /groups/{id}/messages:
+  /v1beta/groups/{id}/messages:
     get:
       tags:
       - chat
@@ -437,7 +437,7 @@ paths:
                 $ref: '#/components/schemas/Message'
         '404':
           description: Unknown group
-  /groups/{id}/retry:
+  /v1beta/groups/{id}/retry:
     post:
       tags:
       - chat
@@ -459,7 +459,7 @@ paths:
           description: Retry accepted
         '404':
           description: Unknown group
-  /groups/{id}/stream:
+  /v1beta/groups/{id}/stream:
     get:
       tags:
       - chat
@@ -479,7 +479,7 @@ paths:
       responses:
         '200':
           description: 'text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `turn` frames carry a Turn, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions'
-  /groups/{id}/suggestions:
+  /v1beta/groups/{id}/suggestions:
     get:
       tags:
       - chat
@@ -507,7 +507,7 @@ paths:
                 $ref: '#/components/schemas/GroupSuggestions'
         '404':
           description: Unknown group
-  /groups/{id}/suggestions/regenerate:
+  /v1beta/groups/{id}/suggestions/regenerate:
     post:
       tags:
       - chat
@@ -530,7 +530,7 @@ paths:
           description: Regeneration accepted (or coalesced with a recent one)
         '404':
           description: Unknown group
-  /health:
+  /v1beta/health:
     get:
       tags:
       - service
@@ -543,7 +543,7 @@ paths:
             text/plain:
               schema:
                 type: string
-  /llm/models:
+  /v1beta/llm/models:
     post:
       tags:
       - llm
@@ -575,7 +575,7 @@ paths:
             text/plain:
               schema:
                 type: string
-  /llm/settings:
+  /v1beta/llm/settings:
     get:
       tags:
       - llm
@@ -619,7 +619,7 @@ paths:
             text/plain:
               schema:
                 type: string
-  /meta:
+  /v1beta/meta:
     get:
       tags:
       - service
@@ -634,7 +634,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ServerMeta'
-  /organizations:
+  /v1beta/organizations:
     get:
       tags:
       - organizations
@@ -665,7 +665,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Organization'
-  /organizations/{id}:
+  /v1beta/organizations/{id}:
     get:
       tags:
       - organizations
@@ -725,7 +725,7 @@ paths:
                 $ref: '#/components/schemas/Organization'
         '404':
           description: ''
-  /personas:
+  /v1beta/personas:
     get:
       tags:
       - personas
@@ -761,7 +761,7 @@ paths:
                 $ref: '#/components/schemas/Persona'
         '409':
           description: 'Refused: name already in use, or a second user identity'
-  /personas/{id}:
+  /v1beta/personas/{id}:
     get:
       tags:
       - personas
@@ -831,7 +831,7 @@ paths:
           description: ''
         '409':
           description: 'Refused: name already in use, or a second user identity'
-  /personas/{personaId}/memories:
+  /v1beta/personas/{personaId}/memories:
     get:
       tags:
       - personas
@@ -887,7 +887,7 @@ paths:
           description: ''
         '409':
           description: 'Refused: persona has no prompt to scope a memory to, or blank content'
-  /personas/{personaId}/memories/{memoryId}:
+  /v1beta/personas/{personaId}/memories/{memoryId}:
     delete:
       tags:
       - personas
@@ -911,7 +911,7 @@ paths:
           description: ''
         '404':
           description: ''
-  /prompt-labels:
+  /v1beta/prompt-labels:
     get:
       tags:
       - personas
@@ -928,7 +928,7 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/PromptLabel'
-  /prompt-labels/{hash}:
+  /v1beta/prompt-labels/{hash}:
     put:
       tags:
       - personas
@@ -955,7 +955,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PromptLabel'
-  /settings:
+  /v1beta/settings:
     get:
       tags:
       - settings

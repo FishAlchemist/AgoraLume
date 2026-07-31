@@ -7,6 +7,7 @@ import type {
   PromptLabel,
   Settings,
 } from '../../types';
+import { versionedBase } from './version';
 
 /** A full read of the backend-owned workspace (the SSOT). */
 export interface WorkspaceSnapshot {
@@ -29,7 +30,11 @@ export interface WorkspaceSnapshot {
  * its departments) happen server-side, so callers re-read after a delete.
  */
 export class HttpWorkspaceApi {
-  constructor(private readonly baseUrl: string) {}
+  private readonly baseUrl: string;
+
+  constructor(rawBaseUrl: string) {
+    this.baseUrl = versionedBase(rawBaseUrl);
+  }
 
   private async get<T>(path: string): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, { headers: { Accept: 'application/json' } });

@@ -1,4 +1,5 @@
 import type { LlmModelsView, LlmSettingsPatch, LlmSettingsView } from './types';
+import { versionedBase } from './version';
 
 /**
  * The LLM provider configuration client — `GET`/`PATCH /llm/settings` on a
@@ -18,7 +19,7 @@ async function getJson<T>(baseUrl: string, path: string): Promise<T> {
 
 /** The live LLM provider configuration, with the API key stripped to a presence flag. */
 export function getLlmSettings(baseUrl: string): Promise<LlmSettingsView> {
-  return getJson<LlmSettingsView>(baseUrl, '/llm/settings');
+  return getJson<LlmSettingsView>(versionedBase(baseUrl), '/llm/settings');
 }
 
 /**
@@ -31,7 +32,7 @@ export async function updateLlmSettings(
   baseUrl: string,
   patch: LlmSettingsPatch,
 ): Promise<LlmSettingsView> {
-  const res = await fetch(`${baseUrl}/llm/settings`, {
+  const res = await fetch(`${versionedBase(baseUrl)}/llm/settings`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
@@ -57,7 +58,7 @@ export async function listLlmModels(
   backendUrl: string,
   query: { baseUrl: string; apiKey?: string },
 ): Promise<LlmModelsView> {
-  const res = await fetch(`${backendUrl}/llm/models`, {
+  const res = await fetch(`${versionedBase(backendUrl)}/llm/models`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(query),
