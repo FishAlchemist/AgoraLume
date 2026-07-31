@@ -31,6 +31,7 @@ export const zhHant: TranslationSchema = {
     signIn: '登入',
     signingIn: '登入中…',
     signOut: '登出',
+    signedInAs: '已登入：{{username}}',
     invalidCredentials: '帳號或密碼錯誤',
   },
   common: {

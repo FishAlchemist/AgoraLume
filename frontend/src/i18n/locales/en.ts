@@ -29,6 +29,7 @@ export const en = {
     signIn: 'Sign in',
     signingIn: 'Signing in…',
     signOut: 'Sign out',
+    signedInAs: 'Signed in as {{username}}',
     invalidCredentials: 'Invalid username or password',
   },
   common: {

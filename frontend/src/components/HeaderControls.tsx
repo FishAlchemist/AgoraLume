@@ -26,6 +26,7 @@ export function HeaderControls() {
   const { colorScheme, toggleColorScheme } = useMantineColorScheme();
   const backendUrl = useConnection((s) => s.backendUrl);
   const accessToken = useAuth((s) => s.accessToken);
+  const username = useAuth((s) => s.username);
   const clearAuth = useAuth((s) => s.clear);
   const openLogin = useUi((s) => s.openLogin);
 
@@ -80,6 +81,14 @@ export function HeaderControls() {
           <ActionIcon variant="default" size="lg" onClick={openLogin} aria-label={t('auth.signIn')}>
             <IconLogin size={18} />
           </ActionIcon>
+        </Tooltip>
+      )}
+
+      {accessToken && username && (
+        <Tooltip label={t('auth.signedInAs', { username })}>
+          <Badge variant="light" color="blue">
+            {username}
+          </Badge>
         </Tooltip>
       )}
 

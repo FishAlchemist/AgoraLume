@@ -54,7 +54,7 @@ export function LoginPage() {
     setStatus('submitting');
     try {
       const tokens = await login(backendUrl, username, password);
-      setTokens(tokens);
+      setTokens({ ...tokens, username });
       closeLogin();
       navigate('/');
     } catch {
