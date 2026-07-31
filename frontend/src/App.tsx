@@ -19,6 +19,7 @@ import { useWorkspace } from './store/workspace';
 // navbar) — the "structure" — paints immediately and only the content region
 // shows a spinner while a page's chunk loads, then swaps in. Named exports are
 // unwrapped to the default `lazy()` expects.
+const AdminPage = lazy(() => import('./pages/AdminPage').then((m) => ({ default: m.AdminPage })));
 const ChatPage = lazy(() => import('./pages/ChatPage').then((m) => ({ default: m.ChatPage })));
 const MePage = lazy(() => import('./pages/MePage').then((m) => ({ default: m.MePage })));
 const OrganizationsPage = lazy(() =>
@@ -122,6 +123,7 @@ function Shell() {
               <Route path="/organizations" element={<OrganizationsPage />} />
               <Route path="/me" element={<MePage />} />
               <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/admin" element={<AdminPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Suspense>

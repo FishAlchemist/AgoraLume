@@ -39,14 +39,25 @@ export const useBackendStatusStore = create<BackendStatus>(() => ({
 
 /**
  * Whether a live, auth-requiring backend should be treated as unreachable for
- * data purposes because there's no session yet — the "browse a demo, log in
- * for your real data" fallback (see `pages/LoginPage`). `authRequired` starts
- * `undefined` until the first `/meta` probe resolves; treated the same as
- * `true` so the app never briefly renders real-looking data before it
+ * data purposes because there's no usable session — the "browse a demo, log
+ * in for your real data" fallback (see `pages/LoginPage`). `authRequired`
+ * starts `undefined` until the first `/meta` probe resolves; treated the same
+ * as `true` so the app never briefly renders real-looking data before it
  * actually knows whether a session is required to see it.
+ *
+ * An admin session counts as "no usable session" too, on purpose: admin has
+ * no workspace of its own (see `backend/src/state.rs`'s `CurrentAccount`),
+ * so every group/message route would just 401 for it. Routing an admin
+ * session through the same shared-seed demo a guest sees — rather than
+ * building a second, admin-specific "nothing to show" path — means every
+ * caller of this function (chat routing, subscription effects, the
+ * data-source badge) already does the right thing with no further changes.
  */
 export function isGuestFallback(): boolean {
-  return useBackendStatusStore.getState().authRequired !== false && !useAuth.getState().accessToken;
+  const { accessToken, role } = useAuth.getState();
+  return (
+    useBackendStatusStore.getState().authRequired !== false && (!accessToken || role === 'admin')
+  );
 }
 
 /**
@@ -59,5 +70,6 @@ export function isGuestFallback(): boolean {
 export function useIsGuestFallback(): boolean {
   const authRequired = useBackendStatusStore((s) => s.authRequired);
   const accessToken = useAuth((s) => s.accessToken);
-  return authRequired !== false && !accessToken;
+  const role = useAuth((s) => s.role);
+  return authRequired !== false && (!accessToken || role === 'admin');
 }

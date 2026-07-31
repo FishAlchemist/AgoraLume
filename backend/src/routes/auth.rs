@@ -14,6 +14,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::Subject;
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
@@ -44,6 +45,12 @@ struct TokenPair {
     /// Long-lived; used only against `POST /auth/refresh` to mint a fresh
     /// access token without asking for the password again.
     refresh_token: String,
+    /// `"admin"` or `"account"` — which kind of session this token belongs
+    /// to, so the frontend can route an admin session to its own dashboard
+    /// instead of a workspace it doesn't have. A UX routing hint only, not
+    /// itself a permission grant: every route still checks the token's
+    /// actual `Subject` server-side regardless of what this field says.
+    role: String,
 }
 
 /// Logs in as the admin (username `"admin"`) or a regular account (its own
@@ -59,12 +66,17 @@ async fn login(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<TokenPair>, (StatusCode, String)> {
-    let issued = state
+    let (issued, subject) = state
         .login(&body.username, &body.password)
         .ok_or((StatusCode::UNAUTHORIZED, "invalid username or password".to_string()))?;
+    let role = match subject {
+        Subject::Admin => "admin",
+        Subject::Account(_) => "account",
+    };
     Ok(Json(TokenPair {
         access_token: issued.access_token,
         refresh_token: issued.refresh_token,
+        role: role.to_string(),
     }))
 }
 

@@ -7,6 +7,60 @@ info:
     identifier: AGPL-3.0-only
   version: 0.1.0
 paths:
+  /v1beta/accounts:
+    get:
+      tags:
+      - accounts
+      summary: Every existing account, for the admin dashboard's account list.
+      operationId: list_accounts
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AccountSummary'
+        '401':
+          description: Missing/invalid token, or a valid token that isn't the admin role
+          content:
+            text/plain:
+              schema:
+                type: string
+    post:
+      tags:
+      - accounts
+      summary: |-
+        Provisions a brand-new account with an admin-chosen username and
+        password. There's no self-service registration — this is the only way an
+        account gets created.
+      operationId: create_account
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccountRequest'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountSummary'
+        '401':
+          description: Missing/invalid token, or a valid token that isn't the admin role
+          content:
+            text/plain:
+              schema:
+                type: string
+        '422':
+          description: empty username/password, a reserved or already-taken username, or no persistent data directory configured
+          content:
+            text/plain:
+              schema:
+                type: string
   /v1beta/auth/login:
     post:
       tags:
@@ -1071,6 +1125,21 @@ components:
       properties:
         accessToken:
           type: string
+    AccountSummary:
+      type: object
+      description: |-
+        One account, as admin sees it: its opaque id and its login name. Never
+        carries a password or its hash. `account_id` isn't used by anything this
+        round — it's returned for a later one (editing/reassigning an existing
+        account's login).
+      required:
+      - accountId
+      - username
+      properties:
+        accountId:
+          type: string
+        username:
+          type: string
     AgentTrace:
       type: object
       description: |-
@@ -1174,6 +1243,20 @@ components:
           type: number
           format: double
           description: Sum of the above.
+    CreateAccountRequest:
+      type: object
+      description: |-
+        The `POST /accounts` request: the initial login for a brand-new account,
+        chosen by admin and communicated to whoever the account is for out of
+        band — there's no self-service registration or password-reset flow.
+      required:
+      - username
+      - password
+      properties:
+        password:
+          type: string
+        username:
+          type: string
     DebugUsage:
       type: object
       description: |-
@@ -1980,6 +2063,7 @@ components:
       required:
       - accessToken
       - refreshToken
+      - role
       properties:
         accessToken:
           type: string
@@ -1989,6 +2073,14 @@ components:
           description: |-
             Long-lived; used only against `POST /auth/refresh` to mint a fresh
             access token without asking for the password again.
+        role:
+          type: string
+          description: |-
+            `"admin"` or `"account"` — which kind of session this token belongs
+            to, so the frontend can route an admin session to its own dashboard
+            instead of a workspace it doesn't have. A UX routing hint only, not
+            itself a permission grant: every route still checks the token's
+            actual `Subject` server-side regardless of what this field says.
     TokenUsage:
       type: object
       description: |-
@@ -2151,3 +2243,5 @@ tags:
   description: 'Operator: real-model provider configuration'
 - name: auth
   description: Login and token refresh, shared by every role
+- name: accounts
+  description: 'Admin: provisioning and listing accounts'

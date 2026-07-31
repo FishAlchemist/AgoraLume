@@ -349,10 +349,10 @@ pub struct AccountState {
     loaded_personas: Mutex<HashSet<String>>,
     /// This account's own login fields — loaded from `credentials.json`, or
     /// seeded (and, when persisted, written out) the first time the account
-    /// is opened with none yet. Not wrapped in a lock: nothing in this round
-    /// mutates it after construction (account management, which would, is a
-    /// later round).
-    credentials: AccountCredentials,
+    /// is opened with none yet. Wrapped in a lock because admin account
+    /// creation (`routes::accounts`) does mutate it after construction, via
+    /// [`Self::set_credentials`] — the only place that happens.
+    credentials: Mutex<AccountCredentials>,
     /// An Argon2 hash of a random password generated this boot, when
     /// `credentials.password_hash` is `None` — see [`generate_boot_password`].
     /// `None` once a fixed password has actually been set.
@@ -444,7 +444,7 @@ impl AccountState {
                 traces: HashMap::new(),
             }),
             loaded_personas: Mutex::new(HashSet::new()),
-            credentials,
+            credentials: Mutex::new(credentials),
             boot_password_hash,
         }
     }
@@ -454,20 +454,42 @@ impl AccountState {
         &self.operator.runtime
     }
 
-    /// This account's login fields (never the raw password).
-    pub fn credentials(&self) -> &AccountCredentials {
-        &self.credentials
+    /// This account's login fields (never the raw password). Cloned out from
+    /// behind the lock — a couple of strings and a bool, cheap enough that
+    /// there's no reason to make every caller deal with a guard's lifetime.
+    pub fn credentials(&self) -> AccountCredentials {
+        self.credentials.lock().unwrap().clone()
     }
 
     /// Checks a login attempt against this account: its stored password hash
     /// if one has been set, else this boot's generated one.
     pub fn verify_password(&self, password: &str) -> bool {
-        match &self.credentials.password_hash {
+        match &self.credentials.lock().unwrap().password_hash {
             Some(hash) => crate::auth::verify_password(password, hash),
             None => self
                 .boot_password_hash
                 .as_deref()
                 .is_some_and(|hash| crate::auth::verify_password(password, hash)),
+        }
+    }
+
+    /// Overwrites this account's login fields — the only place credentials
+    /// actually change after the account's first open. Used by admin account
+    /// creation (`routes::accounts::create_account`) to replace the seeded
+    /// placeholder (`username: account_id, password_hash: None`) with the
+    /// username/password the admin specified. Persists immediately when
+    /// persistence is enabled, the same as every other credentials write —
+    /// the lock is dropped first so the file write doesn't happen while
+    /// holding it.
+    pub fn set_credentials(&self, username: String, password_hash: String) {
+        let updated = {
+            let mut credentials = self.credentials.lock().unwrap();
+            credentials.username = username;
+            credentials.password_hash = Some(password_hash);
+            credentials.clone()
+        };
+        if let Some(persistence) = &self.persistence {
+            persistence.save_credentials(&updated);
         }
     }
 
@@ -1433,16 +1455,70 @@ impl AppState {
     /// [`crate::auth::ADMIN_USERNAME`]) or a regular account (found by
     /// scanning `accounts/*/credentials.json` — no index; an operator is
     /// expected to manage a handful of accounts, not thousands). Issues a
-    /// fresh access/refresh token pair on success.
-    pub fn login(&self, username: &str, password: &str) -> Option<crate::auth::IssuedTokens> {
+    /// fresh access/refresh token pair on success, alongside the `Subject`
+    /// it was issued for — `routes::auth::login` surfaces that as the
+    /// response's `role` field, so the frontend knows an admin session has
+    /// no workspace to route to.
+    pub fn login(&self, username: &str, password: &str) -> Option<(crate::auth::IssuedTokens, Subject)> {
         if username == crate::auth::ADMIN_USERNAME {
             return verify_password_hash(password, &self.admin_password_hash)
-                .then(|| self.tokens.issue(Subject::Admin));
+                .then(|| (self.tokens.issue(Subject::Admin), Subject::Admin));
         }
         let (account_id, account) = self.find_account_by_username(username)?;
-        account
-            .verify_password(password)
-            .then(|| self.tokens.issue(Subject::Account(account_id)))
+        account.verify_password(password).then(|| {
+            let subject = Subject::Account(account_id);
+            (self.tokens.issue(subject.clone()), subject)
+        })
+    }
+
+    /// Admin-only: provisions a brand-new account with a chosen username and
+    /// password, in the same id slot the lazy per-boot seeding would
+    /// otherwise fill on first touch. Requires persistence — without a
+    /// `data_dir`, [`Self::find_account_by_username`] can never find the new
+    /// account again (it only works by scanning disk), so a created account
+    /// would be permanently unloggable-into; fail clearly instead of
+    /// creating that dead end. `account_id` is generated here as an opaque
+    /// v4 UUID, never derived from the username, so it can't collide with
+    /// another id and doesn't depend on `persist::sanitize`'s lossy folding
+    /// for uniqueness.
+    pub fn create_account(&self, username: &str, password: &str) -> Result<(String, AccountCredentials), String> {
+        if self.data_dir.is_none() {
+            return Err("account creation requires a persistent backend".to_string());
+        }
+        if username.is_empty() || password.is_empty() {
+            return Err("username and password are both required".to_string());
+        }
+        if username == crate::auth::ADMIN_USERNAME {
+            return Err(format!("\"{username}\" is reserved for the admin role"));
+        }
+        if self.find_account_by_username(username).is_some() {
+            return Err(format!("an account named \"{username}\" already exists"));
+        }
+        let account_id = uuid::Uuid::new_v4().to_string();
+        let account = self.account_by_id(&account_id);
+        account.set_credentials(username.to_string(), hash_password(password));
+        Ok((account_id, account.credentials()))
+    }
+
+    /// Every existing account's id and username, for the admin dashboard's
+    /// account list. Same directory scan [`Self::find_account_by_username`]
+    /// already does; empty without persistence (nothing to list).
+    pub fn list_accounts(&self) -> Vec<(String, String)> {
+        let Some(data_dir) = &self.data_dir else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(data_dir.join("accounts")) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|entry| {
+                let account_id = entry.file_name().to_str()?.to_string();
+                let username = self.account_by_id(&account_id).credentials().username;
+                Some((account_id, username))
+            })
+            .collect()
     }
 
     /// Mints a fresh access token from a refresh token, or `None` if it's
@@ -1510,6 +1586,7 @@ pub enum AuthRejection {
     MissingToken,
     InvalidToken,
     NotAnAccount,
+    NotAdmin,
 }
 
 impl axum::response::IntoResponse for AuthRejection {
@@ -1520,6 +1597,7 @@ impl axum::response::IntoResponse for AuthRejection {
             AuthRejection::NotAnAccount => {
                 "this token belongs to the admin role, which has no account to act as"
             }
+            AuthRejection::NotAdmin => "this route requires the admin role",
         };
         (axum::http::StatusCode::UNAUTHORIZED, message).into_response()
     }
@@ -1590,6 +1668,40 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AuthenticatedSubject {
             .verify_access_token(token)
             .map(AuthenticatedSubject)
             .ok_or(AuthRejection::InvalidToken)
+    }
+}
+
+/// Proof the request carries an admin token specifically — not just any
+/// authenticated session (contrast [`AuthenticatedSubject`]) and not a
+/// regular account (contrast [`CurrentAccount`], which rejects the *other*
+/// way — admin instead of account). Used by `routes::accounts`: creating or
+/// listing accounts is an operator duty, unlike the shared LLM config that
+/// any logged-in caller can currently reach through `AuthenticatedSubject`.
+pub struct CurrentAdmin;
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for CurrentAdmin {
+    type Rejection = AuthRejection;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        // Same bypass condition as every other extractor in this module — see
+        // `AuthenticatedSubject`'s impl for why.
+        if state.operator.runtime.is_mock() || state.auth_disabled {
+            return Ok(CurrentAdmin);
+        }
+        let token = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or(AuthRejection::MissingToken)?;
+        match state.verify_access_token(token) {
+            Some(Subject::Admin) => Ok(CurrentAdmin),
+            Some(Subject::Account(_)) => Err(AuthRejection::NotAdmin),
+            None => Err(AuthRejection::InvalidToken),
+        }
     }
 }
 

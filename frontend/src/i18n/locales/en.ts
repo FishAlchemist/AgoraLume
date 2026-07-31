@@ -8,6 +8,7 @@ export const en = {
     organizations: 'Organizations',
     me: 'Me',
     settings: 'Settings',
+    admin: 'Admin',
   },
   badge: {
     mock: 'mock',
@@ -150,6 +151,13 @@ export const en = {
     subtitle: 'Your own identity — how you appear in every chat.',
     you: 'You',
     missing: 'No user identity found.',
+  },
+  admin: {
+    title: 'Admin',
+    subtitle: 'Create and view the accounts people log into. Admin has no workspace of its own.',
+    existingAccounts: 'Existing accounts',
+    noAccounts: 'No accounts yet.',
+    createAccount: 'Create account',
   },
   avatar: {
     upload: 'Upload image',

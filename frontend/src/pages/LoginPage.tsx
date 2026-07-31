@@ -56,7 +56,7 @@ export function LoginPage() {
       const tokens = await login(backendUrl, username, password);
       setTokens({ ...tokens, username });
       closeLogin();
-      navigate('/');
+      navigate(tokens.role === 'admin' ? '/admin' : '/');
     } catch {
       setStatus('error');
       setError(t('auth.invalidCredentials'));

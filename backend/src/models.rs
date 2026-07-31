@@ -771,6 +771,27 @@ pub struct LlmModelsView {
     pub models: Vec<LlmModelInfo>,
 }
 
+/// The `POST /accounts` request: the initial login for a brand-new account,
+/// chosen by admin and communicated to whoever the account is for out of
+/// band — there's no self-service registration or password-reset flow.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAccountRequest {
+    pub username: String,
+    pub password: String,
+}
+
+/// One account, as admin sees it: its opaque id and its login name. Never
+/// carries a password or its hash. `account_id` isn't used by anything this
+/// round — it's returned for a later one (editing/reassigning an existing
+/// account's login).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummary {
+    pub account_id: String,
+    pub username: String,
+}
+
 #[cfg(test)]
 mod llm_settings_patch_tests {
     use super::*;

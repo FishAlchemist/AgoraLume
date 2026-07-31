@@ -207,6 +207,12 @@ export interface LlmModelsView {
   models: LlmModelInfo[];
 }
 
+/** One account, as admin sees it — see {@link listAccounts}/{@link createAccount}. */
+export interface AccountSummary {
+  accountId: string;
+  username: string;
+}
+
 /**
  * What the data source offers. `mock` means no LLM and no persistence (the
  * in-memory build) — distinct from whether the backend is reachable. The

@@ -6,6 +6,7 @@
 //! behind it is provisional (in-memory store, simulated agent replies). Emit
 //! `openapi.yml` with the binary's `--dump-openapi` flag.
 
+mod accounts;
 mod auth;
 mod chat;
 mod llm;
@@ -44,7 +45,8 @@ use crate::state::AppState;
         (name = "groups", description = "Chat rooms and their membership"),
         (name = "settings", description = "Client preferences"),
         (name = "llm", description = "Operator: real-model provider configuration"),
-        (name = "auth", description = "Login and token refresh, shared by every role")
+        (name = "auth", description = "Login and token refresh, shared by every role"),
+        (name = "accounts", description = "Admin: provisioning and listing accounts")
     )
 )]
 struct ApiDoc;
@@ -57,6 +59,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .merge(workspace::router())
         .merge(llm::router())
         .merge(auth::router())
+        .merge(accounts::router())
 }
 
 /// The wire contract's version segment. Every route lives under this one
@@ -371,6 +374,29 @@ mod tests {
         router.oneshot(request).await.unwrap().status()
     }
 
+    /// POSTs a JSON body to `path` (unversioned) with a bearer token attached,
+    /// mirroring [`post_json`] + [`get_json_authed`] for the account-management
+    /// routes, which are both authenticated and take a body.
+    async fn post_json_authed(
+        router: Router,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("{API_VERSION}{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
     #[tokio::test]
     async fn protected_route_401s_without_a_token_when_auth_is_enforced() {
         let (status, _) = get_json(router(not_mock_state(None, false), None), "/organizations").await;
@@ -405,6 +431,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(tokens["role"].as_str(), Some("admin"));
         let refresh_token = tokens["refreshToken"].as_str().expect("a refresh token");
 
         let (status, _) =
@@ -476,10 +503,133 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(tokens["role"].as_str(), Some("account"));
         let access_token = tokens["accessToken"].as_str().expect("an access token");
 
         let status = get_json_authed(app, "/organizations", access_token).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Logs in as the fixed admin account against a persisted `not_mock_state`
+    /// and returns its access token — shared setup for the `/accounts` tests.
+    async fn admin_access_token(app: Router) -> String {
+        let (status, tokens) = post_json(
+            app,
+            "/auth/login",
+            serde_json::json!({ "username": "admin", "password": "admin-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        tokens["accessToken"].as_str().expect("an access token").to_string()
+    }
+
+    #[tokio::test]
+    async fn admin_can_create_and_list_an_account_that_can_then_log_in() {
+        let app = router(not_mock_state(Some(temp_dir()), false), None);
+        let admin_token = admin_access_token(app.clone()).await;
+
+        let (status, created) = post_json_authed(
+            app.clone(),
+            "/accounts",
+            &admin_token,
+            serde_json::json!({ "username": "bob", "password": "bob-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(created["username"].as_str(), Some("bob"));
+        assert!(created["accountId"].as_str().is_some_and(|id| !id.is_empty()));
+
+        let request = Request::builder()
+            .uri(format!("{API_VERSION}/accounts"))
+            .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            listed.as_array().unwrap().iter().any(|a| a["username"] == "bob"),
+            "expected the newly created account in the list: {listed}"
+        );
+
+        let (status, tokens) = post_json(
+            app,
+            "/auth/login",
+            serde_json::json!({ "username": "bob", "password": "bob-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tokens["role"].as_str(), Some("account"));
+    }
+
+    #[tokio::test]
+    async fn creating_an_account_requires_the_admin_role_not_just_any_token() {
+        let dir = temp_dir();
+        let account_dir = dir.join("accounts").join("acct-1");
+        let creds = crate::auth::AccountCredentials {
+            username: "alice".to_string(),
+            password_hash: Some(crate::auth::hash_password("alice-pw")),
+            allow_admin_readonly: false,
+        };
+        crate::persist::Persistence::new(&account_dir).save_credentials(&creds);
+
+        let app = router(not_mock_state(Some(dir), false), None);
+        let (_, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "alice", "password": "alice-pw" }),
+        )
+        .await;
+        let account_token = tokens["accessToken"].as_str().expect("an access token");
+
+        let (status, _) = post_json_authed(
+            app,
+            "/accounts",
+            account_token,
+            serde_json::json!({ "username": "carol", "password": "carol-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn creating_an_account_without_persistence_is_rejected() {
+        let app = router(not_mock_state(None, false), None);
+        let admin_token = admin_access_token(app.clone()).await;
+
+        let (status, _) = post_json_authed(
+            app,
+            "/accounts",
+            &admin_token,
+            serde_json::json!({ "username": "dave", "password": "dave-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn creating_an_account_with_a_taken_username_is_rejected() {
+        let app = router(not_mock_state(Some(temp_dir()), false), None);
+        let admin_token = admin_access_token(app.clone()).await;
+
+        let (status, _) = post_json_authed(
+            app.clone(),
+            "/accounts",
+            &admin_token,
+            serde_json::json!({ "username": "erin", "password": "erin-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = post_json_authed(
+            app,
+            "/accounts",
+            &admin_token,
+            serde_json::json!({ "username": "erin", "password": "another-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

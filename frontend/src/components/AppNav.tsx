@@ -16,6 +16,7 @@ import {
   IconMessageCircle,
   IconPlus,
   IconSettings,
+  IconShieldLock,
   IconUpload,
   IconUser,
   IconUsers,
@@ -24,6 +25,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { buildGroupBundle, downloadBundle, parseGroupBundle } from '../lib/transfer';
+import { useAuth } from '../store/auth';
 import { useReadOnly } from '../store/readonly';
 import { useWorkspace } from '../store/workspace';
 import { GroupFormModal } from './GroupFormModal';
@@ -42,6 +44,7 @@ export function AppNav({ onNavigate }: Props) {
   const departments = useWorkspace((s) => s.departments);
   const importGroupBundle = useWorkspace((s) => s.importGroupBundle);
   const readOnly = useReadOnly((s) => s.readOnly);
+  const isAdmin = useAuth((s) => s.role === 'admin');
   const [createOpened, createHandlers] = useDisclosure(false);
   const [notice, setNotice] = useState<{ error: boolean; text: string } | null>(null);
 
@@ -99,6 +102,16 @@ export function AppNav({ onNavigate }: Props) {
       icon: IconSettings,
       match: (p: string) => p.startsWith('/settings'),
     },
+    ...(isAdmin
+      ? [
+          {
+            to: '/admin',
+            label: t('nav.admin'),
+            icon: IconShieldLock,
+            match: (p: string) => p.startsWith('/admin'),
+          },
+        ]
+      : []),
   ];
 
   const onChat = location.pathname === '/' || location.pathname.startsWith('/g/');

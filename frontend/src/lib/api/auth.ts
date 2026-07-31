@@ -3,6 +3,8 @@ import { versionedBase } from './version';
 export interface TokenPair {
   accessToken: string;
   refreshToken: string;
+  /** Which kind of session this token belongs to — see `store/auth.ts`'s `role`. */
+  role: 'admin' | 'account';
 }
 
 /**

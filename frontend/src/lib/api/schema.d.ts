@@ -10,6 +10,16 @@ type XOR<T, U> = (T | U) extends object ? (Without<T, U> & U) | (Without<U, T> &
 type OneOf<T extends any[]> = T extends [infer Only] ? Only : T extends [infer A, infer B, ...infer Rest] ? OneOf<[XOR<A, B>, ...Rest]> : never;
 
 export interface paths {
+  "/v1beta/accounts": {
+    /** Every existing account, for the admin dashboard's account list. */
+    get: operations["list_accounts"];
+    /**
+     * Provisions a brand-new account with an admin-chosen username and
+     * password. There's no self-service registration — this is the only way an
+     * account gets created.
+     */
+    post: operations["create_account"];
+  };
   "/v1beta/auth/login": {
     /**
      * Logs in as the admin (username `"admin"`) or a regular account (its own
@@ -278,6 +288,16 @@ export interface components {
       accessToken: string;
     };
     /**
+     * @description One account, as admin sees it: its opaque id and its login name. Never
+     * carries a password or its hash. `account_id` isn't used by anything this
+     * round — it's returned for a later one (editing/reassigning an existing
+     * account's login).
+     */
+    AccountSummary: {
+      accountId: string;
+      username: string;
+    };
+    /**
      * @description A debug record of one agent inference: exactly the system + context the
      * character's model received, what it decided, and the tokens it cost. Streamed
      * live as a `debug` SSE frame and available in bulk for panel hydration.
@@ -339,6 +359,15 @@ export interface components {
        * @description Sum of the above.
        */
       total: number;
+    };
+    /**
+     * @description The `POST /accounts` request: the initial login for a brand-new account,
+     * chosen by admin and communicated to whoever the account is for out of
+     * band — there's no self-service registration or password-reset flow.
+     */
+    CreateAccountRequest: {
+      password: string;
+      username: string;
     };
     /**
      * @description Cumulative LLM usage across the whole server (since first run, when
@@ -783,6 +812,14 @@ export interface components {
        * access token without asking for the password again.
        */
       refreshToken: string;
+      /**
+       * @description `"admin"` or `"account"` — which kind of session this token belongs
+       * to, so the frontend can route an admin session to its own dashboard
+       * instead of a workspace it doesn't have. A UX routing hint only, not
+       * itself a permission grant: every route still checks the token's
+       * actual `Subject` server-side regardless of what this field says.
+       */
+      role: string;
     };
     /**
      * @description Token usage for one LLM inference. Zero across the board when the provider
@@ -886,6 +923,53 @@ export type external = Record<string, never>;
 
 export interface operations {
 
+  /** Every existing account, for the admin dashboard's account list. */
+  list_accounts: {
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["AccountSummary"][];
+        };
+      };
+      /** @description Missing/invalid token, or a valid token that isn't the admin role */
+      401: {
+        content: {
+          "text/plain": string;
+        };
+      };
+    };
+  };
+  /**
+   * Provisions a brand-new account with an admin-chosen username and
+   * password. There's no self-service registration — this is the only way an
+   * account gets created.
+   */
+  create_account: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CreateAccountRequest"];
+      };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["AccountSummary"];
+        };
+      };
+      /** @description Missing/invalid token, or a valid token that isn't the admin role */
+      401: {
+        content: {
+          "text/plain": string;
+        };
+      };
+      /** @description empty username/password, a reserved or already-taken username, or no persistent data directory configured */
+      422: {
+        content: {
+          "text/plain": string;
+        };
+      };
+    };
+  };
   /**
    * Logs in as the admin (username `"admin"`) or a regular account (its own
    * stored username). An account with no fixed password yet accepts this

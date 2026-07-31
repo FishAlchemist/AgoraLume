@@ -10,6 +10,7 @@ export const zhHant: TranslationSchema = {
     organizations: '組織',
     me: '個人資訊',
     settings: '設定',
+    admin: '管理',
   },
   badge: {
     mock: '模擬',
@@ -151,6 +152,13 @@ export const zhHant: TranslationSchema = {
     subtitle: '你自己的身分——在每個聊天中呈現的樣子。',
     you: '你',
     missing: '找不到使用者身分。',
+  },
+  admin: {
+    title: '管理',
+    subtitle: '建立並查看可登入的帳號。admin 本身沒有自己的工作區。',
+    existingAccounts: '現有帳號',
+    noAccounts: '尚無任何帳號。',
+    createAccount: '建立帳號',
   },
   avatar: {
     upload: '上傳圖片',
