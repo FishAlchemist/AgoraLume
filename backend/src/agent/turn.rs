@@ -1155,7 +1155,7 @@ mod tests {
 
     fn app(brain: Arc<dyn AgentBrain>, config: LoopConfig) -> Arc<AccountState> {
         let operator = Arc::new(OperatorState::new(AgentRuntime::new(brain, config, true)));
-        Arc::new(AccountState::with_runtime(operator))
+        Arc::new(AccountState::with_runtime(operator, "test"))
     }
 
     /// Stores a user line the way the send handler does, returning its id.
@@ -1442,7 +1442,7 @@ mod tests {
         // No coordinator ran this process (like a fresh restart): current_turn must
         // rebuild the bar's turn from the stored log — the last line "you" sent,
         // plus who read and who replied.
-        let state = AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())));
+        let state = AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())), "test");
         let mid = store_user(&state, "lab", "dinner?");
         state.mark_read("lab", &mid, "aria");
         state.emit("lab", Message::conversation("lab", "aria", "pizza!", None));
@@ -1604,7 +1604,7 @@ mod tests {
 
     #[test]
     fn moods_never_enter_the_transcript() {
-        let state = AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())));
+        let state = AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())), "test");
         state.emit(
             "lab",
             Message::conversation("lab", "aria", "hello there", None),
@@ -1893,7 +1893,7 @@ mod tests {
             config,
             false,
         )));
-        let state = Arc::new(AccountState::with_runtime(operator));
+        let state = Arc::new(AccountState::with_runtime(operator, "test"));
         for i in 0..5 {
             state.emit(
                 "lab",
@@ -1932,7 +1932,7 @@ mod tests {
             config,
             false,
         )));
-        let state = Arc::new(AccountState::with_runtime(operator));
+        let state = Arc::new(AccountState::with_runtime(operator, "test"));
         for i in 0..4 {
             state.emit(
                 "lab",

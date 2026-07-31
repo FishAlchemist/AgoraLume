@@ -7,6 +7,62 @@ info:
     identifier: AGPL-3.0-only
   version: 0.1.0
 paths:
+  /v1beta/auth/login:
+    post:
+      tags:
+      - auth
+      summary: |-
+        Logs in as the admin (username `"admin"`) or a regular account (its own
+        stored username). An account with no fixed password yet accepts this
+        boot's generated one instead — see the server log at startup.
+      operationId: login
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          description: Unknown username or wrong password
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1beta/auth/refresh:
+    post:
+      tags:
+      - auth
+      summary: |-
+        Mints a fresh access token from a still-valid refresh token, without
+        asking for the password again. The refresh token itself is not rotated —
+        it keeps working until its own (much longer) expiry.
+      operationId: refresh
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessToken'
+        '401':
+          description: Unknown, expired, or not actually a refresh token
+          content:
+            text/plain:
+              schema:
+                type: string
   /v1beta/debug/usage:
     get:
       tags:
@@ -988,6 +1044,13 @@ paths:
           description: ''
 components:
   schemas:
+    AccessToken:
+      type: object
+      required:
+      - accessToken
+      properties:
+        accessToken:
+          type: string
     AgentTrace:
       type: object
       description: |-
@@ -1432,6 +1495,17 @@ components:
           type: integer
           format: int64
           minimum: 0
+    LoginRequest:
+      type: object
+      required:
+      - username
+      - password
+      properties:
+        password:
+          type: string
+        username:
+          type: string
+          description: The fixed admin login name, or a regular account's own username.
     Memory:
       type: object
       description: |-
@@ -1808,6 +1882,13 @@ components:
           type: string
         personaId:
           type: string
+    RefreshRequest:
+      type: object
+      required:
+      - refreshToken
+      properties:
+        refreshToken:
+          type: string
     SendBody:
       type: object
       description: The body of a send request.
@@ -1865,6 +1946,20 @@ components:
           type: string
         uiLanguage:
           type: string
+    TokenPair:
+      type: object
+      required:
+      - accessToken
+      - refreshToken
+      properties:
+        accessToken:
+          type: string
+          description: 'Short-lived; sent as `Authorization: Bearer <token>` on every request.'
+        refreshToken:
+          type: string
+          description: |-
+            Long-lived; used only against `POST /auth/refresh` to mint a fresh
+            access token without asking for the password again.
     TokenUsage:
       type: object
       description: |-
@@ -2025,3 +2120,5 @@ tags:
   description: Client preferences
 - name: llm
   description: 'Operator: real-model provider configuration'
+- name: auth
+  description: Login and token refresh, shared by every role

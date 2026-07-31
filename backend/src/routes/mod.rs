@@ -6,6 +6,7 @@
 //! behind it is provisional (in-memory store, simulated agent replies). Emit
 //! `openapi.yml` with the binary's `--dump-openapi` flag.
 
+mod auth;
 mod chat;
 mod llm;
 mod workspace;
@@ -42,7 +43,8 @@ use crate::state::AppState;
         (name = "personas", description = "User identities and AI agents"),
         (name = "groups", description = "Chat rooms and their membership"),
         (name = "settings", description = "Client preferences"),
-        (name = "llm", description = "Operator: real-model provider configuration")
+        (name = "llm", description = "Operator: real-model provider configuration"),
+        (name = "auth", description = "Login and token refresh, shared by every role")
     )
 )]
 struct ApiDoc;
@@ -54,6 +56,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .merge(chat::router())
         .merge(workspace::router())
         .merge(llm::router())
+        .merge(auth::router())
 }
 
 /// The wire contract's version segment. Every route lives under this one
@@ -205,11 +208,10 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = if bytes.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap()
-        };
+        // Some error responses (e.g. an auth rejection) are plain text, not
+        // JSON — `Null` there too, since these tests only assert on `status`
+        // in that case.
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, body)
     }
 
@@ -317,5 +319,141 @@ mod tests {
         let allowed =
             preflight_allow_origin(router(state(), Some(&origins)), "https://evil.example").await;
         assert_eq!(allowed.as_deref(), Some("*"));
+    }
+
+    // --- Auth: `state()` above is deliberately mock (bypasses login), which
+    // is right for every test above but wrong for testing the gate itself —
+    // these use a *not*-mock runtime (same rule-based brain, `mock: false`)
+    // so `CurrentAccount` actually has to resolve a token. ---
+
+    fn not_mock_state(data_dir: Option<std::path::PathBuf>, auth_disabled: bool) -> Arc<AppState> {
+        use crate::agent::mock::RuleBrain;
+        use crate::agent::turn::LoopConfig;
+        let runtime = AgentRuntime::new(Arc::new(RuleBrain::new()), LoopConfig::default(), false);
+        let operator = Arc::new(crate::state::OperatorState::new(runtime));
+        let state = AppState::new(operator, data_dir, "test")
+            .with_admin_auth(Some(crate::auth::hash_password("admin-pw")), auth_disabled);
+        Arc::new(state)
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("agoralume-auth-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// POSTs a JSON body to `path` (unversioned) and returns the status and
+    /// parsed body, mirroring [`get_json`] for the request shapes login and
+    /// refresh need.
+    async fn post_json(
+        router: Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("{API_VERSION}{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// GETs `path` (unversioned) with a bearer token attached.
+    async fn get_json_authed(router: Router, path: &str, token: &str) -> StatusCode {
+        let request = Request::builder()
+            .uri(format!("{API_VERSION}{path}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        router.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn protected_route_401s_without_a_token_when_auth_is_enforced() {
+        let (status, _) = get_json(router(not_mock_state(None, false), None), "/organizations").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_bypasses_login_even_when_not_mock() {
+        let (status, _) = get_json(router(not_mock_state(None, true), None), "/organizations").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_rejected() {
+        let app = router(not_mock_state(None, false), None);
+        let (status, _) = post_json(
+            app,
+            "/auth/login",
+            serde_json::json!({ "username": "admin", "password": "wrong" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_login_then_refresh_round_trips() {
+        let app = router(not_mock_state(None, false), None);
+        let (status, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "admin", "password": "admin-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let refresh_token = tokens["refreshToken"].as_str().expect("a refresh token");
+
+        let (status, _) =
+            post_json(app, "/auth/refresh", serde_json::json!({ "refreshToken": refresh_token })).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_token_is_rejected_on_a_per_account_route() {
+        let app = router(not_mock_state(None, false), None);
+        let (_, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "admin", "password": "admin-pw" }),
+        )
+        .await;
+        let access_token = tokens["accessToken"].as_str().expect("an access token");
+
+        // The admin role has no account/workspace of its own to resolve to —
+        // see `CurrentAccount`'s docs.
+        let status = get_json_authed(app, "/organizations", access_token).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_login_reaches_a_protected_route_with_its_access_token() {
+        let dir = temp_dir();
+        // Seed the account's credentials before the server ever opens it, so
+        // login has a password to check against other than an unknowable
+        // per-boot random one.
+        let account_dir = dir.join("accounts").join("acct-1");
+        let creds = crate::auth::AccountCredentials {
+            username: "alice".to_string(),
+            password_hash: Some(crate::auth::hash_password("alice-pw")),
+            allow_admin_readonly: false,
+        };
+        crate::persist::Persistence::new(&account_dir).save_credentials(&creds);
+
+        let app = router(not_mock_state(Some(dir), false), None);
+        let (status, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "alice", "password": "alice-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let access_token = tokens["accessToken"].as_str().expect("an access token");
+
+        let status = get_json_authed(app, "/organizations", access_token).await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

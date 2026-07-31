@@ -17,6 +17,10 @@ use crate::agent::event::Event;
 use crate::agent::turn::{
     AgentRuntime, coordinator_loop, current_time_of_day, generate_suggestions,
 };
+use crate::auth::{
+    AccountCredentials, Subject, TokenStore, generate_boot_password, hash_password,
+    verify_password as verify_password_hash,
+};
 use crate::llm_config::{LlmConfigStore, LlmSettings, Pricing};
 use crate::models::{
     AgentTrace, Cost, GroupSuggestions, Message, ReadReceipt, SYSTEM_PERSONA_ID, TokenUsage, Turn,
@@ -343,23 +347,37 @@ pub struct AccountState {
     /// `debug.persona_models` this run — the lazy-load marker for that map,
     /// mirroring `loaded_groups` one level down (per persona, not per group).
     loaded_personas: Mutex<HashSet<String>>,
+    /// This account's own login fields — loaded from `credentials.json`, or
+    /// seeded (and, when persisted, written out) the first time the account
+    /// is opened with none yet. Not wrapped in a lock: nothing in this round
+    /// mutates it after construction (account management, which would, is a
+    /// later round).
+    credentials: AccountCredentials,
+    /// An Argon2 hash of a random password generated this boot, when
+    /// `credentials.password_hash` is `None` — see [`generate_boot_password`].
+    /// `None` once a fixed password has actually been set.
+    boot_password_hash: Option<String>,
 }
 
 impl AccountState {
     /// Builds one account's state with no persistence — a pure in-memory run.
     /// Tests use this; so does a mock-mode server, where no account persists.
-    pub fn with_runtime(operator: Arc<OperatorState>) -> Self {
-        Self::build(operator, None)
+    pub fn with_runtime(operator: Arc<OperatorState>, account_id: &str) -> Self {
+        Self::build(operator, None, account_id)
     }
 
     /// Builds one account's state backed by on-disk persistence: the workspace
     /// is loaded from `workspace.json` (or seeded on first run) and message
     /// logs load lazily per group.
-    pub fn with_persistence(operator: Arc<OperatorState>, persistence: Persistence) -> Self {
-        Self::build(operator, Some(persistence))
+    pub fn with_persistence(
+        operator: Arc<OperatorState>,
+        persistence: Persistence,
+        account_id: &str,
+    ) -> Self {
+        Self::build(operator, Some(persistence), account_id)
     }
 
-    fn build(operator: Arc<OperatorState>, persistence: Option<Persistence>) -> Self {
+    fn build(operator: Arc<OperatorState>, persistence: Option<Persistence>, account_id: &str) -> Self {
         // A persisted run starts from disk (or a fresh seed the first time);
         // an in-memory run seeds every time.
         let workspace = persistence
@@ -380,6 +398,32 @@ impl AccountState {
             .as_ref()
             .and_then(Persistence::load_usage)
             .unwrap_or_default();
+        // No credentials on disk yet: seed a username from the account id and
+        // leave the password unset — `boot_password_hash` below covers login
+        // until a real one is set (there's no account-management endpoint to
+        // set one yet). Persisted eagerly so the seeded username survives a
+        // restart even before that endpoint exists.
+        let credentials = persistence.as_ref().and_then(Persistence::load_credentials).unwrap_or_else(|| {
+            let seeded = AccountCredentials {
+                username: account_id.to_string(),
+                password_hash: None,
+                allow_admin_readonly: false,
+            };
+            if let Some(persistence) = &persistence {
+                persistence.save_credentials(&seeded);
+            }
+            seeded
+        });
+        let boot_password_hash = credentials.password_hash.is_none().then(|| {
+            let password = generate_boot_password();
+            tracing::warn!(
+                account_id,
+                username = %credentials.username,
+                password,
+                "no fixed password set for this account yet; generated one for this boot only"
+            );
+            hash_password(&password)
+        });
         Self {
             workspace: Mutex::new(workspace),
             messages: Mutex::new(messages),
@@ -400,12 +444,31 @@ impl AccountState {
                 traces: HashMap::new(),
             }),
             loaded_personas: Mutex::new(HashSet::new()),
+            credentials,
+            boot_password_hash,
         }
     }
 
     /// The shared LLM runtime backing this account's agents.
     pub fn runtime(&self) -> &AgentRuntime {
         &self.operator.runtime
+    }
+
+    /// This account's login fields (never the raw password).
+    pub fn credentials(&self) -> &AccountCredentials {
+        &self.credentials
+    }
+
+    /// Checks a login attempt against this account: its stored password hash
+    /// if one has been set, else this boot's generated one.
+    pub fn verify_password(&self, password: &str) -> bool {
+        match &self.credentials.password_hash {
+            Some(hash) => crate::auth::verify_password(password, hash),
+            None => self
+                .boot_password_hash
+                .as_deref()
+                .is_some_and(|hash| crate::auth::verify_password(password, hash)),
+        }
     }
 
     /// Records a debug trace of one agent inference: accumulate its usage (and,
@@ -1234,15 +1297,28 @@ pub struct AppState {
     /// run — every lazily-opened account gets persistence iff the server was
     /// started with it, mirroring the choice `main` already made once.
     data_dir: Option<PathBuf>,
-    /// The one account every request resolves to until real per-request
-    /// account resolution exists — see the struct docs above.
+    /// The one account every request resolves to when auth is bypassed (mock
+    /// mode, or `AGORALUME_AUTH_DISABLED`) — see [`Self::bootstrap_account`].
     bootstrap_account_id: String,
+    /// An Argon2 hash of the admin password — either a fixed one an operator
+    /// set, or a fresh one generated (and logged) this boot. Set via
+    /// [`Self::with_admin_auth`]; a freshly-`new`ed `AppState` has a random,
+    /// never-logged placeholder here, so admin login simply never succeeds
+    /// until that's called (harmless for tests that don't exercise it).
+    admin_password_hash: String,
+    /// Set from `AGORALUME_AUTH_DISABLED` — when true, every request
+    /// resolves to the bootstrap account with no login at all, the same way
+    /// mock mode does. A manual, permanent escape hatch for direct/scripted
+    /// testing, independent of mock-ness — see [`Self::with_admin_auth`].
+    auth_disabled: bool,
+    tokens: TokenStore,
 }
 
 impl AppState {
     /// Builds an empty registry around a given operator state — no account is
     /// open yet; each is created (and persisted under `data_dir`, if given) the
-    /// first time [`Self::account_by_id`] is asked for it.
+    /// first time [`Self::account_by_id`] is asked for it. Admin login is
+    /// effectively disabled until [`Self::with_admin_auth`] sets a real hash.
     pub fn new(
         operator: Arc<OperatorState>,
         data_dir: Option<PathBuf>,
@@ -1253,7 +1329,36 @@ impl AppState {
             accounts: RwLock::new(HashMap::new()),
             data_dir,
             bootstrap_account_id: bootstrap_account_id.into(),
+            admin_password_hash: hash_password(&generate_boot_password()),
+            auth_disabled: false,
+            tokens: TokenStore::default(),
         }
+    }
+
+    /// Sets the admin's password (`fixed_hash`, loaded from disk when an
+    /// operator has set one — `None` generates and logs a fresh one for this
+    /// boot only, the same treatment an account with no fixed password gets)
+    /// and whether auth is bypassed entirely (`AGORALUME_AUTH_DISABLED`).
+    /// Called once at startup, before the state is shared.
+    pub fn with_admin_auth(mut self, fixed_hash: Option<String>, auth_disabled: bool) -> Self {
+        self.admin_password_hash = fixed_hash.unwrap_or_else(|| {
+            let password = generate_boot_password();
+            tracing::warn!(
+                password,
+                "no fixed admin password set; generated one for this boot only \
+                 (log in as \"admin\" with this password, or set a real one in admin.json)"
+            );
+            hash_password(&password)
+        });
+        self.auth_disabled = auth_disabled;
+        if auth_disabled {
+            tracing::warn!(
+                "AGORALUME_AUTH_DISABLED is set: every request is served as the bootstrap \
+                 account with no login required. Do not set this on a deployment reachable by \
+                 anyone untrusted."
+            );
+        }
+        self
     }
 
     /// The named account's own state, opening (and caching) it on first touch.
@@ -1275,18 +1380,18 @@ impl AppState {
         let account = Arc::new(match &self.data_dir {
             Some(data_dir) => {
                 let dir = data_dir.join("accounts").join(crate::persist::sanitize(account_id));
-                AccountState::with_persistence(self.operator.clone(), Persistence::new(&dir))
+                AccountState::with_persistence(self.operator.clone(), Persistence::new(&dir), account_id)
             }
-            None => AccountState::with_runtime(self.operator.clone()),
+            None => AccountState::with_runtime(self.operator.clone(), account_id),
         });
         accounts.insert(account_id.to_string(), account.clone());
         account
     }
 
-    /// The one account every request currently resolves to — see the struct
-    /// docs. Private on purpose: nothing outside this module (and the `FromRef`
-    /// impl just below) should depend on there being a single bootstrap
-    /// account, since that's exactly what a future auth pass removes.
+    /// The account auth-bypassed requests resolve to — see the struct docs.
+    /// Private on purpose: nothing outside this module (and the
+    /// `FromRequestParts` impl just below) should depend on there being a
+    /// single bootstrap account.
     fn bootstrap_account(&self) -> Arc<AccountState> {
         self.account_by_id(&self.bootstrap_account_id)
     }
@@ -1313,6 +1418,54 @@ impl AppState {
     pub fn persistent(&self) -> bool {
         self.data_dir.is_some()
     }
+
+    /// Verifies a username/password against the admin account (the fixed
+    /// [`crate::auth::ADMIN_USERNAME`]) or a regular account (found by
+    /// scanning `accounts/*/credentials.json` — no index; an operator is
+    /// expected to manage a handful of accounts, not thousands). Issues a
+    /// fresh access/refresh token pair on success.
+    pub fn login(&self, username: &str, password: &str) -> Option<crate::auth::IssuedTokens> {
+        if username == crate::auth::ADMIN_USERNAME {
+            return verify_password_hash(password, &self.admin_password_hash)
+                .then(|| self.tokens.issue(Subject::Admin));
+        }
+        let (account_id, account) = self.find_account_by_username(username)?;
+        account
+            .verify_password(password)
+            .then(|| self.tokens.issue(Subject::Account(account_id)))
+    }
+
+    /// Mints a fresh access token from a refresh token, or `None` if it's
+    /// unknown, expired, or was never a refresh token to begin with.
+    pub fn refresh_access_token(&self, refresh_token: &str) -> Option<String> {
+        self.tokens.refresh(refresh_token)
+    }
+
+    /// The subject an access token currently resolves to.
+    fn verify_access_token(&self, token: &str) -> Option<Subject> {
+        self.tokens.verify_access(token)
+    }
+
+    /// Finds an account by its stored username, opening (and caching) it via
+    /// [`Self::account_by_id`] along the way. Scans `accounts/*` under
+    /// `data_dir`; without persistence there is nowhere to scan and no
+    /// account other than the in-memory bootstrap one could exist, so this
+    /// always misses.
+    fn find_account_by_username(&self, username: &str) -> Option<(String, Arc<AccountState>)> {
+        let data_dir = self.data_dir.as_ref()?;
+        let entries = std::fs::read_dir(data_dir.join("accounts")).ok()?;
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let account_id = entry.file_name().to_str()?.to_string();
+            let account = self.account_by_id(&account_id);
+            if account.credentials().username == username {
+                return Some((account_id, account));
+            }
+        }
+        None
+    }
 }
 
 /// The account the current request resolves to — an axum extractor a
@@ -1323,11 +1476,14 @@ impl AppState {
 /// A plain `FromRef<Arc<AppState>> for Arc<AccountState>` would be simpler,
 /// but the orphan rules block it — neither `Arc` nor axum's traits are local
 /// to this crate, and `Arc` isn't `#[fundamental]` — so this wraps it in a
-/// local newtype and implements `FromRequestParts` directly instead. This one
-/// impl is the *only* place that knows about [`AppState::bootstrap_account`]
-/// today; a future auth pass swaps it for one that reads the account resolved
-/// by middleware from the request, and every handler using this extractor
-/// updates for free.
+/// local newtype and implements `FromRequestParts` directly instead.
+///
+/// Resolution order: mock mode or `AGORALUME_AUTH_DISABLED` both bypass login
+/// entirely and resolve to the bootstrap account (see
+/// [`AppState::bootstrap_account`]); otherwise the `Authorization: Bearer
+/// <token>` header is required and must name a *regular* account — an admin
+/// token is rejected here too, since the admin role has no account/workspace
+/// of its own to resolve to.
 pub struct CurrentAccount(pub Arc<AccountState>);
 
 impl std::ops::Deref for CurrentAccount {
@@ -1337,14 +1493,49 @@ impl std::ops::Deref for CurrentAccount {
     }
 }
 
+/// Why [`CurrentAccount`] extraction failed — distinct from a generic 401 so
+/// a client (or a curious operator) can tell "no token" apart from "token
+/// doesn't belong to an account."
+pub enum AuthRejection {
+    MissingToken,
+    InvalidToken,
+    NotAnAccount,
+}
+
+impl axum::response::IntoResponse for AuthRejection {
+    fn into_response(self) -> axum::response::Response {
+        let message = match self {
+            AuthRejection::MissingToken => "missing or malformed Authorization header",
+            AuthRejection::InvalidToken => "invalid or expired access token",
+            AuthRejection::NotAnAccount => {
+                "this token belongs to the admin role, which has no account to act as"
+            }
+        };
+        (axum::http::StatusCode::UNAUTHORIZED, message).into_response()
+    }
+}
+
 impl axum::extract::FromRequestParts<Arc<AppState>> for CurrentAccount {
-    type Rejection = std::convert::Infallible;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
-        _parts: &mut axum::http::request::Parts,
+        parts: &mut axum::http::request::Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        Ok(CurrentAccount(state.bootstrap_account()))
+        if state.operator.runtime.is_mock() || state.auth_disabled {
+            return Ok(CurrentAccount(state.bootstrap_account()));
+        }
+        let token = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or(AuthRejection::MissingToken)?;
+        match state.verify_access_token(token) {
+            Some(Subject::Account(account_id)) => Ok(CurrentAccount(state.account_by_id(&account_id))),
+            Some(Subject::Admin) => Err(AuthRejection::NotAnAccount),
+            None => Err(AuthRejection::InvalidToken),
+        }
     }
 }
 
@@ -1399,7 +1590,7 @@ mod tests {
     /// what most of these tests need, since they only exercise account-scoped
     /// behaviour (usage/traces), not the operator-level LLM config.
     fn account() -> AccountState {
-        AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())))
+        AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())), "test")
     }
 
     #[test]

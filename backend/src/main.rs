@@ -9,6 +9,7 @@
 //! Point the frontend at it with `VITE_API_BASE_URL=http://127.0.0.1:8080`.
 
 mod agent;
+mod auth;
 mod config;
 mod llm_config;
 mod models;
@@ -26,6 +27,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
 use crate::agent::turn::AgentRuntime;
+use crate::auth::AdminConfigStore;
 use crate::config::Config;
 use crate::llm_config::LlmConfigStore;
 use crate::state::{AppState, OperatorState};
@@ -103,6 +105,13 @@ async fn main() {
     } else {
         AppState::new(operator, None, &config.account_id)
     };
+    // The admin's password hash, like `llm.toml`, always loads regardless of
+    // whether accounts persist — the admin role isn't an account, so its
+    // identity doesn't follow that flag either. `None` (no admin.json, or one
+    // without a fixed password yet) makes `with_admin_auth` generate and log
+    // a fresh one for this boot.
+    let admin_password_hash = AdminConfigStore::new(&config.data_dir).load_password_hash();
+    let state = state.with_admin_auth(admin_password_hash, config.auth_disabled);
     let state = Arc::new(state);
     let app = routes::router(state.clone(), config.cors_allowed_origins.as_deref());
 

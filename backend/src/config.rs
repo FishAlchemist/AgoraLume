@@ -54,6 +54,11 @@ pub struct Config {
     /// the binary; see `routes::router` for what this buys against a request
     /// like `PATCH /llm/settings` from an unrelated page in the same browser.
     pub cors_allowed_origins: Option<Vec<String>>,
+    /// Bypasses login entirely (`AGORALUME_AUTH_DISABLED`) — every request is
+    /// served as the bootstrap account, the same way mock mode already is.
+    /// Off by default; see `AppState::with_admin_auth` for where this is
+    /// consumed and logged.
+    pub auth_disabled: bool,
 }
 
 impl Config {
@@ -96,6 +101,12 @@ impl Config {
             })
             .unwrap_or(true);
         let cors_allowed_origins = env_csv_opt("AGORALUME_CORS_ORIGINS");
+        // Off by default — a manual, permanent escape hatch (not just for
+        // this round's backend/frontend rollout gap) so direct/scripted
+        // testing against the API is never blocked by a login wall. Logged
+        // loudly by `AppState::with_admin_auth` when it's on, same as the
+        // CORS wildcard default above calls out what it's doing.
+        let auth_disabled = env_flag_opt("AGORALUME_AUTH_DISABLED").unwrap_or(false);
         Self {
             bind,
             data_dir,
@@ -104,6 +115,7 @@ impl Config {
             web_dir,
             open_browser,
             cors_allowed_origins,
+            auth_disabled,
         }
     }
 
@@ -175,6 +187,7 @@ mod tests {
             web_dir: None,
             open_browser: false,
             cors_allowed_origins: None,
+            auth_disabled: false,
         }
     }
 

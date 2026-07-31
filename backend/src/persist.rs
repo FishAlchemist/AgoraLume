@@ -43,6 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::AccountCredentials;
 use crate::models::{GroupSuggestions, Message};
 use crate::state::{DebugTotals, GroupSummary};
 use crate::workspace::WorkspaceSnapshot;
@@ -95,6 +96,10 @@ impl Persistence {
 
     fn usage_path(&self) -> PathBuf {
         self.dir.join("usage.json")
+    }
+
+    fn credentials_path(&self) -> PathBuf {
+        self.dir.join("credentials.json")
     }
 
     fn group_usage_path(&self, group_id: &str) -> PathBuf {
@@ -285,6 +290,38 @@ impl Persistence {
         }
     }
 
+    /// Loads this account's own login fields (username, password hash if one
+    /// has been set, the admin-readonly consent flag), or `None` when there
+    /// is no saved file yet or it's unreadable/corrupt — in which case, unlike
+    /// `usage.json`, the file is quarantined (not silently left to be
+    /// overwritten) since it holds a password hash, not a readout that's
+    /// cheap to reset to zero.
+    pub fn load_credentials(&self) -> Option<AccountCredentials> {
+        let path = self.credentials_path();
+        let bytes = std::fs::read(&path).ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(credentials) => Some(credentials),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "credentials.json is unreadable; preserving it and starting from a fresh boot password"
+                );
+                quarantine(&path);
+                None
+            }
+        }
+    }
+
+    /// Writes this account's login fields out. Failures are logged, not fatal
+    /// — the in-memory copy stays authoritative for the rest of this run
+    /// either way.
+    pub fn save_credentials(&self, credentials: &AccountCredentials) {
+        if let Err(e) = write_atomic(&self.credentials_path(), credentials) {
+            tracing::warn!(error = %e, "failed to persist account credentials");
+        }
+    }
+
     /// Loads one group's own cumulative usage and accrued cost — independent of
     /// every other group's, unlike [`Self::load_usage`]. `None` when the group
     /// has recorded no traces yet, or its file is unreadable/corrupt, in which
@@ -379,7 +416,7 @@ pub(crate) fn sanitize(id: &str) -> String {
 /// — instead of letting the next save overwrite it, so its data is preserved
 /// for manual recovery. Best-effort: a rename failure is logged and swallowed
 /// (the caller seeds fresh regardless).
-fn quarantine(path: &Path) {
+pub(crate) fn quarantine(path: &Path) {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let mut dest = path.as_os_str().to_owned();
     dest.push(format!(".corrupt-{stamp}"));

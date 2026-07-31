@@ -10,6 +10,22 @@ type XOR<T, U> = (T | U) extends object ? (Without<T, U> & U) | (Without<U, T> &
 type OneOf<T extends any[]> = T extends [infer Only] ? Only : T extends [infer A, infer B, ...infer Rest] ? OneOf<[XOR<A, B>, ...Rest]> : never;
 
 export interface paths {
+  "/v1beta/auth/login": {
+    /**
+     * Logs in as the admin (username `"admin"`) or a regular account (its own
+     * stored username). An account with no fixed password yet accepts this
+     * boot's generated one instead — see the server log at startup.
+     */
+    post: operations["login"];
+  };
+  "/v1beta/auth/refresh": {
+    /**
+     * Mints a fresh access token from a still-valid refresh token, without
+     * asking for the password again. The refresh token itself is not rotated —
+     * it keeps working until its own (much longer) expiry.
+     */
+    post: operations["refresh"];
+  };
   "/v1beta/debug/usage": {
     /**
      * Cumulative LLM usage — the global "total usage" readout: request count,
@@ -256,6 +272,9 @@ export type webhooks = Record<string, never>;
 
 export interface components {
   schemas: {
+    AccessToken: {
+      accessToken: string;
+    };
     /**
      * @description A debug record of one agent inference: exactly the system + context the
      * character's model received, what it decided, and the tokens it cost. Streamed
@@ -504,6 +523,11 @@ export interface components {
       /** Format: int64 */
       retryBaseMs: number;
     };
+    LoginRequest: {
+      password: string;
+      /** @description The fixed admin login name, or a regular account's own username. */
+      username: string;
+    };
     /**
      * @description One persona-scoped memory: a fact a character chose to remember. Tagged with
      * the persona identity hash ([`Persona::prompt_hash`]) that was in force when it
@@ -703,6 +727,9 @@ export interface components {
       messageId: string;
       personaId: string;
     };
+    RefreshRequest: {
+      refreshToken: string;
+    };
     /** @description The body of a send request. */
     SendBody: {
       /**
@@ -737,6 +764,15 @@ export interface components {
       chatFontSize: number;
       nativeLanguage: string;
       uiLanguage: string;
+    };
+    TokenPair: {
+      /** @description Short-lived; sent as `Authorization: Bearer <token>` on every request. */
+      accessToken: string;
+      /**
+       * @description Long-lived; used only against `POST /auth/refresh` to mint a fresh
+       * access token without asking for the password again.
+       */
+      refreshToken: string;
     };
     /**
      * @description Token usage for one LLM inference. Zero across the board when the provider
@@ -840,6 +876,56 @@ export type external = Record<string, never>;
 
 export interface operations {
 
+  /**
+   * Logs in as the admin (username `"admin"`) or a regular account (its own
+   * stored username). An account with no fixed password yet accepts this
+   * boot's generated one instead — see the server log at startup.
+   */
+  login: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["LoginRequest"];
+      };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["TokenPair"];
+        };
+      };
+      /** @description Unknown username or wrong password */
+      401: {
+        content: {
+          "text/plain": string;
+        };
+      };
+    };
+  };
+  /**
+   * Mints a fresh access token from a still-valid refresh token, without
+   * asking for the password again. The refresh token itself is not rotated —
+   * it keeps working until its own (much longer) expiry.
+   */
+  refresh: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["RefreshRequest"];
+      };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["AccessToken"];
+        };
+      };
+      /** @description Unknown, expired, or not actually a refresh token */
+      401: {
+        content: {
+          "text/plain": string;
+        };
+      };
+    };
+  };
   /**
    * Cumulative LLM usage — the global "total usage" readout: request count,
    * token breakdown, cache-hit ratio, the running estimated cost (always an
