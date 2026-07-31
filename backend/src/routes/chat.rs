@@ -19,7 +19,7 @@ use crate::agent::event::Event as AgentEvent;
 use crate::models::{
     AgentTrace, Cost, DebugUsage, GroupSuggestions, Message, ModelUsage, PersonaUsage, ServerMeta,
 };
-use crate::state::{AppState, DebugTotals, StreamEvent};
+use crate::state::{AppState, CurrentAccount, DebugTotals, StreamEvent};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
@@ -52,7 +52,7 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
     // Liveness and mode are independent facts. `llm` = a real model drives the
     // agents (else the rule-based mock); `persistent` = state is written to disk.
     // "Mock" is the precise combination of neither: no LLM and no persistence.
-    let llm = !state.runtime.is_mock();
+    let llm = !state.runtime().is_mock();
     let persistent = state.persistent();
     Json(ServerMeta {
         mock: !llm && !persistent,
@@ -70,7 +70,7 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
 /// recorded, so a later change to the configured rates never reprices history.
 #[utoipa::path(get, path = "/debug/usage", tag = "service",
     responses((status = 200, description = "Cumulative LLM usage", body = DebugUsage)))]
-async fn debug_usage(State(state): State<Arc<AppState>>) -> Json<DebugUsage> {
+async fn debug_usage(state: CurrentAccount) -> Json<DebugUsage> {
     Json(debug_usage_view(state.debug_totals()))
 }
 
@@ -88,7 +88,7 @@ async fn debug_usage(State(state): State<Arc<AppState>>) -> Json<DebugUsage> {
         (status = 200, description = "One group's own cumulative LLM usage", body = DebugUsage),
         (status = 404, description = "Unknown group")))]
 async fn group_debug_usage(
-    State(state): State<Arc<AppState>>,
+    state: CurrentAccount,
     Path(id): Path<String>,
 ) -> Result<Json<DebugUsage>, StatusCode> {
     if state.workspace().turn_members(&id).is_none() {
@@ -107,7 +107,7 @@ async fn group_debug_usage(
         (status = 200, description = "That group's usage, one entry per current AI member", body = Vec<PersonaUsage>),
         (status = 404, description = "Unknown group")))]
 async fn group_debug_usage_by_persona(
-    State(state): State<Arc<AppState>>,
+    state: CurrentAccount,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<PersonaUsage>>, StatusCode> {
     if state.workspace().turn_members(&id).is_none() {
@@ -131,7 +131,7 @@ async fn group_debug_usage_by_persona(
 #[utoipa::path(get, path = "/debug/usage/by-persona", tag = "service",
     responses(
         (status = 200, description = "Every AI persona's usage, summed across every group", body = Vec<PersonaUsage>)))]
-async fn global_debug_usage_by_persona(State(state): State<Arc<AppState>>) -> Json<Vec<PersonaUsage>> {
+async fn global_debug_usage_by_persona(state: CurrentAccount) -> Json<Vec<PersonaUsage>> {
     let mut list: Vec<PersonaUsage> = state
         .global_persona_debug_totals_all()
         .into_iter()
@@ -204,7 +204,7 @@ fn debug_usage_view(totals: DebugTotals) -> DebugUsage {
     params(("id" = String, Path, description = "Group id")),
     responses((status = 200, description = "Recent agent traces, oldest first", body = Vec<AgentTrace>)))]
 async fn debug_traces(
-    State(state): State<Arc<AppState>>,
+    state: CurrentAccount,
     Path(id): Path<String>,
 ) -> Json<Vec<AgentTrace>> {
     Json(state.debug_traces(&id))
@@ -237,7 +237,7 @@ struct HistoryQuery {
     params(("id" = String, Path, description = "Group id"), HistoryQuery),
     responses((status = 200, description = "Message history window, oldest first", body = Vec<Message>)))]
 async fn list_messages(
-    State(state): State<Arc<AppState>>,
+    state: CurrentAccount,
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<Vec<Message>> {
@@ -266,7 +266,7 @@ struct SendBody {
         (status = 200, description = "The stored user message", body = Message),
         (status = 404, description = "Unknown group")))]
 async fn send_message(
-    State(state): State<Arc<AppState>>,
+    state: CurrentAccount,
     Path(id): Path<String>,
     Json(body): Json<SendBody>,
 ) -> Result<Json<Message>, StatusCode> {
@@ -285,7 +285,10 @@ async fn send_message(
     state.store(&id, message.clone());
 
     // Hand the turn to the group's coordinator; replies stream in over SSE.
-    state.dispatch(&id, AgentEvent::User { message_id: message.id().to_string() });
+    // `dispatch` spawns the coordinator task on first use, which needs the
+    // `Arc` itself (to hold a clone across the `tokio::spawn`) rather than
+    // just a `&AccountState` — hence `.0` instead of going through `Deref`.
+    state.0.dispatch(&id, AgentEvent::User { message_id: message.id().to_string() });
     Ok(Json(message))
 }
 
@@ -312,14 +315,14 @@ struct EventBody {
         (status = 202, description = "Event accepted"),
         (status = 404, description = "Unknown group")))]
 async fn post_event(
-    State(state): State<Arc<AppState>>,
+    state: CurrentAccount,
     Path(id): Path<String>,
     Json(body): Json<EventBody>,
 ) -> StatusCode {
     if state.workspace().turn_members(&id).is_none() {
         return StatusCode::NOT_FOUND;
     }
-    state.dispatch(
+    state.0.dispatch(
         &id,
         AgentEvent::Environment { description: body.description, urgent: body.urgent },
     );
@@ -335,11 +338,11 @@ async fn post_event(
     responses(
         (status = 202, description = "Retry accepted"),
         (status = 404, description = "Unknown group")))]
-async fn retry_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+async fn retry_turn(state: CurrentAccount, Path(id): Path<String>) -> StatusCode {
     if state.workspace().turn_members(&id).is_none() {
         return StatusCode::NOT_FOUND;
     }
-    state.dispatch(&id, AgentEvent::Retry);
+    state.0.dispatch(&id, AgentEvent::Retry);
     StatusCode::ACCEPTED
 }
 
@@ -355,14 +358,14 @@ async fn retry_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
         (status = 200, description = "The cached suggestions (a background refresh may follow on the stream)", body = GroupSuggestions),
         (status = 404, description = "Unknown group")))]
 async fn get_suggestions(
-    State(state): State<Arc<AppState>>,
+    state: CurrentAccount,
     Path(id): Path<String>,
 ) -> Result<Json<GroupSuggestions>, StatusCode> {
     if state.workspace().turn_members(&id).is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
     // Return the cache now; regenerate in the background only if stale.
-    state.request_suggestions(&id, false);
+    state.0.request_suggestions(&id, false);
     Ok(Json(state.suggestions(&id)))
 }
 
@@ -377,13 +380,13 @@ async fn get_suggestions(
         (status = 202, description = "Regeneration accepted (or coalesced with a recent one)"),
         (status = 404, description = "Unknown group")))]
 async fn regenerate_suggestions(
-    State(state): State<Arc<AppState>>,
+    state: CurrentAccount,
     Path(id): Path<String>,
 ) -> StatusCode {
     if state.workspace().turn_members(&id).is_none() {
         return StatusCode::NOT_FOUND;
     }
-    state.request_suggestions(&id, true);
+    state.0.request_suggestions(&id, true);
     StatusCode::ACCEPTED
 }
 
@@ -402,7 +405,7 @@ struct ActivityFrame {
     params(("id" = String, Path, description = "Group id")),
     responses((status = 200,
         description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `turn` frames carry a Turn, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions")))]
-async fn stream(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
+async fn stream(state: CurrentAccount, Path(id): Path<String>) -> impl IntoResponse {
     // Subscribe before reading the activity flag: any change that races this
     // arrives on `live` afterwards, so the seed can only be stale, never lost.
     let receiver = state.channel(&id).subscribe();

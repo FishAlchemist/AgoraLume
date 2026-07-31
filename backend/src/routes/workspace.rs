@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::StatusCode;
 use serde_json::Value;
 use utoipa_axum::router::OpenApiRouter;
@@ -20,7 +20,7 @@ use crate::models::{
     Department, Group, Memory, MemoryInput, Organization, Persona, PromptLabel, PromptLabelInput,
     Settings,
 };
-use crate::state::AppState;
+use crate::state::{AppState, CurrentAccount};
 use crate::workspace::PersonaError;
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
@@ -44,7 +44,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
 
 #[utoipa::path(get, path = "/organizations", tag = "organizations",
     responses((status = 200, body = Vec<Organization>)))]
-async fn list_orgs(State(s): State<Arc<AppState>>) -> Json<Vec<Organization>> {
+async fn list_orgs(s: CurrentAccount) -> Json<Vec<Organization>> {
     Json(s.workspace().organizations.clone())
 }
 
@@ -52,7 +52,7 @@ async fn list_orgs(State(s): State<Arc<AppState>>) -> Json<Vec<Organization>> {
     params(("id" = String, Path)),
     responses((status = 200, body = Organization), (status = 404)))]
 async fn get_org(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(id): Path<String>,
 ) -> Result<Json<Organization>, StatusCode> {
     s.workspace()
@@ -68,7 +68,7 @@ async fn get_org(
     request_body = Organization,
     responses((status = 201, body = Organization)))]
 async fn create_org(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Json(body): Json<Organization>,
 ) -> (StatusCode, Json<Organization>) {
     let org = s.workspace().create_organization(body);
@@ -81,7 +81,7 @@ async fn create_org(
     request_body = Organization,
     responses((status = 200, body = Organization), (status = 404)))]
 async fn update_org(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Organization>, StatusCode> {
@@ -95,7 +95,7 @@ async fn update_org(
 #[utoipa::path(delete, path = "/organizations/{id}", tag = "organizations",
     params(("id" = String, Path)),
     responses((status = 204, description = "Deleted (cascades to its departments)"), (status = 404)))]
-async fn delete_org(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+async fn delete_org(s: CurrentAccount, Path(id): Path<String>) -> StatusCode {
     if s.workspace().delete_organization(&id) {
         s.persist_workspace();
         StatusCode::NO_CONTENT
@@ -108,7 +108,7 @@ async fn delete_org(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> S
 
 #[utoipa::path(get, path = "/departments", tag = "departments",
     responses((status = 200, body = Vec<Department>)))]
-async fn list_depts(State(s): State<Arc<AppState>>) -> Json<Vec<Department>> {
+async fn list_depts(s: CurrentAccount) -> Json<Vec<Department>> {
     Json(s.workspace().departments.clone())
 }
 
@@ -116,7 +116,7 @@ async fn list_depts(State(s): State<Arc<AppState>>) -> Json<Vec<Department>> {
     params(("id" = String, Path)),
     responses((status = 200, body = Department), (status = 404)))]
 async fn get_dept(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(id): Path<String>,
 ) -> Result<Json<Department>, StatusCode> {
     s.workspace()
@@ -132,7 +132,7 @@ async fn get_dept(
     request_body = Department,
     responses((status = 201, body = Department)))]
 async fn create_dept(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Json(body): Json<Department>,
 ) -> (StatusCode, Json<Department>) {
     let dept = s.workspace().create_department(body);
@@ -145,7 +145,7 @@ async fn create_dept(
     request_body = Department,
     responses((status = 200, body = Department), (status = 404)))]
 async fn update_dept(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Department>, StatusCode> {
@@ -159,7 +159,7 @@ async fn update_dept(
 #[utoipa::path(delete, path = "/departments/{id}", tag = "departments",
     params(("id" = String, Path)),
     responses((status = 204), (status = 404)))]
-async fn delete_dept(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+async fn delete_dept(s: CurrentAccount, Path(id): Path<String>) -> StatusCode {
     if s.workspace().delete_department(&id) {
         s.persist_workspace();
         StatusCode::NO_CONTENT
@@ -172,7 +172,7 @@ async fn delete_dept(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> 
 
 #[utoipa::path(get, path = "/personas", tag = "personas",
     responses((status = 200, body = Vec<Persona>)))]
-async fn list_personas(State(s): State<Arc<AppState>>) -> Json<Vec<Persona>> {
+async fn list_personas(s: CurrentAccount) -> Json<Vec<Persona>> {
     Json(s.workspace().personas.clone())
 }
 
@@ -180,7 +180,7 @@ async fn list_personas(State(s): State<Arc<AppState>>) -> Json<Vec<Persona>> {
     params(("id" = String, Path)),
     responses((status = 200, body = Persona), (status = 404)))]
 async fn get_persona(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(id): Path<String>,
 ) -> Result<Json<Persona>, StatusCode> {
     s.workspace()
@@ -200,7 +200,7 @@ async fn get_persona(
         (status = 201, body = Persona),
         (status = 409, description = "Refused: name already in use, or a second user identity")))]
 async fn create_persona(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Json(body): Json<Persona>,
 ) -> Result<(StatusCode, Json<Persona>), StatusCode> {
     let created = s.workspace().create_persona(body);
@@ -223,7 +223,7 @@ async fn create_persona(
         (status = 404),
         (status = 409, description = "Refused: name already in use, or a second user identity")))]
 async fn update_persona(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Persona>, StatusCode> {
@@ -246,7 +246,7 @@ async fn update_persona(
         (status = 204),
         (status = 404),
         (status = 409, description = "Refused: last remaining user identity")))]
-async fn delete_persona(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+async fn delete_persona(s: CurrentAccount, Path(id): Path<String>) -> StatusCode {
     let mut ws = s.workspace();
     if !ws.personas.iter().any(|p| p.id == id) {
         return StatusCode::NOT_FOUND;
@@ -267,7 +267,7 @@ async fn delete_persona(State(s): State<Arc<AppState>>, Path(id): Path<String>) 
 /// to show a friendly label (e.g. "bar 版") next to a persona's prompt version.
 #[utoipa::path(get, path = "/prompt-labels", tag = "personas",
     responses((status = 200, body = Vec<PromptLabel>)))]
-async fn list_prompt_labels(State(s): State<Arc<AppState>>) -> Json<Vec<PromptLabel>> {
+async fn list_prompt_labels(s: CurrentAccount) -> Json<Vec<PromptLabel>> {
     Json(s.workspace().prompt_labels())
 }
 
@@ -278,7 +278,7 @@ async fn list_prompt_labels(State(s): State<Arc<AppState>>) -> Json<Vec<PromptLa
     request_body = PromptLabelInput,
     responses((status = 200, body = PromptLabel)))]
 async fn set_prompt_label(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(hash): Path<String>,
     Json(body): Json<PromptLabelInput>,
 ) -> Json<PromptLabel> {
@@ -295,7 +295,7 @@ async fn set_prompt_label(
     params(("personaId" = String, Path)),
     responses((status = 200, body = Vec<Memory>), (status = 404)))]
 async fn list_memories(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(persona_id): Path<String>,
 ) -> Result<Json<Vec<Memory>>, StatusCode> {
     let ws = s.workspace();
@@ -316,7 +316,7 @@ async fn list_memories(
         (status = 404),
         (status = 409, description = "Refused: persona has no prompt to scope a memory to, or blank content")))]
 async fn create_memory(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(persona_id): Path<String>,
     Json(body): Json<MemoryInput>,
 ) -> Result<(StatusCode, Json<Memory>), StatusCode> {
@@ -344,7 +344,7 @@ async fn create_memory(
     params(("personaId" = String, Path), ("memoryId" = String, Path)),
     responses((status = 204), (status = 404)))]
 async fn delete_memory(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path((persona_id, memory_id)): Path<(String, String)>,
 ) -> StatusCode {
     if s.workspace().delete_memory(&persona_id, &memory_id) {
@@ -359,7 +359,7 @@ async fn delete_memory(
 
 #[utoipa::path(get, path = "/groups", tag = "groups",
     responses((status = 200, body = Vec<Group>)))]
-async fn list_groups(State(s): State<Arc<AppState>>) -> Json<Vec<Group>> {
+async fn list_groups(s: CurrentAccount) -> Json<Vec<Group>> {
     Json(s.workspace().groups.clone())
 }
 
@@ -367,7 +367,7 @@ async fn list_groups(State(s): State<Arc<AppState>>) -> Json<Vec<Group>> {
     params(("id" = String, Path)),
     responses((status = 200, body = Group), (status = 404)))]
 async fn get_group(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(id): Path<String>,
 ) -> Result<Json<Group>, StatusCode> {
     s.workspace()
@@ -383,7 +383,7 @@ async fn get_group(
     request_body = Group,
     responses((status = 201, body = Group)))]
 async fn create_group(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Json(body): Json<Group>,
 ) -> (StatusCode, Json<Group>) {
     let group = s.workspace().create_group(body);
@@ -396,7 +396,7 @@ async fn create_group(
     request_body = Group,
     responses((status = 200, body = Group), (status = 404)))]
 async fn update_group(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Path(id): Path<String>,
     Json(patch): Json<Value>,
 ) -> Result<Json<Group>, StatusCode> {
@@ -410,7 +410,7 @@ async fn update_group(
 #[utoipa::path(delete, path = "/groups/{id}", tag = "groups",
     params(("id" = String, Path)),
     responses((status = 204), (status = 404)))]
-async fn delete_group(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+async fn delete_group(s: CurrentAccount, Path(id): Path<String>) -> StatusCode {
     if s.workspace().delete_group(&id) {
         s.persist_workspace();
         StatusCode::NO_CONTENT
@@ -423,7 +423,7 @@ async fn delete_group(State(s): State<Arc<AppState>>, Path(id): Path<String>) ->
 
 #[utoipa::path(get, path = "/settings", tag = "settings",
     responses((status = 200, body = Settings)))]
-async fn get_settings(State(s): State<Arc<AppState>>) -> Json<Settings> {
+async fn get_settings(s: CurrentAccount) -> Json<Settings> {
     Json(s.workspace().settings.clone())
 }
 
@@ -431,7 +431,7 @@ async fn get_settings(State(s): State<Arc<AppState>>) -> Json<Settings> {
     request_body = Settings,
     responses((status = 200, body = Settings), (status = 422)))]
 async fn update_settings(
-    State(s): State<Arc<AppState>>,
+    s: CurrentAccount,
     Json(patch): Json<Value>,
 ) -> Result<Json<Settings>, StatusCode> {
     let updated = s.workspace().update_settings(patch);

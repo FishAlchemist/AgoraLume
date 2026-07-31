@@ -28,8 +28,7 @@ use tracing_subscriber::EnvFilter;
 use crate::agent::turn::AgentRuntime;
 use crate::config::Config;
 use crate::llm_config::LlmConfigStore;
-use crate::persist::Persistence;
-use crate::state::AppState;
+use crate::state::{AppState, OperatorState};
 
 #[tokio::main]
 async fn main() {
@@ -93,17 +92,17 @@ async fn main() {
     // whether a real model is configured — a real run is worth keeping, a mock
     // demo is throwaway — but either can be forced via `AGORALUME_PERSIST`.
     let persist = config.persist_override.unwrap_or(llm_settings.enabled);
+    let operator = Arc::new(OperatorState::new(runtime).with_llm_config(llm_settings, llm_store));
     let state = if persist {
         // One-time upgrade from the pre-account flat layout, if this data dir
         // still has one — a no-op on every later run once nothing legacy is
         // left. See `persist::migrate_legacy_layout`.
         let account_dir = config.account_data_dir();
         persist::migrate_legacy_layout(Path::new(&config.data_dir), &account_dir);
-        AppState::with_persistence(runtime, Persistence::new(&account_dir))
+        AppState::new(operator, Some(PathBuf::from(&config.data_dir)), &config.account_id)
     } else {
-        AppState::with_runtime(runtime)
-    }
-    .with_llm_config(llm_settings, llm_store);
+        AppState::new(operator, None, &config.account_id)
+    };
     let state = Arc::new(state);
     let app = routes::router(state.clone(), config.cors_allowed_origins.as_deref());
 
@@ -152,7 +151,7 @@ async fn main() {
     let url = format!("http://{host}:{}", addr.port());
 
     // Reflect the actual reply source: a real model, or the rule-based mock.
-    let replies = if state.runtime.is_mock() {
+    let replies = if state.runtime().is_mock() {
         "simulated replies (mock)"
     } else {
         "LLM-backed replies"

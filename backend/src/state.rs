@@ -7,6 +7,7 @@
 //! the API — just as the simulated turn will give way to a real LLM.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -208,7 +209,95 @@ pub struct DebugTotals {
     pub models: HashMap<String, ModelTotals>,
 }
 
-pub struct AppState {
+/// Operator-level state, shared by every account: the swappable LLM runtime
+/// and the provider configuration behind it. Unlike [`AccountState`], there is
+/// exactly one of these per process — `llm.toml` is explicitly not a
+/// per-account concept (see `Config::account_data_dir`'s docs).
+pub struct OperatorState {
+    /// The swappable agent runtime (brain + memory + loop config).
+    pub runtime: AgentRuntime,
+    /// Token pricing for the estimated-cost readout, or `None` to show tokens
+    /// only. Set at startup and on every `PATCH /llm/settings` — see
+    /// [`Self::set_pricing`].
+    pricing: RwLock<Option<Pricing>>,
+    /// The live LLM provider configuration backing `GET`/`PATCH /llm/settings`.
+    /// Loaded from `llm.toml` at startup ([`Self::with_llm_config`]) and written
+    /// through on every successful update ([`Self::apply_llm_settings`]); never
+    /// re-read from disk after that, so a hand edit to the file while the server
+    /// is running takes effect on the next restart, not immediately.
+    llm_settings: Mutex<LlmSettings>,
+    /// Where [`Self::apply_llm_settings`] persists changes. `None` for the
+    /// in-memory test/dev constructor ([`Self::new`]) — updates still apply
+    /// live, just don't survive a restart.
+    llm_store: Option<LlmConfigStore>,
+}
+
+impl OperatorState {
+    /// Builds operator state around a specific runtime, with no persisted
+    /// settings store — updates apply live but don't survive a restart. Tests
+    /// use this to inject a scripted brain or deterministic loop config.
+    pub fn new(runtime: AgentRuntime) -> Self {
+        Self {
+            runtime,
+            pricing: RwLock::new(None),
+            llm_settings: Mutex::new(LlmSettings::default()),
+            llm_store: None,
+        }
+    }
+
+    /// Wires the live LLM provider configuration in: the settings backing
+    /// `GET /llm/settings`, where [`Self::apply_llm_settings`] persists future
+    /// changes, and the pricing that drives the cost readout. Called once at
+    /// startup, before the state is shared — a plain field assignment, not the
+    /// locked update path a running server uses.
+    pub fn with_llm_config(mut self, settings: LlmSettings, store: LlmConfigStore) -> Self {
+        self.set_pricing(settings.pricing.clone());
+        self.llm_settings = Mutex::new(settings);
+        self.llm_store = Some(store);
+        self
+    }
+
+    /// Sets the token pricing used for the estimated-cost readout.
+    pub fn set_pricing(&self, pricing: Option<Pricing>) {
+        *self.pricing.write().unwrap() = pricing;
+    }
+
+    /// A snapshot of the current pricing, or `None` if unconfigured.
+    pub fn pricing(&self) -> Option<Pricing> {
+        self.pricing.read().unwrap().clone()
+    }
+
+    /// The live LLM provider configuration (the `GET /llm/settings` payload,
+    /// before the API key is stripped for the wire).
+    pub fn llm_settings(&self) -> LlmSettings {
+        self.llm_settings.lock().unwrap().clone()
+    }
+
+    /// Applies a new LLM configuration: builds and validates the brain it
+    /// describes, and only once that succeeds — so `llm.toml` can never end up
+    /// holding a configuration that won't boot — swaps it into the live
+    /// [`AgentRuntime`], updates the pricing used for new traces, updates the
+    /// in-memory settings `GET /llm/settings` reads, and persists to disk (a
+    /// no-op without a store, e.g. the in-memory test constructor). Returns the
+    /// applied settings, or the validation error (a bad `PATCH` is rejected,
+    /// nothing changes).
+    pub fn apply_llm_settings(&self, settings: LlmSettings) -> Result<LlmSettings, String> {
+        let (brain, config, mock) = settings.build_parts()?;
+        self.runtime.swap(brain, config, mock);
+        self.set_pricing(settings.pricing.clone());
+        *self.llm_settings.lock().unwrap() = settings.clone();
+        if let Some(store) = &self.llm_store {
+            store.save(&settings);
+        }
+        Ok(settings)
+    }
+}
+
+/// One account's own in-memory state: its workspace and everything derived
+/// from chatting in it. Every account gets its own instance (see [`AppState`]'s
+/// registry) — nothing in here is shared across accounts, unlike
+/// [`OperatorState`].
+pub struct AccountState {
     workspace: Mutex<Workspace>,
     messages: Mutex<HashMap<String, Vec<Message>>>,
     /// Per-group compressed older history (the running summary + how far it
@@ -216,7 +305,7 @@ pub struct AppState {
     summaries: Mutex<HashMap<String, GroupSummary>>,
     /// Per-group cached conversation suggestions, generated server-side and
     /// persisted so they survive a restart. Loaded alongside a group's messages
-    /// on first touch; regenerated only when stale (see [`AppState::request_suggestions`]).
+    /// on first touch; regenerated only when stale (see [`AccountState::request_suggestions`]).
     suggestions: Mutex<HashMap<String, GroupSuggestions>>,
     /// Per-group suggestion-generation gate (cooldown + single-flight). Purely
     /// in-memory: a restart starts with a clean gate, which at worst allows one
@@ -230,8 +319,10 @@ pub struct AppState {
     /// which case [`Self::current_turn`] rebuilds a message-triggered turn from
     /// the log so the bar survives a restart.
     turns: Mutex<HashMap<String, Turn>>,
-    /// The swappable agent runtime (brain + memory + loop config).
-    pub runtime: AgentRuntime,
+    /// Shared operator-level state (the LLM runtime and its pricing) — every
+    /// account reads the same one; only the account's own data below is
+    /// exclusive to it.
+    operator: Arc<OperatorState>,
     /// One command channel per group, feeding its coordinator task. Created
     /// lazily on first dispatch so idle groups run nothing.
     coordinators: Mutex<HashMap<String, mpsc::Sender<Event>>>,
@@ -252,39 +343,23 @@ pub struct AppState {
     /// `debug.persona_models` this run — the lazy-load marker for that map,
     /// mirroring `loaded_groups` one level down (per persona, not per group).
     loaded_personas: Mutex<HashSet<String>>,
-    /// Token pricing for the estimated-cost readout, or `None` to show tokens
-    /// only. Set at startup and on every `PATCH /llm/settings` — see
-    /// [`Self::set_pricing`].
-    pricing: RwLock<Option<Pricing>>,
-    /// The live LLM provider configuration backing `GET`/`PATCH /llm/settings`.
-    /// Loaded from `llm.toml` at startup ([`Self::with_llm_config`]) and written
-    /// through on every successful update ([`Self::apply_llm_settings`]); never
-    /// re-read from disk after that, so a hand edit to the file while the server
-    /// is running takes effect on the next restart, not immediately.
-    llm_settings: Mutex<LlmSettings>,
-    /// Where [`Self::apply_llm_settings`] persists changes. `None` for the
-    /// in-memory test/dev constructors ([`Self::with_runtime`],
-    /// [`Self::with_persistence`]) — updates still apply live, just don't
-    /// survive a restart.
-    llm_store: Option<LlmConfigStore>,
 }
 
-impl AppState {
-    /// Builds the app state with a specific runtime and no persistence — a pure
-    /// in-memory run. Tests use this to inject a scripted brain or deterministic
-    /// loop config.
-    pub fn with_runtime(runtime: AgentRuntime) -> Self {
-        Self::build(runtime, None)
+impl AccountState {
+    /// Builds one account's state with no persistence — a pure in-memory run.
+    /// Tests use this; so does a mock-mode server, where no account persists.
+    pub fn with_runtime(operator: Arc<OperatorState>) -> Self {
+        Self::build(operator, None)
     }
 
-    /// Builds the app state backed by on-disk persistence: the workspace is
-    /// loaded from `workspace.json` (or seeded on first run) and message logs
-    /// load lazily per group. `main` uses this when persistence is enabled.
-    pub fn with_persistence(runtime: AgentRuntime, persistence: Persistence) -> Self {
-        Self::build(runtime, Some(persistence))
+    /// Builds one account's state backed by on-disk persistence: the workspace
+    /// is loaded from `workspace.json` (or seeded on first run) and message
+    /// logs load lazily per group.
+    pub fn with_persistence(operator: Arc<OperatorState>, persistence: Persistence) -> Self {
+        Self::build(operator, Some(persistence))
     }
 
-    fn build(runtime: AgentRuntime, persistence: Option<Persistence>) -> Self {
+    fn build(operator: Arc<OperatorState>, persistence: Option<Persistence>) -> Self {
         // A persisted run starts from disk (or a fresh seed the first time);
         // an in-memory run seeds every time.
         let workspace = persistence
@@ -313,7 +388,7 @@ impl AppState {
             suggest_gates: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
-            runtime,
+            operator,
             coordinators: Mutex::new(HashMap::new()),
             persistence,
             loaded_groups: Mutex::new(HashSet::new()),
@@ -325,58 +400,12 @@ impl AppState {
                 traces: HashMap::new(),
             }),
             loaded_personas: Mutex::new(HashSet::new()),
-            pricing: RwLock::new(None),
-            llm_settings: Mutex::new(LlmSettings::default()),
-            llm_store: None,
         }
     }
 
-    /// Wires the live LLM provider configuration in: the settings backing
-    /// `GET /llm/settings`, where [`Self::apply_llm_settings`] persists future
-    /// changes, and the pricing that drives the cost readout. Called once at
-    /// startup, before the state is shared — a plain field assignment, not the
-    /// locked update path a running server uses.
-    pub fn with_llm_config(mut self, settings: LlmSettings, store: LlmConfigStore) -> Self {
-        self.set_pricing(settings.pricing.clone());
-        self.llm_settings = Mutex::new(settings);
-        self.llm_store = Some(store);
-        self
-    }
-
-    /// Sets the token pricing used for the estimated-cost readout.
-    pub fn set_pricing(&self, pricing: Option<Pricing>) {
-        *self.pricing.write().unwrap() = pricing;
-    }
-
-    /// The live LLM provider configuration (the `GET /llm/settings` payload,
-    /// before the API key is stripped for the wire).
-    pub fn llm_settings(&self) -> LlmSettings {
-        self.llm_settings.lock().unwrap().clone()
-    }
-
-    /// Applies a new LLM configuration: builds and validates the brain it
-    /// describes, and only once that succeeds — so `llm.toml` can never end up
-    /// holding a configuration that won't boot — swaps it into the live
-    /// [`AgentRuntime`], updates the pricing used for new traces, updates the
-    /// in-memory settings `GET /llm/settings` reads, and persists to disk (a
-    /// no-op without a store, e.g. the in-memory test constructors). Returns the
-    /// applied settings, or the validation error (a bad `PATCH` is rejected,
-    /// nothing changes).
-    pub fn apply_llm_settings(&self, settings: LlmSettings) -> Result<LlmSettings, String> {
-        let (brain, config, mock) = settings.build_parts()?;
-        self.runtime.swap(brain, config, mock);
-        self.set_pricing(settings.pricing.clone());
-        *self.llm_settings.lock().unwrap() = settings.clone();
-        if let Some(store) = &self.llm_store {
-            store.save(&settings);
-        }
-        Ok(settings)
-    }
-
-    /// Whether state is persisted to disk (survives a restart). Surfaced through
-    /// `/meta`.
-    pub fn persistent(&self) -> bool {
-        self.persistence.is_some()
+    /// The shared LLM runtime backing this account's agents.
+    pub fn runtime(&self) -> &AgentRuntime {
+        &self.operator.runtime
     }
 
     /// Records a debug trace of one agent inference: accumulate its usage (and,
@@ -400,7 +429,7 @@ impl AppState {
                 .model
                 .clone()
                 .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-            let pricing = self.pricing.read().unwrap();
+            let pricing = self.operator.pricing();
 
             // This one call's own cost, at today's rate — a further breakdown of
             // the running totals below, for spotting an unusually expensive
@@ -1185,7 +1214,141 @@ impl AppState {
     }
 }
 
-/// Orders member states so [`AppState::set_turn_member`] only ever advances one.
+/// The registry every route handler sees via axum's `State` extractor: the
+/// operator-level state shared by every account, plus each account's own
+/// [`AccountState`], opened lazily on first touch and cached from then on.
+///
+/// Round 2 of the account system (not yet fully wired): a server process no
+/// longer serves exactly one account fixed at startup — but until real login
+/// exists, every request still resolves to one hardcoded `bootstrap_account_id`
+/// (see [`Self::bootstrap_account`] and its `FromRef` impl below). That's the
+/// one thing a future auth pass replaces; the registry itself, and every
+/// per-account handler already extracting `State<Arc<AccountState>>` instead of
+/// `State<Arc<AppState>>`, don't need to change again.
+pub struct AppState {
+    /// Shared across every account — see [`OperatorState`].
+    pub operator: Arc<OperatorState>,
+    accounts: RwLock<HashMap<String, Arc<AccountState>>>,
+    /// Root directory under which each account's own subtree lives
+    /// (`<data_dir>/accounts/<sanitized id>`), or `None` for a pure in-memory
+    /// run — every lazily-opened account gets persistence iff the server was
+    /// started with it, mirroring the choice `main` already made once.
+    data_dir: Option<PathBuf>,
+    /// The one account every request resolves to until real per-request
+    /// account resolution exists — see the struct docs above.
+    bootstrap_account_id: String,
+}
+
+impl AppState {
+    /// Builds an empty registry around a given operator state — no account is
+    /// open yet; each is created (and persisted under `data_dir`, if given) the
+    /// first time [`Self::account_by_id`] is asked for it.
+    pub fn new(
+        operator: Arc<OperatorState>,
+        data_dir: Option<PathBuf>,
+        bootstrap_account_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            operator,
+            accounts: RwLock::new(HashMap::new()),
+            data_dir,
+            bootstrap_account_id: bootstrap_account_id.into(),
+        }
+    }
+
+    /// The named account's own state, opening (and caching) it on first touch.
+    /// A fresh account starts the same way the very first account always has —
+    /// seeded, or loaded from `accounts/<sanitized id>/workspace.json` if that
+    /// file already exists — persisted under its own subtree exactly when the
+    /// server was started with persistence on.
+    pub fn account_by_id(&self, account_id: &str) -> Arc<AccountState> {
+        if let Some(existing) = self.accounts.read().unwrap().get(account_id) {
+            return existing.clone();
+        }
+        let mut accounts = self.accounts.write().unwrap();
+        // Someone else may have opened it while this call waited for the write
+        // lock — check again under it rather than opening (and discarding) a
+        // second copy.
+        if let Some(existing) = accounts.get(account_id) {
+            return existing.clone();
+        }
+        let account = Arc::new(match &self.data_dir {
+            Some(data_dir) => {
+                let dir = data_dir.join("accounts").join(crate::persist::sanitize(account_id));
+                AccountState::with_persistence(self.operator.clone(), Persistence::new(&dir))
+            }
+            None => AccountState::with_runtime(self.operator.clone()),
+        });
+        accounts.insert(account_id.to_string(), account.clone());
+        account
+    }
+
+    /// The one account every request currently resolves to — see the struct
+    /// docs. Private on purpose: nothing outside this module (and the `FromRef`
+    /// impl just below) should depend on there being a single bootstrap
+    /// account, since that's exactly what a future auth pass removes.
+    fn bootstrap_account(&self) -> Arc<AccountState> {
+        self.account_by_id(&self.bootstrap_account_id)
+    }
+
+    /// The shared LLM runtime, for handlers that need it directly (e.g.
+    /// `/meta`'s mock-vs-live readout) rather than through an `AccountState`.
+    pub fn runtime(&self) -> &AgentRuntime {
+        &self.operator.runtime
+    }
+
+    /// The live LLM provider configuration — see [`OperatorState::llm_settings`].
+    pub fn llm_settings(&self) -> LlmSettings {
+        self.operator.llm_settings()
+    }
+
+    /// Applies a new LLM configuration — see [`OperatorState::apply_llm_settings`].
+    pub fn apply_llm_settings(&self, settings: LlmSettings) -> Result<LlmSettings, String> {
+        self.operator.apply_llm_settings(settings)
+    }
+
+    /// Whether accounts persist to disk (survive a restart) — a server-wide
+    /// policy decided once at startup, not a per-account choice. Surfaced
+    /// through `/meta`.
+    pub fn persistent(&self) -> bool {
+        self.data_dir.is_some()
+    }
+}
+
+/// The account the current request resolves to — an axum extractor a
+/// per-account handler takes directly (`account: CurrentAccount`) instead of
+/// `State<Arc<AppState>>`, so its body reads `&AccountState`'s own methods
+/// with no reaching-into-`AppState` boilerplate. `Deref`s to [`AccountState`].
+///
+/// A plain `FromRef<Arc<AppState>> for Arc<AccountState>` would be simpler,
+/// but the orphan rules block it — neither `Arc` nor axum's traits are local
+/// to this crate, and `Arc` isn't `#[fundamental]` — so this wraps it in a
+/// local newtype and implements `FromRequestParts` directly instead. This one
+/// impl is the *only* place that knows about [`AppState::bootstrap_account`]
+/// today; a future auth pass swaps it for one that reads the account resolved
+/// by middleware from the request, and every handler using this extractor
+/// updates for free.
+pub struct CurrentAccount(pub Arc<AccountState>);
+
+impl std::ops::Deref for CurrentAccount {
+    type Target = AccountState;
+    fn deref(&self) -> &AccountState {
+        &self.0
+    }
+}
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for CurrentAccount {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(CurrentAccount(state.bootstrap_account()))
+    }
+}
+
+/// Orders member states so [`AccountState::set_turn_member`] only ever advances one.
 fn state_rank(state: TurnMemberState) -> u8 {
     match state {
         TurnMemberState::Pending => 0,
@@ -1232,10 +1395,17 @@ mod tests {
     use super::*;
     use crate::models::now_ms;
 
+    /// A fresh account with no persistence, backed by its own mock operator —
+    /// what most of these tests need, since they only exercise account-scoped
+    /// behaviour (usage/traces), not the operator-level LLM config.
+    fn account() -> AccountState {
+        AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())))
+    }
+
     #[test]
     fn apply_llm_settings_rejects_an_incomplete_config_without_changing_anything() {
-        let state = AppState::with_runtime(AgentRuntime::mock());
-        let before = state.llm_settings().enabled;
+        let operator = OperatorState::new(AgentRuntime::mock());
+        let before = operator.llm_settings().enabled;
 
         // enabled with neither base_url nor model set: build_parts must reject
         // this before anything is swapped or persisted.
@@ -1243,15 +1413,15 @@ mod tests {
             enabled: true,
             ..LlmSettings::default()
         };
-        let err = state.apply_llm_settings(bad).unwrap_err();
+        let err = operator.apply_llm_settings(bad).unwrap_err();
 
         assert!(err.contains("base_url"));
         assert!(
-            state.runtime.is_mock(),
+            operator.runtime.is_mock(),
             "the runtime must not have been swapped"
         );
         assert_eq!(
-            state.llm_settings().enabled,
+            operator.llm_settings().enabled,
             before,
             "settings must not have changed"
         );
@@ -1259,7 +1429,7 @@ mod tests {
 
     #[test]
     fn apply_llm_settings_enabling_a_valid_endpoint_swaps_the_runtime() {
-        let state = AppState::with_runtime(AgentRuntime::mock());
+        let operator = OperatorState::new(AgentRuntime::mock());
         let settings = LlmSettings {
             enabled: true,
             base_url: Some("http://localhost:11434/v1".to_string()),
@@ -1267,20 +1437,25 @@ mod tests {
             ..LlmSettings::default()
         };
 
-        let applied = state
+        let applied = operator
             .apply_llm_settings(settings)
             .expect("a valid endpoint applies");
 
         assert!(applied.enabled);
         assert!(
-            !state.runtime.is_mock(),
+            !operator.runtime.is_mock(),
             "the runtime must have been swapped to the real brain"
         );
     }
 
     #[test]
     fn apply_llm_settings_updates_the_pricing_used_by_new_traces() {
-        let state = AppState::with_runtime(AgentRuntime::mock());
+        // Through the full AppState (operator + account registry), to prove
+        // the two layers actually connect: a PATCH-equivalent on the shared
+        // operator config changes what a specific account's traces get priced
+        // at.
+        let operator = Arc::new(OperatorState::new(AgentRuntime::mock()));
+        let state = AppState::new(operator, None, "test");
         let pricing = Pricing {
             input_per_m: 1.0,
             cached_input_per_m: 0.5,
@@ -1294,7 +1469,8 @@ mod tests {
             })
             .expect("disabled config with pricing still applies");
 
-        state.record_trace(
+        let account = state.account_by_id("test");
+        account.record_trace(
             "lab",
             AgentTrace {
                 ts: now_ms(),
@@ -1318,7 +1494,7 @@ mod tests {
             },
         );
 
-        let totals = state.debug_totals();
+        let totals = account.debug_totals();
         let cost = totals
             .models
             .get(UNKNOWN_MODEL)
@@ -1329,7 +1505,7 @@ mod tests {
         // The trace itself, not just the rolled-up totals, should carry its
         // own cost — that's what lets the debug panel show a single call's
         // spend rather than only the group/persona's cumulative total.
-        let stored = state.debug_traces("lab");
+        let stored = account.debug_traces("lab");
         let trace_cost = stored[0]
             .estimated_cost
             .as_ref()
@@ -1338,6 +1514,26 @@ mod tests {
             trace_cost.input, 1.0,
             "one trace's own cost, priced the same as the totals it fed"
         );
+    }
+
+    #[test]
+    fn two_accounts_opened_from_the_same_registry_stay_isolated() {
+        let operator = Arc::new(OperatorState::new(AgentRuntime::mock()));
+        let state = AppState::new(operator, None, "a");
+
+        let a = state.account_by_id("a");
+        let b = state.account_by_id("b");
+        a.record_trace("lab", trace("lab", "gpt-4o-mini", 100));
+
+        assert_eq!(a.debug_totals().models["gpt-4o-mini"].prompt_tokens, 100);
+        assert!(
+            b.debug_totals().models.is_empty(),
+            "a different account's registry entry must not see account a's trace"
+        );
+
+        // Re-fetching the same id returns the same cached instance, not a
+        // fresh (and therefore empty) one.
+        assert_eq!(state.account_by_id("a").debug_totals().models["gpt-4o-mini"].prompt_tokens, 100);
     }
 
     /// A minimal trace for one group, with usage attributed to `model`.
@@ -1371,7 +1567,7 @@ mod tests {
 
     #[test]
     fn group_usage_stays_isolated_while_the_global_total_sums_every_group() {
-        let state = AppState::with_runtime(AgentRuntime::mock());
+        let state = account();
 
         state.record_trace("group-a", trace("group-a", "gpt-4o-mini", 100));
         state.record_trace("group-a", trace("group-a", "gpt-4o-mini", 50));
@@ -1394,7 +1590,7 @@ mod tests {
 
     #[test]
     fn persona_usage_is_isolated_within_a_group_while_group_totals_sum_every_member() {
-        let state = AppState::with_runtime(AgentRuntime::mock());
+        let state = account();
 
         // "lab" is a seeded group with aria and nox as AI members.
         state.record_trace("lab", trace_as("lab", "aria", "gpt-4o-mini", 100));
@@ -1432,7 +1628,7 @@ mod tests {
 
     #[test]
     fn system_bucket_surfaces_compression_and_suggestion_spend_alongside_real_personas() {
-        let state = AppState::with_runtime(AgentRuntime::mock());
+        let state = account();
         state.record_trace("lab", trace_as("lab", "aria", "gpt-4o-mini", 100));
         state.record_trace(
             "lab",
@@ -1449,7 +1645,7 @@ mod tests {
 
     #[test]
     fn global_persona_totals_sum_one_persona_across_every_group_it_appears_in() {
-        let state = AppState::with_runtime(AgentRuntime::mock());
+        let state = account();
         // "lab" and "lounge" are both seeded groups with aria as an AI member;
         // nox is only in "lab".
         state.record_trace("lab", trace_as("lab", "aria", "gpt-4o-mini", 100));

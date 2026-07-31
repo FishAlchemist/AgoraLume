@@ -25,7 +25,7 @@ use crate::agent::mock::RuleBrain;
 use crate::models::{
     AgentTrace, GroupSuggestions, Message, SYSTEM_PERSONA_ID, TurnMemberState, TurnTrigger, now_ms,
 };
-use crate::state::{AppState, GroupSummary};
+use crate::state::{AccountState, GroupSummary, OperatorState};
 use crate::workspace::RosterMember;
 
 /// Tunables for the loop. The bounded compute per triggering message — the "not
@@ -67,7 +67,7 @@ impl Default for LoopConfig {
 }
 
 /// The mutable pieces of an [`AgentRuntime`], guarded together so a hot
-/// reconfiguration (see `AppState::apply_llm_settings`) swaps brain, loop
+/// reconfiguration (see `OperatorState::apply_llm_settings`) swaps brain, loop
 /// tunables, and the mock flag as one atomic unit — a reader can never observe
 /// a config that came from a different model than the brain it's paired with.
 struct RuntimeInner {
@@ -88,7 +88,7 @@ pub struct RuntimeSnapshot {
     pub mock: bool,
 }
 
-/// The agent runtime bundled into [`AppState`]: the swappable brain and the loop
+/// The agent runtime bundled into [`AccountState`]: the swappable brain and the loop
 /// tunables, behind a lock so `PATCH /llm/settings` can reconfigure it without a
 /// restart. Take a [`RuntimeSnapshot`] to read it; [`Self::swap`] is the only
 /// way to write it.
@@ -158,7 +158,7 @@ enum TurnOutcome {
 /// a time, so there is never more than one turn in flight per group. A hard
 /// interrupt returns here and immediately re-runs with the preempting event.
 pub async fn coordinator_loop(
-    state: Arc<AppState>,
+    state: Arc<AccountState>,
     group_id: String,
     mut rx: mpsc::Receiver<Event>,
 ) {
@@ -219,10 +219,10 @@ pub async fn coordinator_loop(
 /// compression is disabled (`compress_after == 0`), or when the tail is still
 /// short. Best-effort: a failed summarization is logged and the full transcript
 /// is kept, to be retried at the next boundary.
-async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
+async fn maybe_compress(state: &Arc<AccountState>, group_id: &str) {
     // Snapshotted once for the whole pass: a reconfiguration landing mid-compress
     // must not swap the brain out from under an in-flight summarization call.
-    let runtime = state.runtime.snapshot();
+    let runtime = state.runtime().snapshot();
     let cfg = &runtime.config;
     if runtime.mock || cfg.compress_after == 0 {
         return;
@@ -322,7 +322,7 @@ async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
 /// message, so agents that already responded aren't re-run. A fresh turn
 /// (`resuming` false) runs every member, leaving multi-round behavior intact.
 async fn run_turn(
-    state: &AppState,
+    state: &AccountState,
     group_id: &str,
     trigger: Event,
     resuming: bool,
@@ -330,7 +330,7 @@ async fn run_turn(
 ) -> TurnOutcome {
     // Snapshotted once for the whole turn: every member's decision this round
     // uses the same brain, even if a reconfiguration lands mid-turn.
-    let runtime = state.runtime.snapshot();
+    let runtime = state.runtime().snapshot();
     let cfg = &runtime.config;
 
     // The user's line every agent marks as read this turn (unlocks the composer).
@@ -622,7 +622,7 @@ fn action_label(action: Action) -> &'static str {
 
 /// Emits a spoken line to the group (Context Stream + UI View), returning its id
 /// so the caller can record it as the speaker's reply target for the turn.
-fn emit_message(state: &AppState, group_id: &str, persona_id: &str, text: String) -> String {
+fn emit_message(state: &AccountState, group_id: &str, persona_id: &str, text: String) -> String {
     let message = Message::conversation(group_id, persona_id, text, None);
     let id = message.id().to_string();
     state.emit(group_id, message);
@@ -633,7 +633,7 @@ fn emit_message(state: &AppState, group_id: &str, persona_id: &str, text: String
 /// user message carries its author and text (looked up from the just-stored
 /// line) so the bar can render it even when that line is outside the client's
 /// loaded window; an environment event carries its description as the label.
-fn turn_trigger(state: &AppState, group_id: &str, event: &Event) -> TurnTrigger {
+fn turn_trigger(state: &AccountState, group_id: &str, event: &Event) -> TurnTrigger {
     match event {
         Event::User { message_id } => {
             let found = state.list(group_id).into_iter().find_map(|m| match m {
@@ -663,14 +663,14 @@ fn turn_trigger(state: &AppState, group_id: &str, event: &Event) -> TurnTrigger 
 }
 
 /// Emits a mood to the group (UI View only — moods never enter the Context).
-fn emit_mood(state: &AppState, group_id: &str, persona_id: &str, mood: String) {
+fn emit_mood(state: &AccountState, group_id: &str, persona_id: &str, mood: String) {
     state.emit(group_id, Message::mood(group_id, persona_id, mood, None));
 }
 
 /// Emits a system error notice to the group after an agent's inference failed —
 /// the sanitized status + reason only, never the provider body. Like a mood, it
 /// is UI-only and never enters the Context other agents read.
-fn emit_error(state: &AppState, group_id: &str, persona_id: &str, error: BrainError) {
+fn emit_error(state: &AccountState, group_id: &str, persona_id: &str, error: BrainError) {
     state.emit(
         group_id,
         Message::system(group_id, persona_id, error.status, error.reason),
@@ -697,7 +697,7 @@ struct ContextLine {
 
 /// Builds the Context Stream: the group's log filtered to spoken lines only.
 /// Moods and read receipts are excluded, so agents reason over clean context.
-fn build_transcript(state: &AppState, group_id: &str) -> Vec<ContextLine> {
+fn build_transcript(state: &AccountState, group_id: &str) -> Vec<ContextLine> {
     let messages = state.list(group_id);
     let workspace = state.workspace();
     messages
@@ -738,7 +738,7 @@ fn tail_after<'a>(transcript: &'a [ContextLine], through_id: Option<&str>) -> &'
 }
 
 /// Resolves a persona into the identity + variables a brain needs to decide.
-fn build_persona(state: &AppState, id: &str) -> Option<AgentPersona> {
+fn build_persona(state: &AccountState, id: &str) -> Option<AgentPersona> {
     let workspace = state.workspace();
     let persona = workspace.persona(id)?;
     let variables = workspace.resolve_variables(&persona);
@@ -753,7 +753,7 @@ fn build_persona(state: &AppState, id: &str) -> Option<AgentPersona> {
 /// the data an LLM brain exposes as a pull tool. Empty for a persona with no
 /// prompt or no memories under its current hash, in which case the brain attaches
 /// no tool and the turn stays a single completion.
-fn recall_lines(state: &AppState, persona_id: &str) -> Vec<String> {
+fn recall_lines(state: &AccountState, persona_id: &str) -> Vec<String> {
     state
         .workspace()
         .recallable_memories(persona_id)
@@ -764,7 +764,7 @@ fn recall_lines(state: &AppState, persona_id: &str) -> Vec<String> {
 
 /// Every persona in the workspace, as the member directory injected into each
 /// prompt. Cloned so the brain can hold it past the workspace lock.
-fn build_directory(state: &AppState) -> Vec<MemberInfo> {
+fn build_directory(state: &AccountState) -> Vec<MemberInfo> {
     state
         .workspace()
         .personas
@@ -791,15 +791,15 @@ pub const SUGGEST_MIN: usize = 3;
 const SUGGEST_CONTEXT_LINES: usize = 12;
 
 /// Generates conversation-starter suggestions for a group and stores them.
-/// Spawned off the request path by [`AppState::request_suggestions`] so the HTTP
+/// Spawned off the request path by [`AccountState::request_suggestions`] so the HTTP
 /// GET never blocks on the model; the result is persisted and pushed on the
 /// group's `suggestions` SSE frame. On failure — or an empty result — the
 /// previous suggestions are kept and only the in-flight gate is cleared.
 /// Assembles the same context a decision sees, plus the current local time and
 /// part of day so the openers fit the moment.
-pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
+pub async fn generate_suggestions(state: Arc<AccountState>, group_id: String) {
     // Snapshotted once for the whole pass, same reasoning as `maybe_compress`.
-    let runtime = state.runtime.snapshot();
+    let runtime = state.runtime().snapshot();
 
     // The room's members (name + blurb + who's the user), for addressing.
     let members: Vec<MemberInfo> = state
@@ -1153,14 +1153,13 @@ mod tests {
         }
     }
 
-    fn app(brain: Arc<dyn AgentBrain>, config: LoopConfig) -> Arc<AppState> {
-        Arc::new(AppState::with_runtime(AgentRuntime::new(
-            brain, config, true,
-        )))
+    fn app(brain: Arc<dyn AgentBrain>, config: LoopConfig) -> Arc<AccountState> {
+        let operator = Arc::new(OperatorState::new(AgentRuntime::new(brain, config, true)));
+        Arc::new(AccountState::with_runtime(operator))
     }
 
     /// Stores a user line the way the send handler does, returning its id.
-    fn store_user(state: &AppState, group: &str, text: &str) -> String {
+    fn store_user(state: &AccountState, group: &str, text: &str) -> String {
         let message = Message::conversation(group, "user-me", text, Some(vec![]));
         let id = message.id().to_string();
         state.store(group, message);
@@ -1169,7 +1168,7 @@ mod tests {
 
     /// Runs one turn with no interrupts (the sender is kept alive so the command
     /// channel never closes mid-turn).
-    async fn run_once(state: &AppState, group: &str, trigger: Event) -> TurnOutcome {
+    async fn run_once(state: &AccountState, group: &str, trigger: Event) -> TurnOutcome {
         let (_tx, mut rx) = mpsc::channel::<Event>(8);
         run_turn(state, group, trigger, false, &mut rx).await
     }
@@ -1289,7 +1288,7 @@ mod tests {
     }
 
     /// The AI persona ids that have read a given message.
-    fn readers(state: &AppState, group: &str, message_id: &str) -> Vec<String> {
+    fn readers(state: &AccountState, group: &str, message_id: &str) -> Vec<String> {
         state
             .list(group)
             .into_iter()
@@ -1301,7 +1300,7 @@ mod tests {
     }
 
     /// How many system (error) notices a group's log holds.
-    fn system_count(state: &AppState, group: &str) -> usize {
+    fn system_count(state: &AccountState, group: &str) -> usize {
         state
             .list(group)
             .iter()
@@ -1443,7 +1442,7 @@ mod tests {
         // No coordinator ran this process (like a fresh restart): current_turn must
         // rebuild the bar's turn from the stored log — the last line "you" sent,
         // plus who read and who replied.
-        let state = AppState::with_runtime(AgentRuntime::mock());
+        let state = AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())));
         let mid = store_user(&state, "lab", "dinner?");
         state.mark_read("lab", &mid, "aria");
         state.emit("lab", Message::conversation("lab", "aria", "pizza!", None));
@@ -1605,7 +1604,7 @@ mod tests {
 
     #[test]
     fn moods_never_enter_the_transcript() {
-        let state = AppState::with_runtime(AgentRuntime::mock());
+        let state = AccountState::with_runtime(Arc::new(OperatorState::new(AgentRuntime::mock())));
         state.emit(
             "lab",
             Message::conversation("lab", "aria", "hello there", None),
@@ -1889,11 +1888,12 @@ mod tests {
             compress_keep: 1,
             ..cfg()
         };
-        let state = Arc::new(AppState::with_runtime(AgentRuntime::new(
+        let operator = Arc::new(OperatorState::new(AgentRuntime::new(
             Arc::new(JoinBrain),
             config,
             false,
         )));
+        let state = Arc::new(AccountState::with_runtime(operator));
         for i in 0..5 {
             state.emit(
                 "lab",
@@ -1927,11 +1927,12 @@ mod tests {
             compress_keep: 2,
             ..cfg()
         };
-        let state = Arc::new(AppState::with_runtime(AgentRuntime::new(
+        let operator = Arc::new(OperatorState::new(AgentRuntime::new(
             Arc::new(JoinBrain),
             config,
             false,
         )));
+        let state = Arc::new(AccountState::with_runtime(operator));
         for i in 0..4 {
             state.emit(
                 "lab",
@@ -1993,7 +1994,7 @@ mod tests {
 
     /// Yields until the group's suggestions cache is populated (the spawned
     /// generation ran), or panics if it never does.
-    async fn wait_for_suggestions(state: &Arc<AppState>, group: &str) {
+    async fn wait_for_suggestions(state: &Arc<AccountState>, group: &str) {
         for _ in 0..1000 {
             if state.suggestions(group).generated_at != 0 {
                 return;

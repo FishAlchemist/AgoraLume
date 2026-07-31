@@ -187,7 +187,8 @@ mod tests {
     }
 
     fn state() -> Arc<AppState> {
-        Arc::new(AppState::with_runtime(AgentRuntime::mock()))
+        let operator = Arc::new(crate::state::OperatorState::new(AgentRuntime::mock()));
+        Arc::new(AppState::new(operator, None, "test"))
     }
 
     /// GETs `path` (unversioned, e.g. `/debug/usage` — [`API_VERSION`] is
@@ -217,7 +218,7 @@ mod tests {
         use crate::models::{AgentTrace, TokenUsage};
 
         let state = state();
-        state.record_trace(
+        state.account_by_id("test").record_trace(
             "lab",
             AgentTrace {
                 ts: 0,
