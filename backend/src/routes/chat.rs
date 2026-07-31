@@ -16,7 +16,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::agent::event::Event as AgentEvent;
-use crate::models::{AgentTrace, Cost, DebugUsage, GroupSuggestions, Message, ModelUsage, ServerMeta};
+use crate::models::{
+    AgentTrace, Cost, DebugUsage, GroupSuggestions, Message, ModelUsage, PersonaUsage, ServerMeta,
+};
 use crate::state::{AppState, DebugTotals, StreamEvent};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
@@ -30,6 +32,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(get_suggestions, regenerate_suggestions))
         .routes(routes!(debug_traces))
         .routes(routes!(group_debug_usage))
+        .routes(routes!(group_debug_usage_by_persona))
         .routes(routes!(stream))
 }
 
@@ -73,15 +76,49 @@ async fn debug_usage(State(state): State<Arc<AppState>>) -> Json<DebugUsage> {
 /// One group's own cumulative LLM usage — independent of every other group's,
 /// unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
 /// every group's usage (plus any spend from groups since deleted); this is one
-/// group's own slice of it.
+/// group's own slice of it. 404s for an unknown group, matching every other
+/// `/groups/{id}/...` handler — [`group_debug_usage_by_persona`] needs the
+/// workspace to know the group's current members, so the two must agree on
+/// what "unknown group" means rather than one 200-with-zeros and the other
+/// silently returning nothing.
 #[utoipa::path(get, path = "/groups/{id}/debug/usage", tag = "chat",
     params(("id" = String, Path, description = "Group id")),
-    responses((status = 200, description = "One group's own cumulative LLM usage", body = DebugUsage)))]
+    responses(
+        (status = 200, description = "One group's own cumulative LLM usage", body = DebugUsage),
+        (status = 404, description = "Unknown group")))]
 async fn group_debug_usage(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Json<DebugUsage> {
-    Json(debug_usage_view(state.group_debug_totals(&id)))
+) -> Result<Json<DebugUsage>, StatusCode> {
+    if state.workspace().turn_members(&id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(debug_usage_view(state.group_debug_totals(&id))))
+}
+
+/// A group's usage broken down by persona — which character is driving the
+/// spend, within that group's own total from [`group_debug_usage`]. Covers
+/// the group's current AI members; sorted by total tokens descending, like
+/// the per-model breakdown inside each [`DebugUsage`].
+#[utoipa::path(get, path = "/groups/{id}/debug/usage/by-persona", tag = "chat",
+    params(("id" = String, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "That group's usage, one entry per current AI member", body = Vec<PersonaUsage>),
+        (status = 404, description = "Unknown group")))]
+async fn group_debug_usage_by_persona(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<PersonaUsage>>, StatusCode> {
+    if state.workspace().turn_members(&id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let mut list: Vec<PersonaUsage> = state
+        .persona_debug_totals_all(&id)
+        .into_iter()
+        .map(|(persona_id, totals)| PersonaUsage { persona_id, usage: debug_usage_view(totals) })
+        .collect();
+    list.sort_by_key(|p| std::cmp::Reverse(p.usage.total_tokens));
+    Ok(Json(list))
 }
 
 /// Turns a raw per-model breakdown into the `DebugUsage` wire shape: the grand

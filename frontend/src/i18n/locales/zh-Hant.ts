@@ -230,7 +230,10 @@ export const zhHant: TranslationSchema = {
     mockNote: 'Mock 後端不會呼叫 LLM。連上 LLM 後端即可看到使用量與提示。',
     showDetails: '顯示明細',
     byModel: '依模型',
+    byPersona: '依角色',
     unknownModel: '模擬（無實際模型）',
+    export: '匯出',
+    exportTitle: '將此群組的除錯紀錄匯出成 JSON',
   },
   settings: {
     title: '設定',

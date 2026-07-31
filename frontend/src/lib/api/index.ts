@@ -10,6 +10,7 @@ import type {
   DebugUsage,
   HistoryWindow,
   MessageHandler,
+  PersonaUsage,
   ReadHandler,
   ServerMeta,
   SuggestionsHandler,
@@ -68,6 +69,9 @@ class RoutingChatApi implements ChatApi {
   }
   getGroupUsage(groupId: string): Promise<DebugUsage> {
     return this.impl().getGroupUsage(groupId);
+  }
+  getPersonaUsage(groupId: string): Promise<PersonaUsage[]> {
+    return this.impl().getPersonaUsage(groupId);
   }
   listTraces(groupId: string): Promise<AgentTrace[]> {
     return this.impl().listTraces(groupId);

@@ -231,7 +231,10 @@ export const en = {
       'The mock backend makes no LLM calls. Connect an LLM backend to see usage and prompts.',
     showDetails: 'Show details',
     byModel: 'By model',
+    byPersona: 'By character',
     unknownModel: 'Mock (no real model)',
+    export: 'Export',
+    exportTitle: 'Export this group’s debug trace as JSON',
   },
   settings: {
     title: 'Settings',

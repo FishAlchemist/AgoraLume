@@ -7,6 +7,7 @@ import type {
   DebugUsage,
   HistoryWindow,
   MessageHandler,
+  PersonaUsage,
   ReadHandler,
   ReadReceipt,
   ServerMeta,
@@ -285,6 +286,10 @@ export class HttpChatApi implements ChatApi {
 
   getGroupUsage(groupId: string): Promise<DebugUsage> {
     return this.getJson<DebugUsage>(`/groups/${groupId}/debug/usage`);
+  }
+
+  getPersonaUsage(groupId: string): Promise<PersonaUsage[]> {
+    return this.getJson<PersonaUsage[]>(`/groups/${groupId}/debug/usage/by-persona`);
   }
 
   listTraces(groupId: string): Promise<AgentTrace[]> {

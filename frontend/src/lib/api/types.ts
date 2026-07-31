@@ -122,6 +122,16 @@ export interface DebugUsage {
 }
 
 /**
+ * One persona's own slice of a group's usage — a further breakdown of that
+ * group's {@link DebugUsage} by which character is driving the spend. See
+ * {@link ChatApi.getPersonaUsage}.
+ */
+export interface PersonaUsage {
+  personaId: string;
+  usage: DebugUsage;
+}
+
+/**
  * Token pricing rates, per 1,000,000 tokens — the operator's estimate behind
  * {@link DebugUsage.estimatedCost}. Distinct from {@link Cost}: this is the
  * configured *rate*, not a computed total.
@@ -309,6 +319,13 @@ export interface ChatApi {
    * group's, unlike {@link getUsage}, whose total sums every group together.
    */
   getGroupUsage(groupId: string): Promise<DebugUsage>;
+
+  /**
+   * That same group's usage broken down by persona — which character is
+   * driving the spend. One entry per current AI member, sorted by total
+   * tokens descending.
+   */
+  getPersonaUsage(groupId: string): Promise<PersonaUsage[]>;
 
   /**
    * Recent agent traces for a group — for hydrating the debug panel on open.

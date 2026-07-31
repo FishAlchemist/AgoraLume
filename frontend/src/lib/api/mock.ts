@@ -15,6 +15,7 @@ import type {
   DebugUsage,
   HistoryWindow,
   MessageHandler,
+  PersonaUsage,
   ReadHandler,
   ServerMeta,
   SuggestionsHandler,
@@ -156,6 +157,18 @@ export class MockChatApi implements ChatApi {
 
   async getGroupUsage(): Promise<DebugUsage> {
     return this.getUsage();
+  }
+
+  // Same reasoning as getUsage: no LLM calls means zero usage for every AI
+  // member, not an empty list — the panel still shows the group's roster.
+  async getPersonaUsage(groupId: string): Promise<PersonaUsage[]> {
+    const state = useWorkspace.getState();
+    const group = state.groups.find((g) => g.id === groupId);
+    const aiIds = (group?.personaIds ?? []).filter(
+      (id) => state.personas.find((p) => p.id === id)?.kind === 'ai',
+    );
+    const usage = await this.getUsage();
+    return aiIds.map((personaId) => ({ personaId, usage }));
   }
 
   async listTraces(): Promise<AgentTrace[]> {

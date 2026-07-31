@@ -106,6 +106,12 @@ struct DebugState {
     /// ([`DEBUG_TRACE_CAP`]) and cheap-to-lose, while a group's lifetime spend
     /// must not shrink when its old traces fall off the ring.
     group_models: HashMap<String, HashMap<String, ModelTotals>>,
+    /// The same breakdown again, scoped to one persona *within* one group — a
+    /// further slice of `group_models`, letting the debug panel show which
+    /// character in a group is driving the spend. Keyed `group_id ->
+    /// persona_id -> model -> totals`. Folded in `record_trace` from the same
+    /// trace as the other two maps, so all three can never drift apart.
+    persona_models: HashMap<String, HashMap<String, HashMap<String, ModelTotals>>>,
     /// Recent traces per group, oldest first, capped at [`DEBUG_TRACE_CAP`].
     traces: HashMap<String, VecDeque<AgentTrace>>,
 }
@@ -223,6 +229,10 @@ pub struct AppState {
     active_groups: Mutex<HashSet<String>>,
     /// LLM usage counters and recent traces for the debug panel.
     debug: Mutex<DebugState>,
+    /// `"{group_id}\u{1}{persona_id}"` keys already pulled from disk into
+    /// `debug.persona_models` this run — the lazy-load marker for that map,
+    /// mirroring `loaded_groups` one level down (per persona, not per group).
+    loaded_personas: Mutex<HashSet<String>>,
     /// Token pricing for the estimated-cost readout, or `None` to show tokens
     /// only. Set at startup and on every `PATCH /llm/settings` — see
     /// [`Self::set_pricing`].
@@ -292,8 +302,10 @@ impl AppState {
             debug: Mutex::new(DebugState {
                 models: usage.models,
                 group_models: HashMap::new(),
+                persona_models: HashMap::new(),
                 traces: HashMap::new(),
             }),
+            loaded_personas: Mutex::new(HashSet::new()),
             pricing: RwLock::new(None),
             llm_settings: Mutex::new(LlmSettings::default()),
             llm_store: None,
@@ -362,7 +374,8 @@ impl AppState {
     /// what new traces cost.
     pub fn record_trace(&self, group_id: &str, trace: AgentTrace) {
         self.ensure_loaded(group_id);
-        let (snapshot, group_snapshot) = {
+        self.ensure_persona_loaded(group_id, &trace.persona_id);
+        let (snapshot, group_snapshot, persona_snapshot) = {
             let mut debug = self.debug.lock().unwrap();
             let model_key = trace
                 .model
@@ -376,11 +389,28 @@ impl AppState {
                 entry.add_usage(usage, pricing.as_ref());
             }
 
-            let group_entry =
-                debug.group_models.entry(group_id.to_string()).or_default().entry(model_key).or_default();
+            let group_entry = debug
+                .group_models
+                .entry(group_id.to_string())
+                .or_default()
+                .entry(model_key.clone())
+                .or_default();
             group_entry.requests += 1;
             if let Some(usage) = &trace.usage {
                 group_entry.add_usage(usage, pricing.as_ref());
+            }
+
+            let persona_entry = debug
+                .persona_models
+                .entry(group_id.to_string())
+                .or_default()
+                .entry(trace.persona_id.clone())
+                .or_default()
+                .entry(model_key)
+                .or_default();
+            persona_entry.requests += 1;
+            if let Some(usage) = &trace.usage {
+                persona_entry.add_usage(usage, pricing.as_ref());
             }
 
             let ring = debug.traces.entry(group_id.to_string()).or_default();
@@ -395,11 +425,20 @@ impl AppState {
                 DebugTotals {
                     models: debug.group_models.get(group_id).cloned().unwrap_or_default(),
                 },
+                DebugTotals {
+                    models: debug
+                        .persona_models
+                        .get(group_id)
+                        .and_then(|personas| personas.get(&trace.persona_id))
+                        .cloned()
+                        .unwrap_or_default(),
+                },
             )
         };
         if let Some(persistence) = &self.persistence {
             persistence.save_usage(&snapshot);
             persistence.save_group_usage(group_id, &group_snapshot);
+            persistence.save_persona_usage(group_id, &trace.persona_id, &persona_snapshot);
         }
         let _ = self.channel(group_id).send(StreamEvent::Debug(trace));
     }
@@ -419,6 +458,40 @@ impl AppState {
         DebugTotals {
             models: self.debug.lock().unwrap().group_models.get(group_id).cloned().unwrap_or_default(),
         }
+    }
+
+    /// A snapshot of one persona's own cumulative usage *within* a group — a
+    /// further slice of [`Self::group_debug_totals`], for spotting which
+    /// character in a group is driving the token spend.
+    pub fn persona_debug_totals(&self, group_id: &str, persona_id: &str) -> DebugTotals {
+        self.ensure_loaded(group_id);
+        self.ensure_persona_loaded(group_id, persona_id);
+        DebugTotals {
+            models: self
+                .debug
+                .lock()
+                .unwrap()
+                .persona_models
+                .get(group_id)
+                .and_then(|personas| personas.get(persona_id))
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Every current member persona's own usage within a group, unsorted —
+    /// the full by-persona breakdown behind `GET
+    /// /groups/{id}/debug/usage/by-persona`. Scoped to the group's *current*
+    /// AI members (not every persona that ever produced a trace), matching
+    /// who the debug panel shows traces for today.
+    pub fn persona_debug_totals_all(&self, group_id: &str) -> Vec<(String, DebugTotals)> {
+        let Some((_, member_ids)) = self.workspace().turn_members(group_id) else {
+            return Vec::new();
+        };
+        member_ids
+            .iter()
+            .map(|persona_id| (persona_id.clone(), self.persona_debug_totals(group_id, persona_id)))
+            .collect()
     }
 
     /// The recent traces for a group, oldest first.
@@ -482,6 +555,33 @@ impl AppState {
                 .or_insert(totals.models);
         }
         loaded.insert(group_id.to_string());
+    }
+
+    /// Loads one persona's own usage within a group from disk the first time
+    /// it is touched (by a recorded trace, or a debug-panel request) — the
+    /// same lazy-load-on-first-touch pattern as [`Self::ensure_loaded`], one
+    /// level more specific. A no-op when persistence is off or this
+    /// `(group_id, persona_id)` pair was already pulled in this run.
+    fn ensure_persona_loaded(&self, group_id: &str, persona_id: &str) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let key = format!("{group_id}\u{1}{persona_id}");
+        let mut loaded = self.loaded_personas.lock().unwrap();
+        if loaded.contains(&key) {
+            return;
+        }
+        if let Some(totals) = persistence.load_persona_usage(group_id, persona_id) {
+            self.debug
+                .lock()
+                .unwrap()
+                .persona_models
+                .entry(group_id.to_string())
+                .or_default()
+                .entry(persona_id.to_string())
+                .or_insert(totals.models);
+        }
+        loaded.insert(key);
     }
 
     /// Persists the whole workspace after a mutation. No-op without persistence.
@@ -1159,11 +1259,16 @@ mod tests {
 
     /// A minimal trace for one group, with usage attributed to `model`.
     fn trace(group_id: &str, model: &str, prompt_tokens: u64) -> AgentTrace {
+        trace_as(group_id, "aria", model, prompt_tokens)
+    }
+
+    /// Like [`trace`], attributed to a specific persona.
+    fn trace_as(group_id: &str, persona_id: &str, model: &str, prompt_tokens: u64) -> AgentTrace {
         AgentTrace {
             ts: now_ms(),
             group_id: group_id.to_string(),
-            persona_id: "aria".to_string(),
-            persona_name: "Aria".to_string(),
+            persona_id: persona_id.to_string(),
+            persona_name: persona_id.to_string(),
             system: String::new(),
             conversation: String::new(),
             action: "read".to_string(),
@@ -1200,5 +1305,34 @@ mod tests {
 
         // A group with no traces yet reports zero, not the global total.
         assert!(state.group_debug_totals("group-c").models.is_empty());
+    }
+
+    #[test]
+    fn persona_usage_is_isolated_within_a_group_while_group_totals_sum_every_member() {
+        let state = AppState::with_runtime(AgentRuntime::mock());
+
+        // "lab" is a seeded group with aria and nox as AI members.
+        state.record_trace("lab", trace_as("lab", "aria", "gpt-4o-mini", 100));
+        state.record_trace("lab", trace_as("lab", "aria", "gpt-4o-mini", 50));
+        state.record_trace("lab", trace_as("lab", "nox", "gpt-4o-mini", 900));
+
+        let aria = state.persona_debug_totals("lab", "aria");
+        let nox = state.persona_debug_totals("lab", "nox");
+        assert_eq!(aria.models["gpt-4o-mini"].requests, 2);
+        assert_eq!(aria.models["gpt-4o-mini"].prompt_tokens, 150);
+        assert_eq!(nox.models["gpt-4o-mini"].requests, 1);
+        assert_eq!(nox.models["gpt-4o-mini"].prompt_tokens, 900);
+
+        let group = state.group_debug_totals("lab");
+        assert_eq!(group.models["gpt-4o-mini"].requests, 3, "group total sums every persona");
+
+        let all = state.persona_debug_totals_all("lab");
+        assert_eq!(all.len(), 2, "lab's two AI members, aria and nox");
+        let aria_entry = &all.iter().find(|(id, _)| id == "aria").unwrap().1;
+        assert_eq!(aria_entry.models["gpt-4o-mini"].requests, 2);
+
+        // A member persona with no traces in this group reports zero, not the
+        // group total.
+        assert!(state.persona_debug_totals("lab", "sol").models.is_empty());
     }
 }

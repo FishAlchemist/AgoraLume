@@ -7,8 +7,9 @@
 //! messages/<group_id>.json     one group's chat log (loaded lazily, saved on change)
 //! summaries/<group_id>.json    one group's compressed older history (loaded with its log)
 //! suggestions/<group_id>.json  one group's cached conversation starters (loaded with its log)
-//! usage.json                   cumulative LLM usage counters + accrued cost, across every group (loaded at startup)
-//! usage/<group_id>.json        one group's own usage counters + accrued cost (loaded with its log)
+//! usage.json                             cumulative LLM usage counters + accrued cost, across every group (loaded at startup)
+//! usage/<group_id>.json                  one group's own usage counters + accrued cost (loaded with its log)
+//! usage/<group_id>/<persona_id>.json     one persona's own usage within that group (loaded lazily, per persona)
 //! ```
 //!
 //! Splitting the message logs off the workspace means a running server only
@@ -89,6 +90,13 @@ impl Persistence {
 
     fn group_usage_path(&self, group_id: &str) -> PathBuf {
         self.dir.join("usage").join(format!("{}.json", sanitize(group_id)))
+    }
+
+    fn persona_usage_path(&self, group_id: &str, persona_id: &str) -> PathBuf {
+        self.dir
+            .join("usage")
+            .join(sanitize(group_id))
+            .join(format!("{}.json", sanitize(persona_id)))
     }
 
     /// Loads the persisted workspace, or `None` when there is no saved file yet
@@ -295,6 +303,40 @@ impl Persistence {
             tracing::warn!(group = %group_id, error = %e, "failed to persist per-group usage totals");
         }
     }
+
+    /// Loads one persona's own cumulative usage within a group — a further
+    /// slice of [`Self::load_group_usage`]. `None` when that persona has
+    /// recorded no traces in this group yet, or its file is
+    /// unreadable/corrupt, in which case the caller starts that persona's
+    /// counters at zero.
+    pub fn load_persona_usage(&self, group_id: &str, persona_id: &str) -> Option<DebugTotals> {
+        let path = self.persona_usage_path(group_id, persona_id);
+        let bytes = std::fs::read(&path).ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(totals) => Some(totals),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ignoring corrupt per-persona usage totals; starting the persona's counters at zero"
+                );
+                None
+            }
+        }
+    }
+
+    /// Writes one persona's own usage counters and accrued cost out. Called
+    /// after every recorded trace; failures are logged, not fatal.
+    pub fn save_persona_usage(&self, group_id: &str, persona_id: &str, totals: &DebugTotals) {
+        if let Err(e) = write_atomic(&self.persona_usage_path(group_id, persona_id), totals) {
+            tracing::warn!(
+                group = %group_id,
+                persona = %persona_id,
+                error = %e,
+                "failed to persist per-persona usage totals"
+            );
+        }
+    }
 }
 
 /// Serializes `value` as pretty JSON and writes it atomically: a sibling temp
@@ -432,6 +474,43 @@ mod tests {
         std::fs::write(path, b"not json").unwrap();
 
         assert!(store.load_group_usage("g1").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persona_usage_round_trips_independently_per_persona() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+
+        assert!(store.load_persona_usage("g1", "aria").is_none(), "nothing saved yet");
+
+        let mut aria = DebugTotals::default();
+        aria.models.insert("gpt-4o-mini".to_string(), ModelTotals { requests: 4, ..Default::default() });
+        let mut nox = DebugTotals::default();
+        nox.models.insert("gpt-4o-mini".to_string(), ModelTotals { requests: 1, ..Default::default() });
+
+        store.save_persona_usage("g1", "aria", &aria);
+        store.save_persona_usage("g1", "nox", &nox);
+        // Same persona id, different group: must not collide with "g1"/"aria".
+        store.save_persona_usage("g2", "aria", &DebugTotals::default());
+
+        assert_eq!(store.load_persona_usage("g1", "aria").unwrap().models["gpt-4o-mini"].requests, 4);
+        assert_eq!(store.load_persona_usage("g1", "nox").unwrap().models["gpt-4o-mini"].requests, 1);
+        assert!(store.load_persona_usage("g2", "aria").unwrap().models.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_persona_usage_file_is_ignored_not_fatal() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+        let path = store.persona_usage_path("g1", "aria");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"not json").unwrap();
+
+        assert!(store.load_persona_usage("g1", "aria").is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }

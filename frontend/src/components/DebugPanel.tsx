@@ -1,5 +1,6 @@
 import {
   Accordion,
+  ActionIcon,
   Badge,
   Code,
   Divider,
@@ -10,16 +11,19 @@ import {
   Text,
   Tooltip,
 } from '@mantine/core';
+import { IconDownload } from '@tabler/icons-react';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
-import type { AgentTrace, DebugUsage } from '../lib/api/types';
+import type { AgentTrace, DebugUsage, PersonaUsage } from '../lib/api/types';
 import { workspaceClient } from '../lib/api/workspace';
 import { useBackendStatus } from '../lib/useBackendStatus';
 import { useConnection } from '../store/connection';
 import type { Persona } from '../types';
 import { CopyIconButton } from './CopyIconButton';
 import { UsageSummary } from './UsageSummary';
+
+const fmt = (n: number) => n.toLocaleString();
 
 interface Props {
   groupId: string;
@@ -40,6 +44,7 @@ export function DebugPanel({ groupId, personas }: Props) {
   const backendUrl = useConnection((s) => s.backendUrl);
   const status = useBackendStatus();
   const [usage, setUsage] = useState<DebugUsage | null>(null);
+  const [personaUsage, setPersonaUsage] = useState<PersonaUsage[]>([]);
   // Persona identity-hash → git-tag-style name, so a trace shows "溫柔版" rather
   // than a raw hash. Fetched once per backend bind; labels change rarely.
   const [labels, setLabels] = useState<Record<string, string>>({});
@@ -53,6 +58,7 @@ export function DebugPanel({ groupId, personas }: Props) {
   useEffect(() => {
     let active = true;
     setUsage(null);
+    setPersonaUsage([]);
     setLabels({});
     setEntries([]);
     nextId.current = 0;
@@ -60,6 +66,9 @@ export function DebugPanel({ groupId, personas }: Props) {
     const loadUsage = () => {
       void api.getGroupUsage(groupId).then((u) => {
         if (active) setUsage(u);
+      });
+      void api.getPersonaUsage(groupId).then((list) => {
+        if (active) setPersonaUsage(list);
       });
     };
     loadUsage();
@@ -92,20 +101,71 @@ export function DebugPanel({ groupId, personas }: Props) {
     };
   }, [groupId, backendUrl]);
 
+  // Downloads the currently loaded traces (capped server-side, newest window
+  // only) as a JSON file — a snapshot for offline inspection or sharing, not a
+  // full-history export.
+  const exportTraces = () => {
+    const blob = new Blob(
+      [
+        JSON.stringify(
+          entries.map((e) => e.trace),
+          null,
+          2,
+        ),
+      ],
+      { type: 'application/json' },
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `agoralume-debug-${groupId}-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Only members with at least one recorded inference — a group that hasn't
+  // run a turn yet shouldn't show every member at a flat zero.
+  const activePersonaUsage = personaUsage.filter((entry) => entry.usage.requests > 0);
+
   return (
     <Paper withBorder radius="md" p="sm" m="md" mb={0}>
       <Stack gap="xs">
         <UsageSummary usage={usage} mock={status.mock} title={t('debug.groupUsage')} />
 
+        {activePersonaUsage.length > 0 && (
+          <Stack gap={4}>
+            <Text size="xs" fw={600} c="dimmed">
+              {t('debug.byPersona')}
+            </Text>
+            {activePersonaUsage.map((entry) => (
+              <PersonaUsageRow key={entry.personaId} entry={entry} personas={personas} />
+            ))}
+          </Stack>
+        )}
+
         <Divider />
 
-        <Group gap={6} align="baseline">
-          <Text fw={700} size="sm">
-            {t('debug.traces')}
-          </Text>
-          <Text size="xs" c="dimmed">
-            {t('debug.tracesHint')}
-          </Text>
+        <Group gap={6} align="baseline" justify="space-between" wrap="nowrap">
+          <Group gap={6} align="baseline">
+            <Text fw={700} size="sm">
+              {t('debug.traces')}
+            </Text>
+            <Text size="xs" c="dimmed">
+              {t('debug.tracesHint')}
+            </Text>
+          </Group>
+          {entries.length > 0 && (
+            <Tooltip label={t('debug.exportTitle')} withArrow>
+              <ActionIcon
+                variant="subtle"
+                color="gray"
+                onClick={exportTraces}
+                aria-label={t('debug.export')}
+              >
+                <IconDownload size={16} />
+              </ActionIcon>
+            </Tooltip>
+          )}
         </Group>
 
         {entries.length === 0 ? (
@@ -129,6 +189,35 @@ export function DebugPanel({ groupId, personas }: Props) {
         )}
       </Stack>
     </Paper>
+  );
+}
+
+/** One character's row in the by-persona usage breakdown. */
+function PersonaUsageRow({
+  entry,
+  personas,
+}: {
+  entry: PersonaUsage;
+  personas: Map<string, Persona>;
+}) {
+  const persona = personas.get(entry.personaId);
+  const name = persona?.name ?? entry.personaId;
+  const cost = entry.usage.estimatedCost;
+  return (
+    <Group gap="xs" wrap="nowrap" justify="space-between">
+      <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+        <Text size="xs" fw={600} truncate>
+          {name}
+        </Text>
+        <Text size="xs" c="dimmed" ff="monospace" truncate>
+          {fmt(entry.usage.requests)}× · {fmt(entry.usage.promptTokens)}→
+          {fmt(entry.usage.completionTokens)}
+        </Text>
+      </Group>
+      <Text size="xs" c="dimmed" ff="monospace">
+        {cost ? `${cost.total.toFixed(4)} ${cost.currency}` : '—'}
+      </Text>
+    </Group>
   );
 }
 
@@ -163,7 +252,8 @@ function TraceItem({
           </Badge>
           {trace.usage && (
             <Text size="xs" c="dimmed" ff="monospace">
-              {trace.usage.promptTokens}→{trace.usage.completionTokens}
+              {t('debug.inputTokens')} {fmt(trace.usage.promptTokens)} → {t('debug.outputTokens')}{' '}
+              {fmt(trace.usage.completionTokens)}
             </Text>
           )}
         </Group>

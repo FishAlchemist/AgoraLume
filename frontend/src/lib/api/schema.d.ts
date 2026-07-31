@@ -52,9 +52,22 @@ export interface paths {
      * One group's own cumulative LLM usage — independent of every other group's,
      * unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
      * every group's usage (plus any spend from groups since deleted); this is one
-     * group's own slice of it.
+     * group's own slice of it. 404s for an unknown group, matching every other
+     * `/groups/{id}/...` handler — [`group_debug_usage_by_persona`] needs the
+     * workspace to know the group's current members, so the two must agree on
+     * what "unknown group" means rather than one 200-with-zeros and the other
+     * silently returning nothing.
      */
     get: operations["group_debug_usage"];
+  };
+  "/groups/{id}/debug/usage/by-persona": {
+    /**
+     * A group's usage broken down by persona — which character is driving the
+     * spend, within that group's own total from [`group_debug_usage`]. Covers
+     * the group's current AI members; sorted by total tokens descending, like
+     * the per-model breakdown inside each [`DebugUsage`].
+     */
+    get: operations["group_debug_usage_by_persona"];
   };
   "/groups/{id}/events": {
     /**
@@ -613,6 +626,15 @@ export interface components {
      */
     PersonaKind: "user" | "ai";
     /**
+     * @description One persona's own slice of a group's usage — a further breakdown of that
+     * group's [`DebugUsage`] by which character is driving the spend. `GET
+     * /groups/{id}/debug/usage/by-persona`.
+     */
+    PersonaUsage: {
+      personaId: string;
+      usage: components["schemas"]["DebugUsage"];
+    };
+    /**
      * @description Token pricing used to turn usage into an estimated cost. Rates are per
      * 1,000,000 tokens, in `currency`. A rough operator-supplied estimate — models
      * and providers differ — so the UI always labels the result "for reference".
@@ -997,7 +1019,11 @@ export interface operations {
    * One group's own cumulative LLM usage — independent of every other group's,
    * unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
    * every group's usage (plus any spend from groups since deleted); this is one
-   * group's own slice of it.
+   * group's own slice of it. 404s for an unknown group, matching every other
+   * `/groups/{id}/...` handler — [`group_debug_usage_by_persona`] needs the
+   * workspace to know the group's current members, so the two must agree on
+   * what "unknown group" means rather than one 200-with-zeros and the other
+   * silently returning nothing.
    */
   group_debug_usage: {
     parameters: {
@@ -1012,6 +1038,36 @@ export interface operations {
         content: {
           "application/json": components["schemas"]["DebugUsage"];
         };
+      };
+      /** @description Unknown group */
+      404: {
+        content: never;
+      };
+    };
+  };
+  /**
+   * A group's usage broken down by persona — which character is driving the
+   * spend, within that group's own total from [`group_debug_usage`]. Covers
+   * the group's current AI members; sorted by total tokens descending, like
+   * the per-model breakdown inside each [`DebugUsage`].
+   */
+  group_debug_usage_by_persona: {
+    parameters: {
+      path: {
+        /** @description Group id */
+        id: string;
+      };
+    };
+    responses: {
+      /** @description That group's usage, one entry per current AI member */
+      200: {
+        content: {
+          "application/json": components["schemas"]["PersonaUsage"][];
+        };
+      };
+      /** @description Unknown group */
+      404: {
+        content: never;
       };
     };
   };

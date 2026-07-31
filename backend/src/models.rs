@@ -571,6 +571,16 @@ pub struct DebugUsage {
     pub models: Vec<ModelUsage>,
 }
 
+/// One persona's own slice of a group's usage — a further breakdown of that
+/// group's [`DebugUsage`] by which character is driving the spend. `GET
+/// /groups/{id}/debug/usage/by-persona`.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonaUsage {
+    pub persona_id: String,
+    pub usage: DebugUsage,
+}
+
 /// The `GET`/`PATCH /llm/settings` response: the live LLM provider
 /// configuration, with the API key stripped to a presence flag. Built by hand
 /// from [`crate::llm_config::LlmSettings`] (never derived by serializing it
