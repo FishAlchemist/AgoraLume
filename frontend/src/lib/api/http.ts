@@ -1,5 +1,6 @@
 import type { GroupSuggestions, Message, Turn } from '../../types';
-import { versionedBase } from './version';
+import { authFetch } from './authFetch';
+import { FetchEventStream } from './eventStream';
 import type {
   ActivityHandler,
   AgentTrace,
@@ -15,6 +16,7 @@ import type {
   SuggestionsHandler,
   TurnHandler,
 } from './types';
+import { versionedBase } from './version';
 
 /** Parses an SSE frame's JSON payload, yielding null on malformed data. */
 function parseFrame<T>(data: string): T | null {
@@ -26,11 +28,48 @@ function parseFrame<T>(data: string): T | null {
 }
 
 /**
+ * Per-event-name frame handling, keyed the same way the backend names its SSE
+ * events. Each entry parses its payload and fans it out to that event kind's
+ * subscribers on the given stream.
+ */
+const FRAME_HANDLERS: Record<string, (stream: GroupStream, data: string) => void> = {
+  message: (stream, data) => {
+    const parsed = parseFrame<Message>(data);
+    if (parsed) for (const h of stream.message) h(parsed);
+  },
+  read: (stream, data) => {
+    const parsed = parseFrame<ReadReceipt>(data);
+    if (parsed) for (const h of stream.read) h(parsed);
+  },
+  activity: (stream, data) => {
+    const parsed = parseFrame<{ active: boolean }>(data);
+    if (parsed) for (const h of stream.activity) h(parsed.active);
+  },
+  turn: (stream, data) => {
+    const parsed = parseFrame<Turn>(data);
+    if (parsed) for (const h of stream.turn) h(parsed);
+  },
+  debug: (stream, data) => {
+    const parsed = parseFrame<AgentTrace>(data);
+    if (parsed) for (const h of stream.debug) h(parsed);
+  },
+  suggestions: (stream, data) => {
+    const parsed = parseFrame<GroupSuggestions>(data);
+    if (parsed) for (const h of stream.suggestions) h(parsed);
+  },
+};
+
+/** Routes one parsed SSE frame to its event kind's handler, if recognized. */
+function dispatchFrame(stream: GroupStream, eventName: string, data: string): void {
+  FRAME_HANDLERS[eventName]?.(stream, data);
+}
+
+/**
  * The set of live subscribers on one group's SSE connection, split by event
  * kind. The connection stays open while any set is non-empty.
  */
 interface GroupStream {
-  source: EventSource;
+  source: FetchEventStream;
   message: Set<MessageHandler>;
   read: Set<ReadHandler>;
   activity: Set<ActivityHandler>;
@@ -108,50 +147,30 @@ class SharedStreams {
       return existing;
     }
 
-    const source = new EventSource(`${this.baseUrl}/groups/${groupId}/stream`);
-    const stream: GroupStream = {
-      source,
-      message: new Set(),
-      read: new Set(),
-      activity: new Set(),
-      turn: new Set(),
-      debug: new Set(),
-      suggestions: new Set(),
-    };
+    // `source` is assigned right below — the dispatcher and onOpen callbacks
+    // close over `stream` itself, so the object has to exist first.
+    const stream = {
+      message: new Set<MessageHandler>(),
+      read: new Set<ReadHandler>(),
+      activity: new Set<ActivityHandler>(),
+      turn: new Set<TurnHandler>(),
+      debug: new Set<DebugHandler>(),
+      suggestions: new Set<SuggestionsHandler>(),
+    } as GroupStream;
     // The default (unnamed) event carries a Message; the rest are named events.
-    source.addEventListener('message', (e: MessageEvent<string>) => {
-      const data = parseFrame<Message>(e.data);
-      if (data) for (const h of stream.message) h(data);
-    });
-    source.addEventListener('read', (e: MessageEvent<string>) => {
-      const data = parseFrame<ReadReceipt>(e.data);
-      if (data) for (const h of stream.read) h(data);
-    });
-    source.addEventListener('activity', (e: MessageEvent<string>) => {
-      const data = parseFrame<{ active: boolean }>(e.data);
-      if (data) for (const h of stream.activity) h(data.active);
-    });
-    source.addEventListener('turn', (e: MessageEvent<string>) => {
-      const data = parseFrame<Turn>(e.data);
-      if (data) for (const h of stream.turn) h(data);
-    });
-    source.addEventListener('debug', (e: MessageEvent<string>) => {
-      const data = parseFrame<AgentTrace>(e.data);
-      if (data) for (const h of stream.debug) h(data);
-    });
-    source.addEventListener('suggestions', (e: MessageEvent<string>) => {
-      const data = parseFrame<GroupSuggestions>(e.data);
-      if (data) for (const h of stream.suggestions) h(data);
-    });
-    source.onopen = () => {
-      // The first `open` is the initial connect — the caller (ChatView's effect)
-      // has already loaded history, so nothing to do. Every later `open` is a
-      // reconnect after a drop, common through a tunnel, and the stream missed
-      // whatever was broadcast while it was down (the channel keeps no backlog).
-      // Reconcile so the UI heals on its own instead of needing a page refresh.
-      if (stream.connected) this.resync(groupId, stream);
-      else stream.connected = true;
-    };
+    stream.source = new FetchEventStream(
+      `${this.baseUrl}/groups/${groupId}/stream`,
+      (eventName, data) => dispatchFrame(stream, eventName, data),
+      () => {
+        // The first `open` is the initial connect — the caller (ChatView's effect)
+        // has already loaded history, so nothing to do. Every later `open` is a
+        // reconnect after a drop, common through a tunnel, and the stream missed
+        // whatever was broadcast while it was down (the channel keeps no backlog).
+        // Reconcile so the UI heals on its own instead of needing a page refresh.
+        if (stream.connected) this.resync(groupId, stream);
+        else stream.connected = true;
+      },
+    );
     this.byGroup.set(groupId, stream);
     return stream;
   }
@@ -164,7 +183,7 @@ class SharedStreams {
    * waits for the next reconnect.
    */
   private resync(groupId: string, stream: GroupStream): void {
-    void fetch(`${this.baseUrl}/groups/${groupId}/messages`, {
+    void authFetch(`${this.baseUrl}/groups/${groupId}/messages`, {
       headers: { Accept: 'application/json' },
     })
       .then((res) => (res.ok ? (res.json() as Promise<Message[]>) : null))
@@ -224,7 +243,7 @@ export class HttpChatApi implements ChatApi {
   }
 
   private async getJson<T>(path: string): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await authFetch(`${this.baseUrl}${path}`, {
       headers: { Accept: 'application/json' },
     });
     if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
@@ -253,7 +272,7 @@ export class HttpChatApi implements ChatApi {
   }
 
   async sendMessage(groupId: string, text: string, personaId?: string): Promise<Message> {
-    const res = await fetch(`${this.baseUrl}/groups/${groupId}/messages`, {
+    const res = await authFetch(`${this.baseUrl}/groups/${groupId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, personaId }),
@@ -263,7 +282,7 @@ export class HttpChatApi implements ChatApi {
   }
 
   async retry(groupId: string): Promise<void> {
-    const res = await fetch(`${this.baseUrl}/groups/${groupId}/retry`, { method: 'POST' });
+    const res = await authFetch(`${this.baseUrl}/groups/${groupId}/retry`, { method: 'POST' });
     if (!res.ok) throw new Error(`retry failed: ${res.status}`);
   }
 
@@ -312,7 +331,7 @@ export class HttpChatApi implements ChatApi {
   }
 
   async regenerateSuggestions(groupId: string): Promise<void> {
-    const res = await fetch(`${this.baseUrl}/groups/${groupId}/suggestions/regenerate`, {
+    const res = await authFetch(`${this.baseUrl}/groups/${groupId}/suggestions/regenerate`, {
       method: 'POST',
     });
     if (!res.ok) throw new Error(`regenerateSuggestions failed: ${res.status}`);

@@ -49,7 +49,7 @@ export class MockChatApi implements ChatApi {
 
   async probe(): Promise<ServerMeta> {
     // The mock runs entirely in-browser — always reachable, always mock mode.
-    return { mock: true, llm: false, persistent: false };
+    return { mock: true, llm: false, persistent: false, authRequired: false };
   }
 
   async listMessages(groupId: string, opts?: HistoryWindow): Promise<Message[]> {

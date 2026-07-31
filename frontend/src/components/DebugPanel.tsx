@@ -20,6 +20,7 @@ import { api } from '../lib/api';
 import type { AgentTrace, DebugUsage, PersonaUsage } from '../lib/api/types';
 import { workspaceClient } from '../lib/api/workspace';
 import { useBackendStatus } from '../lib/useBackendStatus';
+import { useIsGuestFallback } from '../store/backendStatus';
 import { useConnection } from '../store/connection';
 import type { Persona } from '../types';
 import { CopyIconButton } from './CopyIconButton';
@@ -74,6 +75,7 @@ export function DebugPanel({ groupId, personas, onCollapse }: Props) {
   const { t } = useTranslation();
   const backendUrl = useConnection((s) => s.backendUrl);
   const status = useBackendStatus();
+  const isGuestFallback = useIsGuestFallback();
   const [usage, setUsage] = useState<DebugUsage | null>(null);
   const [personaUsage, setPersonaUsage] = useState<PersonaUsage[]>([]);
   // Persona identity-hash → git-tag-style name, so a trace shows "溫柔版" rather
@@ -87,6 +89,7 @@ export function DebugPanel({ groupId, personas, onCollapse }: Props) {
   // Refetch the totals on each new trace, coalescing bursts into one request.
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: isGuestFallback is an intentional trigger — a flip rebinds subscriptions to whichever data source `api` currently routes to.
   useEffect(() => {
     let active = true;
     setUsage(null);
@@ -132,7 +135,7 @@ export function DebugPanel({ groupId, personas, onCollapse }: Props) {
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
       unsubscribe();
     };
-  }, [groupId, backendUrl]);
+  }, [groupId, backendUrl, isGuestFallback]);
 
   // Downloads the currently loaded traces (capped server-side, newest window
   // only) as a JSON file — a snapshot for offline inspection or sharing, not a

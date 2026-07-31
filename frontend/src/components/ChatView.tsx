@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
 import { INITIAL_PAGE_CAP } from '../lib/api/types';
 import { useChatReadTracking } from '../lib/useChatReadTracking';
+import { useIsGuestFallback } from '../store/backendStatus';
 import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
 import { useReadState } from '../store/readState';
@@ -149,6 +150,7 @@ export function ChatView({ group, personas }: Props) {
   const readOnly = useReadOnly((s) => s.readOnly);
   // Re-bind history + streams when the active data source changes.
   const backendUrl = useConnection((s) => s.backendUrl);
+  const isGuestFallback = useIsGuestFallback();
 
   // Fall back to any user identity so a group without an explicit self still works.
   const selfId = group.selfPersonaId || [...personas.values()].find((p) => p.kind === 'user')?.id;
@@ -326,7 +328,7 @@ export function ChatView({ group, personas }: Props) {
     });
   }, [suggestions, group.id, finishRegen]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: backendUrl is an intentional trigger — a change re-runs this so history and subscriptions rebind to the newly selected data source.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: backendUrl and isGuestFallback are intentional triggers — a change re-runs this so history and subscriptions rebind to the newly selected data source (connecting to a different backend, or the guest/session state flipping which one `api` actually routes to).
   useEffect(() => {
     let active = true;
     setMessages(null);
@@ -400,7 +402,7 @@ export function ChatView({ group, personas }: Props) {
       unsubscribeSuggestions();
       finishRegen();
     };
-  }, [group.id, backendUrl]);
+  }, [group.id, backendUrl, isGuestFallback]);
 
   // When a turn ends (busy → idle) the conversation has advanced, so the openers
   // are stale. Re-fetch to nudge the backend into regenerating for the new state;

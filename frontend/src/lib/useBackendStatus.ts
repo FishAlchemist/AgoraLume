@@ -1,45 +1,32 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
+import { type BackendStatus, useBackendStatusStore } from '../store/backendStatus';
 import { useConnection } from '../store/connection';
 import { useWorkspace } from '../store/workspace';
 import { api } from './api';
 
-/**
- * Reachability of the data source, kept separate from its *mode*:
- * - `local`    — the in-browser mock (no server; nothing to reach)
- * - `checking` — a backend is configured, first probe in flight
- * - `online`   — the backend answered
- * - `offline`  — the backend is unreachable
- */
-export type Reachability = 'local' | 'checking' | 'online' | 'offline';
-
-export interface BackendStatus {
-  reachable: Reachability;
-  /**
-   * Mock = no LLM and no persistence (pure in-memory). True for the in-browser
-   * mock and for a backend running in mock mode; independent of reachability.
-   * Undefined while `checking`/`offline` (mode unknown).
-   */
-  mock?: boolean;
-}
+export type { BackendStatus, Reachability } from '../store/backendStatus';
 
 /**
  * Polls the configured backend's `/meta` for liveness + mode, re-checking
- * whenever the configured backend changes. In-browser mock mode makes no
+ * whenever the configured backend changes, and writes the result into the
+ * shared `useBackendStatusStore` (read outside React too — see
+ * `store/backendStatus`'s `isGuestFallback`). In-browser mock mode makes no
  * network calls: it reports `local` / `mock` immediately. A backend that only
  * comes up later flips from `offline` to `online` on the next poll.
  */
 export function useBackendStatus(intervalMs = 10_000): BackendStatus {
   const backendUrl = useConnection((s) => s.backendUrl);
-  const [status, setStatus] = useState<BackendStatus>(
-    backendUrl ? { reachable: 'checking' } : { reachable: 'local', mock: true },
-  );
 
   useEffect(() => {
     if (!backendUrl) {
-      setStatus({ reachable: 'local', mock: true });
+      useBackendStatusStore.setState({ reachable: 'local', mock: true, authRequired: false });
       return;
     }
-    setStatus({ reachable: 'checking' });
+    useBackendStatusStore.setState({
+      reachable: 'checking',
+      mock: undefined,
+      authRequired: undefined,
+    });
     let active = true;
     // Track reachability across polls so we can re-pull the workspace on the
     // rising edge — a backend that only comes up *after* we connected wasn't
@@ -52,10 +39,14 @@ export function useBackendStatus(intervalMs = 10_000): BackendStatus {
       if (meta) {
         if (wasOffline) void useWorkspace.getState().hydrate();
         wasOffline = false;
-        setStatus({ reachable: 'online', mock: meta.mock });
+        useBackendStatusStore.setState({
+          reachable: 'online',
+          mock: meta.mock,
+          authRequired: meta.authRequired,
+        });
       } else {
         wasOffline = true;
-        setStatus({ reachable: 'offline' });
+        useBackendStatusStore.setState({ reachable: 'offline' });
       }
     };
 
@@ -67,5 +58,5 @@ export function useBackendStatus(intervalMs = 10_000): BackendStatus {
     };
   }, [backendUrl, intervalMs]);
 
-  return status;
+  return useBackendStatusStore();
 }

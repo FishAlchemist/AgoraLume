@@ -3,6 +3,8 @@ import { type WorkspaceSnapshot, workspaceClient } from '../lib/api/workspace';
 import type { GroupBundle, PersonaBundle } from '../lib/transfer';
 import type { Department, Group, Organization, Persona, Settings } from '../types';
 import { DEFAULT_USER_PERSONA_ID } from '../types';
+import { useAuth } from './auth';
+import { isGuestFallback, useBackendStatusStore } from './backendStatus';
 import { useConnection } from './connection';
 
 const uid = () =>
@@ -208,10 +210,27 @@ function saveMock(data: WorkspaceData): void {
 
 // --- Backend routing --------------------------------------------------------
 
-/** The workspace client for the active backend, or `null` in mock mode. */
+/**
+ * The workspace client for the active backend, or `null` when the app should
+ * show placeholder data instead — no backend configured, or one is but
+ * there's no session for it yet (see `isGuestFallback`).
+ */
 function backend() {
   const url = useConnection.getState().backendUrl;
-  return url ? workspaceClient(url) : null;
+  return url && !isGuestFallback() ? workspaceClient(url) : null;
+}
+
+/**
+ * What to show instead of the real SSOT when `backend()` is null. A
+ * configured-but-unauthenticated backend gets the shared seed — the same
+ * content a fresh install of *that* backend actually has (see `seedData`),
+ * not some unrelated sandbox — since a guest can't see the real account's
+ * data anyway and showing them a stand-in for their own past local edits
+ * would be a non sequitur. Only the true no-backend case (nothing to ever log
+ * into) gets the persisted offline sandbox.
+ */
+function offlineData(): WorkspaceData {
+  return useConnection.getState().backendUrl ? seedData() : loadMock();
 }
 
 export const useWorkspace = create<WorkspaceState>()((set, get) => {
@@ -222,10 +241,11 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
   };
 
   return {
-    // Backend mode starts from the shared seed (identical to the backend's own
-    // seed, so there's no visible flash) and is replaced by hydrate(); mock mode
-    // loads the persisted offline copy.
-    ...(backend() ? seedData() : loadMock()),
+    // A configured backend (whether about to hydrate, or a guest still
+    // waiting on a session) starts from the shared seed — identical to the
+    // backend's own, so there's no visible flash; no backend at all loads the
+    // persisted offline sandbox. See `offlineData`.
+    ...(backend() ? seedData() : offlineData()),
 
     addOrganization: (input) => {
       const org: Organization = { ...input, id: uid() };
@@ -438,7 +458,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
 
     hydrate: async () => {
       const url = useConnection.getState().backendUrl;
-      if (!url) return;
+      if (!url || isGuestFallback()) return;
       try {
         const snap: WorkspaceSnapshot = await workspaceClient(url).fetchAll();
         // Ignore a stale response if the source changed while we were fetching.
@@ -452,8 +472,10 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
   };
 });
 
-// Persist the offline workspace, and only the offline one: while a backend is
-// connected the store mirrors the SSOT and must not overwrite the mock copy.
+// Persist the offline sandbox, and only that sandbox: a guest's session on
+// a real backend shows the shared seed (see `offlineData`) but never saves
+// it here — that key is the no-backend-at-all dev sandbox specifically, not
+// a place for ephemeral guest edits to end up.
 useWorkspace.subscribe((state) => {
   if (!useConnection.getState().backendUrl) {
     saveMock({
@@ -466,18 +488,31 @@ useWorkspace.subscribe((state) => {
   }
 });
 
-// React to data-source switches: pull the SSOT when connecting to a backend,
-// restore the offline copy when going back to the mock.
-useConnection.subscribe((conn, prev) => {
-  if (conn.backendUrl === prev.backendUrl) return;
-  if (conn.backendUrl) {
+// React to anything that changes which data source is live — connecting to a
+// different backend, logging in or out, or learning whether login is even
+// required — by pulling the SSOT once it becomes reachable and restoring the
+// offline copy once it stops being. `backend()` already makes exactly this
+// call; only act when it actually flips, so an unrelated store update (e.g.
+// editing a setting) doesn't re-trigger a hydrate.
+let wasBackendRoute = !!backend();
+
+function syncWorkspaceToDataSource() {
+  const isBackendRoute = !!backend();
+  if (isBackendRoute === wasBackendRoute) return;
+  wasBackendRoute = isBackendRoute;
+  if (isBackendRoute) {
     void useWorkspace.getState().hydrate();
   } else {
-    useWorkspace.setState(loadMock());
+    useWorkspace.setState(offlineData());
   }
-});
+}
 
-// On startup with a backend already configured, pull the SSOT once.
-if (useConnection.getState().backendUrl) {
+useConnection.subscribe(syncWorkspaceToDataSource);
+useAuth.subscribe(syncWorkspaceToDataSource);
+useBackendStatusStore.subscribe(syncWorkspaceToDataSource);
+
+// On startup already routed to a backend (e.g. a returning session with a
+// still-valid token), pull the SSOT once.
+if (wasBackendRoute) {
   void useWorkspace.getState().hydrate();
 }

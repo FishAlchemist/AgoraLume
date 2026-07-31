@@ -20,6 +20,18 @@ export const zhHant: TranslationSchema = {
     offlineHint: '無法連上後端——請確認它正在執行',
     live: '上線',
     liveHint: '已連上具備 LLM 的後端',
+    guestDemo: '訪客體驗',
+    guestDemoHint:
+      '後端其實是活的、也連得上，只是你還沒登入——目前看到的是它的預設示範內容，不是任何帳號的真實資料。登入後即可查看你自己的資料。',
+  },
+  auth: {
+    title: '登入',
+    username: '帳號',
+    password: '密碼',
+    signIn: '登入',
+    signingIn: '登入中…',
+    signOut: '登出',
+    invalidCredentials: '帳號或密碼錯誤',
   },
   common: {
     save: '儲存',

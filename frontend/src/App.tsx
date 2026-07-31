@@ -10,6 +10,7 @@ import { HeaderControls } from './components/HeaderControls';
 import { MemoryDrawer } from './components/MemoryDrawer';
 import { PersonaCard } from './components/PersonaCard';
 import { PersonaFormModal } from './components/PersonaFormModal';
+import { LoginPage } from './pages/LoginPage';
 import { useUi } from './store/ui';
 import { useWorkspace } from './store/workspace';
 
@@ -36,7 +37,32 @@ export function App() {
   return (
     <HashRouter>
       <Shell />
+      <LoginOverlay />
     </HashRouter>
+  );
+}
+
+/**
+ * The login screen, shown over the shell rather than in place of it — a
+ * connected backend that requires auth still renders the shell against the
+ * in-browser demo (see `isGuestFallback`) rather than being blocked outright,
+ * and logging in is something the user opts into (see the header's sign-in
+ * button) instead of a wall between them and the app. The shell stays
+ * mounted underneath so its `uiLanguage` effect keeps driving `i18n` even
+ * while this is open.
+ */
+function LoginOverlay() {
+  const loginOpen = useUi((s) => s.loginOpen);
+  if (!loginOpen) return null;
+  return (
+    // Above the shell's own chrome (AppShell's header/navbar sit at Mantine's
+    // `--mantine-z-index-app`, 100) but below Mantine's popover tier (300) —
+    // LoginPage's own language menu and tooltips are Mantine popovers,
+    // portaled to <body> at that tier, and must render above this backdrop,
+    // not behind it.
+    <div style={{ position: 'fixed', inset: 0, zIndex: 150 }}>
+      <LoginPage />
+    </div>
   );
 }
 

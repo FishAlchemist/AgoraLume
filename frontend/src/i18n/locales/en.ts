@@ -18,6 +18,18 @@ export const en = {
     offlineHint: 'Backend unreachable — check it is running',
     live: 'live',
     liveHint: 'Connected to a live LLM backend',
+    guestDemo: 'guest demo',
+    guestDemoHint:
+      "The backend is live and reachable, but you're not signed in — you're viewing its default demo content, not any account's real data. Sign in to see yours.",
+  },
+  auth: {
+    title: 'Sign in',
+    username: 'Username',
+    password: 'Password',
+    signIn: 'Sign in',
+    signingIn: 'Signing in…',
+    signOut: 'Sign out',
+    invalidCredentials: 'Invalid username or password',
   },
   common: {
     save: 'Save',

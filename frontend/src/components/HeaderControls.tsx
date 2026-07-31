@@ -1,17 +1,33 @@
 import { ActionIcon, Badge, Group, Menu, Tooltip, useMantineColorScheme } from '@mantine/core';
-import { IconEye, IconLanguage, IconMoon, IconSun } from '@tabler/icons-react';
+import {
+  IconEye,
+  IconLanguage,
+  IconLogin,
+  IconLogout,
+  IconMoon,
+  IconSun,
+} from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
 import { UI_LANGUAGES } from '../i18n';
+import { useAuth } from '../store/auth';
+import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
+import { useUi } from '../store/ui';
 import { useWorkspace } from '../store/workspace';
 import type { UiLanguage } from '../types';
 
 export function HeaderControls() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const uiLanguage = useWorkspace((s) => s.settings.uiLanguage);
   const updateSettings = useWorkspace((s) => s.updateSettings);
   const readOnly = useReadOnly((s) => s.readOnly);
   const { colorScheme, toggleColorScheme } = useMantineColorScheme();
+  const backendUrl = useConnection((s) => s.backendUrl);
+  const accessToken = useAuth((s) => s.accessToken);
+  const clearAuth = useAuth((s) => s.clear);
+  const openLogin = useUi((s) => s.openLogin);
 
   return (
     <Group gap="xs">
@@ -58,6 +74,30 @@ export function HeaderControls() {
           {colorScheme === 'dark' ? <IconSun size={18} /> : <IconMoon size={18} />}
         </ActionIcon>
       </Tooltip>
+
+      {backendUrl && !accessToken && (
+        <Tooltip label={t('auth.signIn')}>
+          <ActionIcon variant="default" size="lg" onClick={openLogin} aria-label={t('auth.signIn')}>
+            <IconLogin size={18} />
+          </ActionIcon>
+        </Tooltip>
+      )}
+
+      {accessToken && (
+        <Tooltip label={t('auth.signOut')}>
+          <ActionIcon
+            variant="default"
+            size="lg"
+            onClick={() => {
+              clearAuth();
+              navigate('/');
+            }}
+            aria-label={t('auth.signOut')}
+          >
+            <IconLogout size={18} />
+          </ActionIcon>
+        </Tooltip>
+      )}
     </Group>
   );
 }

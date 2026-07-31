@@ -216,6 +216,8 @@ export interface ServerMeta {
   mock: boolean;
   llm: boolean;
   persistent: boolean;
+  /** Whether a client must log in before anything else works. See `pages/LoginPage`. */
+  authRequired: boolean;
   version?: string;
 }
 

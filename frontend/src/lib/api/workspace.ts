@@ -7,6 +7,7 @@ import type {
   PromptLabel,
   Settings,
 } from '../../types';
+import { authFetch } from './authFetch';
 import { versionedBase } from './version';
 
 /** A full read of the backend-owned workspace (the SSOT). */
@@ -37,13 +38,15 @@ export class HttpWorkspaceApi {
   }
 
   private async get<T>(path: string): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, { headers: { Accept: 'application/json' } });
+    const res = await authFetch(`${this.baseUrl}${path}`, {
+      headers: { Accept: 'application/json' },
+    });
     if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
     return (await res.json()) as T;
   }
 
   private async send(method: string, path: string, body?: unknown): Promise<void> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await authFetch(`${this.baseUrl}${path}`, {
       method,
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -53,7 +56,7 @@ export class HttpWorkspaceApi {
 
   /** Like `send`, but for endpoints that return the created/updated record. */
   private async sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await authFetch(`${this.baseUrl}${path}`, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

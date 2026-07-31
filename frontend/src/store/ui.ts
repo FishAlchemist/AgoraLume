@@ -26,6 +26,9 @@ interface UiState {
   editorKind: PersonaKind;
   /** Pending confirmation dialog, or null when none is open. */
   confirm: ConfirmRequest | null;
+  /** Whether the login overlay (see `pages/LoginPage`) is showing. Login is
+   * user-triggered, not a gate — the shell stays mounted underneath. */
+  loginOpen: boolean;
 
   openCard: (personaId: string) => void;
   closeCard: () => void;
@@ -35,6 +38,8 @@ interface UiState {
   closeEditor: () => void;
   askConfirm: (request: ConfirmRequest) => void;
   closeConfirm: () => void;
+  openLogin: () => void;
+  closeLogin: () => void;
 }
 
 /**
@@ -49,6 +54,7 @@ export const useUi = create<UiState>((set) => ({
   editorPersonaId: null,
   editorKind: 'ai',
   confirm: null,
+  loginOpen: false,
 
   openCard: (personaId) => set({ cardPersonaId: personaId }),
   closeCard: () => set({ cardPersonaId: null }),
@@ -59,4 +65,6 @@ export const useUi = create<UiState>((set) => ({
   closeEditor: () => set({ editorOpen: false }),
   askConfirm: (request) => set({ confirm: request }),
   closeConfirm: () => set({ confirm: null }),
+  openLogin: () => set({ loginOpen: true }),
+  closeLogin: () => set({ loginOpen: false }),
 }));

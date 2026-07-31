@@ -1,3 +1,4 @@
+import { isGuestFallback } from '../../store/backendStatus';
 import { useConnection } from '../../store/connection';
 import type { GroupSuggestions, Message } from '../../types';
 import { HttpChatApi } from './http';
@@ -29,9 +30,7 @@ class RoutingChatApi implements ChatApi {
   // One client per URL, reused so repeated switches don't leak connections.
   private readonly httpByUrl = new Map<string, HttpChatApi>();
 
-  private impl(): ChatApi {
-    const url = useConnection.getState().backendUrl;
-    if (!url) return this.mock;
+  private httpFor(url: string): HttpChatApi {
     let http = this.httpByUrl.get(url);
     if (!http) {
       http = new HttpChatApi(url);
@@ -40,8 +39,27 @@ class RoutingChatApi implements ChatApi {
     return http;
   }
 
+  /**
+   * Every call except `probe` — the real backend once there's a usable
+   * session, the in-browser demo otherwise (see `isGuestFallback`), so a
+   * guest on a login-required deployment gets a working demo instead of a
+   * wall of 401s.
+   */
+  private impl(): ChatApi {
+    const url = useConnection.getState().backendUrl;
+    if (!url || isGuestFallback()) return this.mock;
+    return this.httpFor(url);
+  }
+
+  /**
+   * `/meta` always goes straight to the real backend when one is configured,
+   * bypassing the guest-fallback gate above — it's how the app learns
+   * `authRequired` in the first place, and it's unauthenticated by backend
+   * design regardless of session state.
+   */
   probe(): Promise<ServerMeta | null> {
-    return this.impl().probe();
+    const url = useConnection.getState().backendUrl;
+    return url ? this.httpFor(url).probe() : this.mock.probe();
   }
   listMessages(groupId: string, opts?: HistoryWindow): Promise<Message[]> {
     return this.impl().listMessages(groupId, opts);
