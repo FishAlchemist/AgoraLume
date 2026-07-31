@@ -179,6 +179,19 @@ export interface LlmSettingsPatch {
   pricing?: PricingSettings;
 }
 
+/** One model a provider's listing endpoint reported — see {@link listLlmModels}. */
+export interface LlmModelInfo {
+  /** What `LlmSettingsPatch.model` actually wants. */
+  id: string;
+  /** A display label, when the provider offers one (not every provider does). */
+  name?: string | null;
+}
+
+/** The `POST /llm/models` response. */
+export interface LlmModelsView {
+  models: LlmModelInfo[];
+}
+
 /**
  * What the data source offers. `mock` means no LLM and no persistence (the
  * in-memory build) — distinct from whether the backend is reachable. The

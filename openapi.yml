@@ -464,6 +464,38 @@ paths:
             text/plain:
               schema:
                 type: string
+  /llm/models:
+    post:
+      tags:
+      - llm
+      summary: |-
+        Lists the models a provider endpoint offers, so the Settings page can offer
+        a picker instead of a blind text field. `apiKey` is optional: when omitted,
+        the stored key is used, but *only* when `baseUrl` names the same endpoint
+        already configured — otherwise the request must carry its own key. Without
+        that check, an operator (or anything else that can reach this API) could
+        point `baseUrl` at an arbitrary third-party URL and have the server hand it
+        the real provider key in an outbound `Authorization` header.
+      operationId: list_llm_models
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LlmModelsQuery'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LlmModelsView'
+        '422':
+          description: empty baseUrl, no usable key, or the endpoint rejected the request
+          content:
+            text/plain:
+              schema:
+                type: string
   /llm/settings:
     get:
       tags:
@@ -1124,6 +1156,49 @@ components:
             The coarse time-of-day bucket the suggestions were tuned for
             (`morning` / `afternoon` / `evening` / `night`) — lets the server tell when
             they've gone stale against the clock, and the UI hint the framing.
+    LlmModelInfo:
+      type: object
+      description: |-
+        One model a provider's listing endpoint reported. `name` is a display label
+        when the provider offers one (Gemini does; OpenAI-compatible listings
+        usually don't), never required for choosing the model — `id` is what's
+        actually sent as `LlmSettings::model`.
+      required:
+      - id
+      properties:
+        id:
+          type: string
+        name:
+          type:
+          - string
+          - 'null'
+    LlmModelsQuery:
+      type: object
+      description: |-
+        The `POST /llm/models` request: which endpoint to list models from. `apiKey`
+        is optional — omitted, the backend uses the currently-stored key, but only
+        when `baseUrl` matches the stored endpoint (see `routes::llm`), so this
+        can't be used to make the server send its stored credential to an arbitrary
+        third-party URL.
+      required:
+      - baseUrl
+      properties:
+        apiKey:
+          type:
+          - string
+          - 'null'
+        baseUrl:
+          type: string
+    LlmModelsView:
+      type: object
+      description: The `POST /llm/models` response.
+      required:
+      - models
+      properties:
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/LlmModelInfo'
     LlmSettingsPatch:
       type: object
       description: |-

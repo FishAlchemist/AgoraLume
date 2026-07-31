@@ -42,6 +42,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rig_core::agent::PromptResponse;
+use rig_core::client::ModelListingClient;
 use rig_core::client::completion::CompletionClient;
 use rig_core::completion::{Prompt, PromptError, Usage};
 use rig_core::providers::{gemini, openai};
@@ -54,7 +55,7 @@ use crate::agent::brain::{
     Summary, SummaryRequest,
 };
 use crate::agent::ratelimit::RateLimiter;
-use crate::models::TokenUsage;
+use crate::models::{LlmModelInfo, TokenUsage};
 
 /// The `respond` tool's arguments, as the model returns them. Kept separate from
 /// [`Respond`] so the wire schema the model sees stays decoupled from the
@@ -630,6 +631,37 @@ impl Provider {
     }
 }
 
+/// Lists the models a configured endpoint offers, for the Settings page's
+/// "fetch models" action. Uses the same [`is_gemini_openai_compat`] detection
+/// [`Provider::resolve`] does, so listing and completion always agree on which
+/// endpoint is hit — but builds its own client rather than reusing
+/// `Provider::resolve`'s, since rig's `ModelListingClient` capability on the
+/// OpenAI-compatible side is only wired up for its *Responses*-API client
+/// (`openai::Client`), not the Chat Completions one `Provider::OpenAi` holds
+/// (`openai::CompletionsClient`) — both talk to the same `{base_url}/models`
+/// endpoint regardless, so this costs nothing beyond a second client build.
+pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<LlmModelInfo>, String> {
+    let list = if is_gemini_openai_compat(base_url) {
+        let client = gemini::Client::builder()
+            .api_key(api_key)
+            .build()
+            .map_err(|e| format!("failed to build the Gemini client: {e}"))?;
+        client.list_models().await
+    } else {
+        let client = openai::Client::builder()
+            .api_key(api_key)
+            .base_url(base_url)
+            .build()
+            .map_err(|e| format!("failed to build the LLM client: {e}"))?;
+        client.list_models().await
+    }
+    .map_err(|e| e.to_string())?;
+    let mut models: Vec<LlmModelInfo> =
+        list.iter().map(|m| LlmModelInfo { id: m.id.clone(), name: m.name.clone() }).collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(models)
+}
+
 /// Builds and runs one completion against any rig client, handing rig's raw
 /// response back — plus whatever the model chose to remember — for the caller's
 /// retry, usage, and persistence handling. Generic over the provider so the
@@ -714,8 +746,17 @@ where
 /// has no field for Gemini's `thoughtSignature`, which the native path round-trips.
 /// Tolerant of a trailing slash and letter case so a hand-typed value still matches.
 fn is_gemini_openai_compat(base_url: &str) -> bool {
-    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    let normalized = normalize_base_url(base_url);
     normalized.contains("generativelanguage.googleapis.com") && normalized.ends_with("/openai")
+}
+
+/// Trims, drops a trailing slash, and lowercases a base URL so two spellings
+/// of the same endpoint (trailing slash, letter case) compare equal. Used both
+/// by [`is_gemini_openai_compat`] and by `routes::llm`'s stored-key guard,
+/// which must not treat `https://x/v1` and `https://x/v1/` as different
+/// endpoints when deciding whether a request may use the stored key.
+pub(crate) fn normalize_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
 /// An [`AgentBrain`] that drives decisions with a rig-core chat model. Endpoint,

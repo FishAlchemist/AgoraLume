@@ -1,6 +1,8 @@
 import {
   Accordion,
+  ActionIcon,
   Alert,
+  Autocomplete,
   Box,
   Button,
   Divider,
@@ -15,8 +17,10 @@ import {
   Text,
   TextInput,
   Title,
+  Tooltip,
   useMantineColorScheme,
 } from '@mantine/core';
+import { IconRefresh } from '@tabler/icons-react';
 import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -24,7 +28,7 @@ import { DataSourceBadge } from '../components/DataSourceBadge';
 import { UsageSummary } from '../components/UsageSummary';
 import { UI_LANGUAGES } from '../i18n';
 import { api } from '../lib/api';
-import { getLlmSettings, updateLlmSettings } from '../lib/api/llmSettings';
+import { getLlmSettings, listLlmModels, updateLlmSettings } from '../lib/api/llmSettings';
 import type { DebugUsage, LlmSettingsPatch, LlmSettingsView, ServerMeta } from '../lib/api/types';
 import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
@@ -42,6 +46,22 @@ const FONT_SIZES = [
   { value: '18', labelKey: 'settings.fontL' },
   { value: '22', labelKey: 'settings.fontXl' },
 ] as const;
+
+/** Google's OpenAI-compatible Gemini endpoint — auto-filled by the "Google"
+ * provider preset so the operator never has to look this URL up themselves.
+ * The backend's `agent::llm::is_gemini_openai_compat` detects any base URL
+ * shaped like this and auto-routes it to rig's native Gemini provider; this
+ * just makes that URL discoverable instead of requiring it be hand-typed. */
+const GEMINI_OPENAI_COMPAT_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/';
+
+/** Whether `baseUrl` is (some spelling of) {@link GEMINI_OPENAI_COMPAT_URL} —
+ * tolerant of a trailing slash and letter case, mirroring the backend's own
+ * detection, so the Provider control reads "Google" for a hand-typed or
+ * previously-saved value too, not only the exact constant. */
+function isGoogleBaseUrl(baseUrl: string): boolean {
+  const normalized = baseUrl.trim().replace(/\/+$/, '').toLowerCase();
+  return normalized.includes('generativelanguage.googleapis.com') && normalized.endsWith('/openai');
+}
 
 /**
  * One category card: a bordered `Paper` with its own heading, so the settings
@@ -378,6 +398,15 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
   const [hasApiKey, setHasApiKey] = useState(false);
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [error, setError] = useState('');
+  // The fetched model list — offered as Autocomplete suggestions, never a
+  // closed set (some endpoints don't implement listing, so free text must
+  // keep working). `lastCustomBaseUrl` remembers what was typed under
+  // "Custom" so toggling to "Google" and back doesn't lose it.
+  const [modelOptions, setModelOptions] = useState<{ value: string; label: string }[]>([]);
+  const [modelsStatus, setModelsStatus] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [modelsError, setModelsError] = useState('');
+  const [modelsFetchedEmpty, setModelsFetchedEmpty] = useState(false);
+  const [lastCustomBaseUrl, setLastCustomBaseUrl] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -390,6 +419,11 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
         setApiKeyDraft('');
         setApiKeyTouched(false);
         setStatus('idle');
+        setModelOptions([]);
+        setModelsStatus('idle');
+        setModelsError('');
+        setModelsFetchedEmpty(false);
+        setLastCustomBaseUrl(isGoogleBaseUrl(view.baseUrl ?? '') ? '' : (view.baseUrl ?? ''));
       },
       (e: unknown) => {
         if (active) setError(e instanceof Error ? e.message : String(e));
@@ -403,6 +437,46 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
   const set = <K extends keyof LlmDraft>(key: K, value: LlmDraft[K]) => {
     setDraft((d) => (d ? { ...d, [key]: value } : d));
     if (status === 'saved') setStatus('idle');
+  };
+
+  const setProvider = (next: 'google' | 'custom') => {
+    if (!draft) return;
+    if (next === 'google') {
+      setLastCustomBaseUrl(draft.baseUrl);
+      set('baseUrl', GEMINI_OPENAI_COMPAT_URL);
+    } else {
+      set('baseUrl', lastCustomBaseUrl);
+    }
+    // The fetched list belonged to the endpoint being left.
+    setModelOptions([]);
+    setModelsStatus('idle');
+    setModelsError('');
+    setModelsFetchedEmpty(false);
+  };
+
+  const fetchModels = () => {
+    if (!draft) return;
+    const baseUrl = draft.baseUrl.trim();
+    if (!baseUrl) return;
+    setModelsStatus('loading');
+    setModelsError('');
+    setModelsFetchedEmpty(false);
+    void listLlmModels(backendUrl, {
+      baseUrl,
+      ...(apiKeyTouched && { apiKey: apiKeyDraft }),
+    }).then(
+      (view) => {
+        setModelOptions(
+          view.models.map((m) => ({ value: m.id, label: m.name ? `${m.id} — ${m.name}` : m.id })),
+        );
+        setModelsFetchedEmpty(view.models.length === 0);
+        setModelsStatus('idle');
+      },
+      (e: unknown) => {
+        setModelsError(e instanceof Error ? e.message : String(e));
+        setModelsStatus('error');
+      },
+    );
   };
 
   const save = () => {
@@ -439,6 +513,8 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
     );
   }
 
+  const provider = isGoogleBaseUrl(draft.baseUrl) ? 'google' : 'custom';
+
   return (
     <Stack gap="sm">
       <Switch
@@ -448,21 +524,67 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
         label={t('settings.llmEnable')}
         description={t('settings.llmEnableHint')}
       />
-      <TextInput
-        label={t('settings.llmBaseUrl')}
-        description={t('settings.llmBaseUrlHint')}
-        placeholder={t('settings.llmBaseUrlPlaceholder')}
-        value={draft.baseUrl}
-        onChange={(e) => set('baseUrl', e.currentTarget.value)}
-        disabled={readOnly}
-      />
-      <TextInput
+      <Box>
+        <Text size="sm" fw={500} mb={4}>
+          {t('settings.llmProvider')}
+        </Text>
+        <SegmentedControl
+          fullWidth
+          value={provider}
+          onChange={(v) => setProvider(v as 'google' | 'custom')}
+          disabled={readOnly}
+          data={[
+            { value: 'google', label: t('settings.llmProviderGoogle') },
+            { value: 'custom', label: t('settings.llmProviderCustom') },
+          ]}
+        />
+      </Box>
+      {provider === 'google' ? (
+        <Text size="xs" c="dimmed">
+          {t('settings.llmProviderGoogleHint')}
+        </Text>
+      ) : (
+        <TextInput
+          label={t('settings.llmBaseUrl')}
+          description={t('settings.llmBaseUrlHint')}
+          placeholder={t('settings.llmBaseUrlPlaceholder')}
+          value={draft.baseUrl}
+          onChange={(e) => set('baseUrl', e.currentTarget.value)}
+          disabled={readOnly}
+        />
+      )}
+      <Autocomplete
         label={t('settings.llmModel')}
         placeholder={t('settings.llmModelPlaceholder')}
         value={draft.model}
-        onChange={(e) => set('model', e.currentTarget.value)}
+        onChange={(v) => set('model', v)}
+        data={modelOptions}
         disabled={readOnly}
+        rightSection={
+          <Tooltip label={t('settings.llmFetchModels')} withArrow>
+            <ActionIcon
+              size="sm"
+              variant="subtle"
+              aria-label={t('settings.llmFetchModels')}
+              onClick={fetchModels}
+              loading={modelsStatus === 'loading'}
+              disabled={readOnly || !draft.baseUrl.trim()}
+            >
+              <IconRefresh size={14} />
+            </ActionIcon>
+          </Tooltip>
+        }
       />
+      {modelsStatus === 'error' && (
+        <Text size="xs" c="red">
+          {modelsError}
+        </Text>
+      )}
+      {modelsFetchedEmpty && (
+        <Text size="xs" c="dimmed">
+          {t('settings.llmModelsEmpty')}
+        </Text>
+      )}
       <PasswordInput
         label={t('settings.llmApiKey')}
         description={hasApiKey ? t('settings.llmApiKeyStored') : t('settings.llmApiKeyNotStored')}

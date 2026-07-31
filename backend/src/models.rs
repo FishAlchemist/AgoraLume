@@ -704,6 +704,38 @@ fn non_empty(s: String) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// The `POST /llm/models` request: which endpoint to list models from. `apiKey`
+/// is optional — omitted, the backend uses the currently-stored key, but only
+/// when `baseUrl` matches the stored endpoint (see `routes::llm`), so this
+/// can't be used to make the server send its stored credential to an arbitrary
+/// third-party URL.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmModelsQuery {
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+/// One model a provider's listing endpoint reported. `name` is a display label
+/// when the provider offers one (Gemini does; OpenAI-compatible listings
+/// usually don't), never required for choosing the model — `id` is what's
+/// actually sent as `LlmSettings::model`.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmModelInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The `POST /llm/models` response.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmModelsView {
+    pub models: Vec<LlmModelInfo>,
+}
+
 #[cfg(test)]
 mod llm_settings_patch_tests {
     use super::*;

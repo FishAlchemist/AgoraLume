@@ -115,6 +115,18 @@ export interface paths {
     /** Liveness probe — cheap "is the server up" check. */
     get: operations["health"];
   };
+  "/llm/models": {
+    /**
+     * Lists the models a provider endpoint offers, so the Settings page can offer
+     * a picker instead of a blind text field. `apiKey` is optional: when omitted,
+     * the stored key is used, but *only* when `baseUrl` names the same endpoint
+     * already configured — otherwise the request must carry its own key. Without
+     * that check, an operator (or anything else that can reach this API) could
+     * point `baseUrl` at an arbitrary third-party URL and have the server hand it
+     * the real provider key in an outbound `Authorization` header.
+     */
+    post: operations["list_llm_models"];
+  };
   "/llm/settings": {
     /**
      * The live LLM provider configuration. `apiKey` is never included — only
@@ -365,6 +377,31 @@ export interface components {
        * they've gone stale against the clock, and the UI hint the framing.
        */
       timeOfDay?: string;
+    };
+    /**
+     * @description One model a provider's listing endpoint reported. `name` is a display label
+     * when the provider offers one (Gemini does; OpenAI-compatible listings
+     * usually don't), never required for choosing the model — `id` is what's
+     * actually sent as `LlmSettings::model`.
+     */
+    LlmModelInfo: {
+      id: string;
+      name?: string | null;
+    };
+    /**
+     * @description The `POST /llm/models` request: which endpoint to list models from. `apiKey`
+     * is optional — omitted, the backend uses the currently-stored key, but only
+     * when `baseUrl` matches the stored endpoint (see `routes::llm`), so this
+     * can't be used to make the server send its stored credential to an arbitrary
+     * third-party URL.
+     */
+    LlmModelsQuery: {
+      apiKey?: string | null;
+      baseUrl: string;
+    };
+    /** @description The `POST /llm/models` response. */
+    LlmModelsView: {
+      models: components["schemas"]["LlmModelInfo"][];
     };
     /**
      * @description A partial update to the LLM provider configuration — every field is
@@ -1148,6 +1185,35 @@ export interface operations {
     responses: {
       /** @description Service is up */
       200: {
+        content: {
+          "text/plain": string;
+        };
+      };
+    };
+  };
+  /**
+   * Lists the models a provider endpoint offers, so the Settings page can offer
+   * a picker instead of a blind text field. `apiKey` is optional: when omitted,
+   * the stored key is used, but *only* when `baseUrl` names the same endpoint
+   * already configured — otherwise the request must carry its own key. Without
+   * that check, an operator (or anything else that can reach this API) could
+   * point `baseUrl` at an arbitrary third-party URL and have the server hand it
+   * the real provider key in an outbound `Authorization` header.
+   */
+  list_llm_models: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["LlmModelsQuery"];
+      };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["LlmModelsView"];
+        };
+      };
+      /** @description empty baseUrl, no usable key, or the endpoint rejected the request */
+      422: {
         content: {
           "text/plain": string;
         };

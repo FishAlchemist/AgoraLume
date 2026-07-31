@@ -1,4 +1,4 @@
-import type { LlmSettingsPatch, LlmSettingsView } from './types';
+import type { LlmModelsView, LlmSettingsPatch, LlmSettingsView } from './types';
 
 /**
  * The LLM provider configuration client — `GET`/`PATCH /llm/settings` on a
@@ -41,4 +41,30 @@ export async function updateLlmSettings(
     throw new Error(detail || `updateLlmSettings failed: ${res.status}`);
   }
   return (await res.json()) as LlmSettingsView;
+}
+
+/**
+ * Lists the models a provider endpoint offers, so the model field can be a
+ * picker instead of a blind text box. `apiKey` is optional — omit it to use
+ * whatever key is already stored on the backend (the frontend never actually
+ * holds it once saved); the backend only honors that fallback when `baseUrl`
+ * matches the currently-configured endpoint, so it can't be used to make the
+ * server leak its stored key to an arbitrary URL. Rejects (throwing, with the
+ * backend's explanation as the message) on an empty `baseUrl`, a `baseUrl`
+ * that doesn't match with no `apiKey` given, or the endpoint itself failing.
+ */
+export async function listLlmModels(
+  backendUrl: string,
+  query: { baseUrl: string; apiKey?: string },
+): Promise<LlmModelsView> {
+  const res = await fetch(`${backendUrl}/llm/models`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(query),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(detail || `listLlmModels failed: ${res.status}`);
+  }
+  return (await res.json()) as LlmModelsView;
 }
