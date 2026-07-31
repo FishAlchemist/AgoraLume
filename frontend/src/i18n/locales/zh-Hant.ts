@@ -209,6 +209,7 @@ export const zhHant: TranslationSchema = {
     title: '除錯',
     toggle: '除錯面板',
     usage: '總使用量',
+    groupUsage: '此群組的用量',
     requests: '請求數',
     inputTokens: '輸入',
     outputTokens: '輸出',

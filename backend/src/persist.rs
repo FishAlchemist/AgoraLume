@@ -7,7 +7,8 @@
 //! messages/<group_id>.json     one group's chat log (loaded lazily, saved on change)
 //! summaries/<group_id>.json    one group's compressed older history (loaded with its log)
 //! suggestions/<group_id>.json  one group's cached conversation starters (loaded with its log)
-//! usage.json                   cumulative LLM usage counters + accrued cost (loaded at startup)
+//! usage.json                   cumulative LLM usage counters + accrued cost, across every group (loaded at startup)
+//! usage/<group_id>.json        one group's own usage counters + accrued cost (loaded with its log)
 //! ```
 //!
 //! Splitting the message logs off the workspace means a running server only
@@ -84,6 +85,10 @@ impl Persistence {
 
     fn usage_path(&self) -> PathBuf {
         self.dir.join("usage.json")
+    }
+
+    fn group_usage_path(&self, group_id: &str) -> PathBuf {
+        self.dir.join("usage").join(format!("{}.json", sanitize(group_id)))
     }
 
     /// Loads the persisted workspace, or `None` when there is no saved file yet
@@ -262,6 +267,34 @@ impl Persistence {
             tracing::warn!(error = %e, "failed to persist usage totals");
         }
     }
+
+    /// Loads one group's own cumulative usage and accrued cost — independent of
+    /// every other group's, unlike [`Self::load_usage`]. `None` when the group
+    /// has recorded no traces yet, or its file is unreadable/corrupt, in which
+    /// case the caller starts that group's counters at zero.
+    pub fn load_group_usage(&self, group_id: &str) -> Option<DebugTotals> {
+        let path = self.group_usage_path(group_id);
+        let bytes = std::fs::read(&path).ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(totals) => Some(totals),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ignoring corrupt per-group usage totals; starting the group's counters at zero"
+                );
+                None
+            }
+        }
+    }
+
+    /// Writes one group's own usage counters and accrued cost out. Called after
+    /// every recorded trace; failures are logged, not fatal.
+    pub fn save_group_usage(&self, group_id: &str, totals: &DebugTotals) {
+        if let Err(e) = write_atomic(&self.group_usage_path(group_id), totals) {
+            tracing::warn!(group = %group_id, error = %e, "failed to persist per-group usage totals");
+        }
+    }
 }
 
 /// Serializes `value` as pretty JSON and writes it atomically: a sibling temp
@@ -365,6 +398,40 @@ mod tests {
         std::fs::write(store.usage_path(), b"not json").unwrap();
 
         assert!(store.load_usage().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn group_usage_round_trips_independently_per_group() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+
+        assert!(store.load_group_usage("g1").is_none(), "nothing saved yet");
+
+        let mut g1 = DebugTotals::default();
+        g1.models.insert("gpt-4o-mini".to_string(), ModelTotals { requests: 2, ..Default::default() });
+        let mut g2 = DebugTotals::default();
+        g2.models.insert("gpt-4o-mini".to_string(), ModelTotals { requests: 9, ..Default::default() });
+
+        store.save_group_usage("g1", &g1);
+        store.save_group_usage("g2", &g2);
+
+        assert_eq!(store.load_group_usage("g1").unwrap().models["gpt-4o-mini"].requests, 2);
+        assert_eq!(store.load_group_usage("g2").unwrap().models["gpt-4o-mini"].requests, 9);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_group_usage_file_is_ignored_not_fatal() {
+        let dir = temp_dir();
+        let store = Persistence::new(&dir);
+        let path = store.group_usage_path("g1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"not json").unwrap();
+
+        assert!(store.load_group_usage("g1").is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }

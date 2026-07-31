@@ -66,6 +66,9 @@ class RoutingChatApi implements ChatApi {
   getUsage(): Promise<DebugUsage> {
     return this.impl().getUsage();
   }
+  getGroupUsage(groupId: string): Promise<DebugUsage> {
+    return this.impl().getGroupUsage(groupId);
+  }
   listTraces(groupId: string): Promise<AgentTrace[]> {
     return this.impl().listTraces(groupId);
   }

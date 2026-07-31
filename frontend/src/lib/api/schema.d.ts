@@ -47,6 +47,15 @@ export interface paths {
      */
     get: operations["debug_traces"];
   };
+  "/groups/{id}/debug/usage": {
+    /**
+     * One group's own cumulative LLM usage — independent of every other group's,
+     * unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
+     * every group's usage (plus any spend from groups since deleted); this is one
+     * group's own slice of it.
+     */
+    get: operations["group_debug_usage"];
+  };
   "/groups/{id}/events": {
     /**
      * Posts an environment event into a group — rain, time passing, an emergency —
@@ -980,6 +989,28 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["AgentTrace"][];
+        };
+      };
+    };
+  };
+  /**
+   * One group's own cumulative LLM usage — independent of every other group's,
+   * unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
+   * every group's usage (plus any spend from groups since deleted); this is one
+   * group's own slice of it.
+   */
+  group_debug_usage: {
+    parameters: {
+      path: {
+        /** @description Group id */
+        id: string;
+      };
+    };
+    responses: {
+      /** @description One group's own cumulative LLM usage */
+      200: {
+        content: {
+          "application/json": components["schemas"]["DebugUsage"];
         };
       };
     };

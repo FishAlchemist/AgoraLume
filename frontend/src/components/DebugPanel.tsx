@@ -58,7 +58,7 @@ export function DebugPanel({ groupId, personas }: Props) {
     nextId.current = 0;
 
     const loadUsage = () => {
-      void api.getUsage().then((u) => {
+      void api.getGroupUsage(groupId).then((u) => {
         if (active) setUsage(u);
       });
     };
@@ -95,7 +95,7 @@ export function DebugPanel({ groupId, personas }: Props) {
   return (
     <Paper withBorder radius="md" p="sm" m="md" mb={0}>
       <Stack gap="xs">
-        <UsageSummary usage={usage} mock={status.mock} />
+        <UsageSummary usage={usage} mock={status.mock} title={t('debug.groupUsage')} />
 
         <Divider />
 

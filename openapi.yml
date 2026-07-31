@@ -233,6 +233,30 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/AgentTrace'
+  /groups/{id}/debug/usage:
+    get:
+      tags:
+      - chat
+      summary: |-
+        One group's own cumulative LLM usage — independent of every other group's,
+        unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
+        every group's usage (plus any spend from groups since deleted); this is one
+        group's own slice of it.
+      operationId: group_debug_usage
+      parameters:
+      - name: id
+        in: path
+        description: Group id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: One group's own cumulative LLM usage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugUsage'
   /groups/{id}/events:
     post:
       tags:

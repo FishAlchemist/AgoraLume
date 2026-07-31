@@ -305,6 +305,12 @@ export interface ChatApi {
   getUsage(): Promise<DebugUsage>;
 
   /**
+   * One group's own cumulative LLM usage — independent of every other
+   * group's, unlike {@link getUsage}, whose total sums every group together.
+   */
+  getGroupUsage(groupId: string): Promise<DebugUsage>;
+
+  /**
    * Recent agent traces for a group — for hydrating the debug panel on open.
    * Live updates then arrive via {@link subscribeDebug}.
    */

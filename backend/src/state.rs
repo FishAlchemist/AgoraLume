@@ -98,6 +98,14 @@ struct DebugState {
     /// brain with no real model (the rule-based mock) land under the
     /// `"unknown"` key.
     models: HashMap<String, ModelTotals>,
+    /// The same breakdown, scoped per group — each chat's own running usage and
+    /// spend, independent of every other group's. `models`, above, is the sum of
+    /// all of these plus any traces from groups no longer present here (none
+    /// today — every trace is recorded under a group). Kept as a second map
+    /// rather than derived from `traces` because trace history is capped
+    /// ([`DEBUG_TRACE_CAP`]) and cheap-to-lose, while a group's lifetime spend
+    /// must not shrink when its old traces fall off the ring.
+    group_models: HashMap<String, HashMap<String, ModelTotals>>,
     /// Recent traces per group, oldest first, capped at [`DEBUG_TRACE_CAP`].
     traces: HashMap<String, VecDeque<AgentTrace>>,
 }
@@ -283,6 +291,7 @@ impl AppState {
             active_groups: Mutex::new(HashSet::new()),
             debug: Mutex::new(DebugState {
                 models: usage.models,
+                group_models: HashMap::new(),
                 traces: HashMap::new(),
             }),
             pricing: RwLock::new(None),
@@ -352,37 +361,63 @@ impl AppState {
     /// switch to a different model) never reprices history; it only changes
     /// what new traces cost.
     pub fn record_trace(&self, group_id: &str, trace: AgentTrace) {
-        let snapshot = {
+        self.ensure_loaded(group_id);
+        let (snapshot, group_snapshot) = {
             let mut debug = self.debug.lock().unwrap();
             let model_key = trace
                 .model
                 .clone()
                 .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-            let entry = debug.models.entry(model_key).or_default();
+            let pricing = self.pricing.read().unwrap();
+
+            let entry = debug.models.entry(model_key.clone()).or_default();
             entry.requests += 1;
             if let Some(usage) = &trace.usage {
-                let pricing = self.pricing.read().unwrap();
                 entry.add_usage(usage, pricing.as_ref());
             }
+
+            let group_entry =
+                debug.group_models.entry(group_id.to_string()).or_default().entry(model_key).or_default();
+            group_entry.requests += 1;
+            if let Some(usage) = &trace.usage {
+                group_entry.add_usage(usage, pricing.as_ref());
+            }
+
             let ring = debug.traces.entry(group_id.to_string()).or_default();
             ring.push_back(trace.clone());
             while ring.len() > DEBUG_TRACE_CAP {
                 ring.pop_front();
             }
-            DebugTotals {
-                models: debug.models.clone(),
-            }
+            (
+                DebugTotals {
+                    models: debug.models.clone(),
+                },
+                DebugTotals {
+                    models: debug.group_models.get(group_id).cloned().unwrap_or_default(),
+                },
+            )
         };
         if let Some(persistence) = &self.persistence {
             persistence.save_usage(&snapshot);
+            persistence.save_group_usage(group_id, &group_snapshot);
         }
         let _ = self.channel(group_id).send(StreamEvent::Debug(trace));
     }
 
-    /// A snapshot of the cumulative per-model usage and accrued cost.
+    /// A snapshot of the cumulative per-model usage and accrued cost, across
+    /// every group.
     pub fn debug_totals(&self) -> DebugTotals {
         DebugTotals {
             models: self.debug.lock().unwrap().models.clone(),
+        }
+    }
+
+    /// A snapshot of one group's own cumulative usage and accrued cost —
+    /// independent of every other group's, unlike [`Self::debug_totals`].
+    pub fn group_debug_totals(&self, group_id: &str) -> DebugTotals {
+        self.ensure_loaded(group_id);
+        DebugTotals {
+            models: self.debug.lock().unwrap().group_models.get(group_id).cloned().unwrap_or_default(),
         }
     }
 
@@ -434,6 +469,17 @@ impl AppState {
                 .unwrap()
                 .entry(group_id.to_string())
                 .or_insert(suggestions);
+        }
+        // This group's own running usage/cost, so a restart resumes its total
+        // rather than restarting it from zero (the global total, in `usage.json`,
+        // is loaded once at startup — see `AppState::build`).
+        if let Some(totals) = persistence.load_group_usage(group_id) {
+            self.debug
+                .lock()
+                .unwrap()
+                .group_models
+                .entry(group_id.to_string())
+                .or_insert(totals.models);
         }
         loaded.insert(group_id.to_string());
     }
@@ -1109,5 +1155,50 @@ mod tests {
             .and_then(|m| m.cost.as_ref())
             .expect("costed");
         assert_eq!(cost.input, 1.0, "priced at the rate just applied");
+    }
+
+    /// A minimal trace for one group, with usage attributed to `model`.
+    fn trace(group_id: &str, model: &str, prompt_tokens: u64) -> AgentTrace {
+        AgentTrace {
+            ts: now_ms(),
+            group_id: group_id.to_string(),
+            persona_id: "aria".to_string(),
+            persona_name: "Aria".to_string(),
+            system: String::new(),
+            conversation: String::new(),
+            action: "read".to_string(),
+            message: None,
+            mood: None,
+            usage: Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens: 0,
+                total_tokens: prompt_tokens,
+                cached_prompt_tokens: 0,
+            }),
+            model: Some(model.to_string()),
+        }
+    }
+
+    #[test]
+    fn group_usage_stays_isolated_while_the_global_total_sums_every_group() {
+        let state = AppState::with_runtime(AgentRuntime::mock());
+
+        state.record_trace("group-a", trace("group-a", "gpt-4o-mini", 100));
+        state.record_trace("group-a", trace("group-a", "gpt-4o-mini", 50));
+        state.record_trace("group-b", trace("group-b", "gpt-4o-mini", 900));
+
+        let a = state.group_debug_totals("group-a");
+        let b = state.group_debug_totals("group-b");
+        assert_eq!(a.models["gpt-4o-mini"].requests, 2);
+        assert_eq!(a.models["gpt-4o-mini"].prompt_tokens, 150);
+        assert_eq!(b.models["gpt-4o-mini"].requests, 1);
+        assert_eq!(b.models["gpt-4o-mini"].prompt_tokens, 900);
+
+        let total = state.debug_totals();
+        assert_eq!(total.models["gpt-4o-mini"].requests, 3, "global total sums both groups");
+        assert_eq!(total.models["gpt-4o-mini"].prompt_tokens, 1050);
+
+        // A group with no traces yet reports zero, not the global total.
+        assert!(state.group_debug_totals("group-c").models.is_empty());
     }
 }

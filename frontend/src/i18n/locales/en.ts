@@ -209,6 +209,7 @@ export const en = {
     title: 'Debug',
     toggle: 'Debug panel',
     usage: 'Total usage',
+    groupUsage: "This group's usage",
     requests: 'Requests',
     inputTokens: 'Input',
     outputTokens: 'Output',

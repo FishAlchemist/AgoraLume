@@ -154,6 +154,10 @@ export class MockChatApi implements ChatApi {
     };
   }
 
+  async getGroupUsage(): Promise<DebugUsage> {
+    return this.getUsage();
+  }
+
   async listTraces(): Promise<AgentTrace[]> {
     return [];
   }

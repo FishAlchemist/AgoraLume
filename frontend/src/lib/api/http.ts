@@ -283,6 +283,10 @@ export class HttpChatApi implements ChatApi {
     return this.getJson<DebugUsage>('/debug/usage');
   }
 
+  getGroupUsage(groupId: string): Promise<DebugUsage> {
+    return this.getJson<DebugUsage>(`/groups/${groupId}/debug/usage`);
+  }
+
   listTraces(groupId: string): Promise<AgentTrace[]> {
     return this.getJson<AgentTrace[]>(`/groups/${groupId}/debug/traces`);
   }

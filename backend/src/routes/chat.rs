@@ -17,7 +17,7 @@ use utoipa_axum::routes;
 
 use crate::agent::event::Event as AgentEvent;
 use crate::models::{AgentTrace, Cost, DebugUsage, GroupSuggestions, Message, ModelUsage, ServerMeta};
-use crate::state::{AppState, StreamEvent};
+use crate::state::{AppState, DebugTotals, StreamEvent};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
@@ -29,6 +29,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(retry_turn))
         .routes(routes!(get_suggestions, regenerate_suggestions))
         .routes(routes!(debug_traces))
+        .routes(routes!(group_debug_usage))
         .routes(routes!(stream))
 }
 
@@ -66,11 +67,29 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
 #[utoipa::path(get, path = "/debug/usage", tag = "service",
     responses((status = 200, description = "Cumulative LLM usage", body = DebugUsage)))]
 async fn debug_usage(State(state): State<Arc<AppState>>) -> Json<DebugUsage> {
-    let totals = state.debug_totals();
+    Json(debug_usage_view(state.debug_totals()))
+}
 
-    // The grand totals aren't kept separately — they're the sum of the
-    // per-model entries, computed here so there is exactly one place that can
-    // drift out of sync with the breakdown: nowhere.
+/// One group's own cumulative LLM usage — independent of every other group's,
+/// unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
+/// every group's usage (plus any spend from groups since deleted); this is one
+/// group's own slice of it.
+#[utoipa::path(get, path = "/groups/{id}/debug/usage", tag = "chat",
+    params(("id" = String, Path, description = "Group id")),
+    responses((status = 200, description = "One group's own cumulative LLM usage", body = DebugUsage)))]
+async fn group_debug_usage(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<DebugUsage> {
+    Json(debug_usage_view(state.group_debug_totals(&id)))
+}
+
+/// Turns a raw per-model breakdown into the `DebugUsage` wire shape: the grand
+/// totals aren't kept separately anywhere — they're the sum of the per-model
+/// entries, computed here so there is exactly one place that can drift out of
+/// sync with the breakdown: nowhere. Shared by the site-wide and per-group
+/// usage endpoints, which differ only in which [`DebugTotals`] they pass in.
+fn debug_usage_view(totals: DebugTotals) -> DebugUsage {
     let mut requests = 0u64;
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
@@ -109,7 +128,7 @@ async fn debug_usage(State(state): State<Arc<AppState>>) -> Json<DebugUsage> {
     let cache_hit_ratio =
         if prompt_tokens > 0 { cached_prompt_tokens as f64 / prompt_tokens as f64 } else { 0.0 };
 
-    Json(DebugUsage {
+    DebugUsage {
         requests,
         prompt_tokens,
         completion_tokens,
@@ -118,7 +137,7 @@ async fn debug_usage(State(state): State<Arc<AppState>>) -> Json<DebugUsage> {
         cache_hit_ratio,
         estimated_cost,
         models,
-    })
+    }
 }
 
 /// Recent agent traces for a group — the exact prompt each character received
