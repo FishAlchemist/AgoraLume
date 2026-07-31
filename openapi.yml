@@ -26,6 +26,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DebugUsage'
+  /debug/usage/by-persona:
+    get:
+      tags:
+      - service
+      summary: |-
+        Usage broken down by persona, site-wide — the global analogue of
+        [`group_debug_usage_by_persona`], for spotting which character is
+        expensive across every group rather than within one chat. Covers every AI
+        persona in the workspace plus the synthetic "system" bucket (context
+        compression, chat suggestions); sorted by total tokens descending. No
+        group to miss, so unlike the per-group endpoints there's no 404 case.
+      operationId: global_debug_usage_by_persona
+      responses:
+        '200':
+          description: Every AI persona's usage, summed across every group
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PersonaUsage'
   /departments:
     get:
       tags:
@@ -1704,9 +1725,10 @@ components:
     PersonaUsage:
       type: object
       description: |-
-        One persona's own slice of a group's usage — a further breakdown of that
-        group's [`DebugUsage`] by which character is driving the spend. `GET
-        /groups/{id}/debug/usage/by-persona`.
+        One persona's own slice of a usage total — a further breakdown by which
+        character is driving the spend. Serves both `GET
+        /groups/{id}/debug/usage/by-persona` (one group's [`DebugUsage`]) and the
+        site-wide `GET /debug/usage/by-persona` (summed across every group).
       required:
       - personaId
       - usage

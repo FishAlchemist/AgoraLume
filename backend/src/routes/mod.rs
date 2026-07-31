@@ -176,6 +176,80 @@ mod tests {
         Arc::new(AppState::with_runtime(AgentRuntime::mock()))
     }
 
+    /// GETs `path` through the fully assembled router and returns the parsed
+    /// JSON body — end-to-end through actual route dispatch, not just the
+    /// `AppState` method underneath, so a route that got shadowed or
+    /// mis-registered (as opposed to a wrong-answer bug in the method itself)
+    /// would show up here.
+    async fn get_json(router: Router, path: &str) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn debug_usage_by_persona_resolves_independently_at_both_scopes() {
+        use crate::models::{AgentTrace, TokenUsage};
+
+        let state = state();
+        state.record_trace(
+            "lab",
+            AgentTrace {
+                ts: 0,
+                group_id: "lab".to_string(),
+                persona_id: "aria".to_string(),
+                persona_name: "Aria".to_string(),
+                system: String::new(),
+                conversation: String::new(),
+                action: "read".to_string(),
+                message: None,
+                mood: None,
+                usage: Some(TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 0,
+                    total_tokens: 10,
+                    cached_prompt_tokens: 0,
+                }),
+                model: None,
+                duration_ms: None,
+                estimated_cost: None,
+            },
+        );
+        let app = router(state, None);
+
+        // The plain site-wide total — unaffected by the sibling by-persona route.
+        let (status, body) = get_json(app.clone(), "/debug/usage").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["requests"], 1);
+
+        // The global by-persona breakdown — a distinct path, not a 404 or a
+        // re-dispatch to `/debug/usage` above.
+        let (status, body) = get_json(app.clone(), "/debug/usage/by-persona").await;
+        assert_eq!(status, StatusCode::OK);
+        let list = body.as_array().expect("a JSON array");
+        assert!(
+            list.iter().any(|p| p["personaId"] == "aria"),
+            "aria's global entry should be present: {body}"
+        );
+
+        // The group-scoped by-persona breakdown — same last path segment, a
+        // different route entirely.
+        let (status, body) = get_json(app, "/groups/lab/debug/usage/by-persona").await;
+        assert_eq!(status, StatusCode::OK);
+        let list = body.as_array().expect("a JSON array");
+        assert!(
+            list.iter().any(|p| p["personaId"] == "aria"),
+            "aria's group-scoped entry should be present: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn default_cors_allows_any_origin() {
         let allowed = preflight_allow_origin(router(state(), None), "https://evil.example").await;

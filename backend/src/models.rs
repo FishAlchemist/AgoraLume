@@ -459,6 +459,14 @@ pub struct TokenUsage {
     pub cached_prompt_tokens: u64,
 }
 
+/// The synthetic `persona_id` a trace carries when it isn't any character's
+/// own decision — context compression (`summarize`) and chat-suggestion
+/// generation (`suggest`) both call the model but aren't attributable to one
+/// member, so they're recorded under this shared pseudo-identity rather than
+/// silently folding into the model-only totals with no per-agent visibility
+/// at all.
+pub const SYSTEM_PERSONA_ID: &str = "system";
+
 /// A debug record of one agent inference: exactly the system + context the
 /// character's model received, what it decided, and the tokens it cost. Streamed
 /// live as a `debug` SSE frame and available in bulk for panel hydration.
@@ -581,9 +589,10 @@ pub struct DebugUsage {
     pub models: Vec<ModelUsage>,
 }
 
-/// One persona's own slice of a group's usage — a further breakdown of that
-/// group's [`DebugUsage`] by which character is driving the spend. `GET
-/// /groups/{id}/debug/usage/by-persona`.
+/// One persona's own slice of a usage total — a further breakdown by which
+/// character is driving the spend. Serves both `GET
+/// /groups/{id}/debug/usage/by-persona` (one group's [`DebugUsage`]) and the
+/// site-wide `GET /debug/usage/by-persona` (summed across every group).
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonaUsage {

@@ -10,6 +10,7 @@ import {
   NumberInput,
   Paper,
   PasswordInput,
+  ScrollArea,
   SegmentedControl,
   Select,
   Stack,
@@ -25,11 +26,17 @@ import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { DataSourceBadge } from '../components/DataSourceBadge';
-import { UsageSummary } from '../components/UsageSummary';
+import { PersonaUsageRow, UsageSummary } from '../components/UsageSummary';
 import { UI_LANGUAGES } from '../i18n';
 import { api } from '../lib/api';
 import { getLlmSettings, listLlmModels, updateLlmSettings } from '../lib/api/llmSettings';
-import type { DebugUsage, LlmSettingsPatch, LlmSettingsView, ServerMeta } from '../lib/api/types';
+import type {
+  DebugUsage,
+  LlmSettingsPatch,
+  LlmSettingsView,
+  PersonaUsage,
+  ServerMeta,
+} from '../lib/api/types';
 import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
 import { useWorkspace } from '../store/workspace';
@@ -204,13 +211,18 @@ export function SettingsPage() {
 function UsageSettings() {
   const { t } = useTranslation();
   const [usage, setUsage] = useState<DebugUsage | null>(null);
+  const [personaUsage, setPersonaUsage] = useState<PersonaUsage[]>([]);
   const [meta, setMeta] = useState<ServerMeta | null>(null);
+  const personas = useWorkspace((s) => s.personas);
 
   useEffect(() => {
     let active = true;
     const load = () => {
       void api.getUsage().then((u) => {
         if (active) setUsage(u);
+      });
+      void api.getGlobalPersonaUsage().then((list) => {
+        if (active) setPersonaUsage(list);
       });
       void api.probe().then((m) => {
         if (active) setMeta(m);
@@ -224,6 +236,12 @@ function UsageSettings() {
     };
   }, []);
 
+  // Same reasoning as the per-group debug panel: only personas with at least
+  // one recorded inference, so a fresh install doesn't list every character
+  // at a flat zero.
+  const activePersonaUsage = personaUsage.filter((entry) => entry.usage.requests > 0);
+  const personaMap = new Map(personas.map((p) => [p.id, p]));
+
   return (
     <Stack gap={4}>
       <UsageSummary
@@ -236,6 +254,29 @@ function UsageSettings() {
         <Text size="xs" c={meta.persistent ? 'teal' : 'dimmed'}>
           {meta.persistent ? t('settings.usagePersisted') : t('settings.usageNotPersisted')}
         </Text>
+      )}
+
+      {activePersonaUsage.length > 0 && (
+        <Accordion variant="separated" chevronPosition="left">
+          {/* Collapsed by default, same as the per-group breakdown — this is
+              every character across every group, so it can get long. */}
+          <Accordion.Item value="by-persona">
+            <Accordion.Control>
+              <Text size="xs" fw={600} c="dimmed">
+                {t('debug.byPersona')} ({activePersonaUsage.length})
+              </Text>
+            </Accordion.Control>
+            <Accordion.Panel>
+              <ScrollArea.Autosize mah={200}>
+                <Stack gap={4}>
+                  {activePersonaUsage.map((entry) => (
+                    <PersonaUsageRow key={entry.personaId} entry={entry} personas={personaMap} />
+                  ))}
+                </Stack>
+              </ScrollArea.Autosize>
+            </Accordion.Panel>
+          </Accordion.Item>
+        </Accordion>
       )}
     </Stack>
   );

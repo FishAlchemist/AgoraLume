@@ -18,8 +18,8 @@ use crate::agent::turn::{
 };
 use crate::llm_config::{LlmConfigStore, LlmSettings, Pricing};
 use crate::models::{
-    AgentTrace, Cost, GroupSuggestions, Message, ReadReceipt, TokenUsage, Turn, TurnMember,
-    TurnMemberState, TurnTrigger,
+    AgentTrace, Cost, GroupSuggestions, Message, ReadReceipt, SYSTEM_PERSONA_ID, TokenUsage, Turn,
+    TurnMember, TurnMemberState, TurnTrigger,
 };
 use crate::persist::Persistence;
 use crate::workspace::Workspace;
@@ -165,6 +165,25 @@ impl ModelTotals {
             Some(acc) if acc.currency == trace_cost.currency => acc.add(trace_cost),
             _ => trace_cost,
         });
+    }
+
+    /// Folds another totals record in, component-wise — used to sum one
+    /// persona's already-accumulated totals *across groups* at read time
+    /// (see [`AppState::global_persona_debug_totals_all`]), as opposed to
+    /// [`Self::add_usage`] folding in one trace's raw usage.
+    fn merge(&mut self, other: &ModelTotals) {
+        self.requests += other.requests;
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+        self.cached_prompt_tokens += other.cached_prompt_tokens;
+        self.cost = match (self.cost.take(), other.cost.clone()) {
+            (Some(acc), Some(other_cost)) if acc.currency == other_cost.currency => {
+                Some(acc.add(other_cost))
+            }
+            (Some(acc), _) => Some(acc),
+            (None, other_cost) => other_cost,
+        };
     }
 }
 
@@ -466,8 +485,15 @@ impl AppState {
 
     /// A snapshot of one group's own cumulative usage and accrued cost —
     /// independent of every other group's, unlike [`Self::debug_totals`].
+    /// Deliberately does *not* call [`Self::ensure_loaded`] — usage totals
+    /// live entirely under `usage/`, independent of a group's message log, so
+    /// there's no reason a usage read should also pull that group's whole
+    /// chat history into memory. That distinction matters once a caller reads
+    /// usage for *every* group at once (see
+    /// [`Self::global_persona_debug_totals_all`]) — going through
+    /// `ensure_loaded` there would force-load every group's full history on
+    /// the first call.
     pub fn group_debug_totals(&self, group_id: &str) -> DebugTotals {
-        self.ensure_loaded(group_id);
         DebugTotals {
             models: self.debug.lock().unwrap().group_models.get(group_id).cloned().unwrap_or_default(),
         }
@@ -475,9 +501,10 @@ impl AppState {
 
     /// A snapshot of one persona's own cumulative usage *within* a group — a
     /// further slice of [`Self::group_debug_totals`], for spotting which
-    /// character in a group is driving the token spend.
+    /// character in a group is driving the token spend. Same reasoning as
+    /// [`Self::group_debug_totals`]: only the usage-specific lazy load runs
+    /// here, not the group's message log.
     pub fn persona_debug_totals(&self, group_id: &str, persona_id: &str) -> DebugTotals {
-        self.ensure_loaded(group_id);
         self.ensure_persona_loaded(group_id, persona_id);
         DebugTotals {
             models: self
@@ -496,15 +523,43 @@ impl AppState {
     /// the full by-persona breakdown behind `GET
     /// /groups/{id}/debug/usage/by-persona`. Scoped to the group's *current*
     /// AI members (not every persona that ever produced a trace), matching
-    /// who the debug panel shows traces for today.
+    /// who the debug panel shows traces for today — plus the synthetic
+    /// [`SYSTEM_PERSONA_ID`] bucket (context compression, chat suggestions),
+    /// which isn't a roster member but still spends real tokens *within* this
+    /// group and would otherwise never surface in a per-agent breakdown.
     pub fn persona_debug_totals_all(&self, group_id: &str) -> Vec<(String, DebugTotals)> {
         let Some((_, member_ids)) = self.workspace().turn_members(group_id) else {
             return Vec::new();
         };
-        member_ids
-            .iter()
+        let mut ids = member_ids;
+        if !ids.iter().any(|id| id == SYSTEM_PERSONA_ID) {
+            ids.push(SYSTEM_PERSONA_ID.to_string());
+        }
+        ids.iter()
             .map(|persona_id| (persona_id.clone(), self.persona_debug_totals(group_id, persona_id)))
             .collect()
+    }
+
+    /// Every AI persona's usage summed *across every group* in the workspace
+    /// — the global analogue of [`Self::persona_debug_totals_all`], for
+    /// spotting which character is expensive site-wide rather than within one
+    /// chat. Deliberately not a separate persisted accumulator: it's computed
+    /// fresh from the same per-group per-persona totals every group-level
+    /// call already uses (forcing each into memory via
+    /// [`Self::ensure_persona_loaded`] along the way), so this always *is*
+    /// their sum and there's nothing that could drift out of sync with them.
+    pub fn global_persona_debug_totals_all(&self) -> Vec<(String, DebugTotals)> {
+        let group_ids: Vec<String> = self.workspace().groups.iter().map(|g| g.id.clone()).collect();
+        let mut totals: HashMap<String, DebugTotals> = HashMap::new();
+        for group_id in &group_ids {
+            for (persona_id, group_totals) in self.persona_debug_totals_all(group_id) {
+                let entry = totals.entry(persona_id).or_default();
+                for (model, model_totals) in group_totals.models {
+                    entry.models.entry(model).or_default().merge(&model_totals);
+                }
+            }
+        }
+        totals.into_iter().collect()
     }
 
     /// The recent traces for a group, oldest first.
@@ -1357,12 +1412,62 @@ mod tests {
         assert_eq!(group.models["gpt-4o-mini"].requests, 3, "group total sums every persona");
 
         let all = state.persona_debug_totals_all("lab");
-        assert_eq!(all.len(), 2, "lab's two AI members, aria and nox");
+        assert_eq!(
+            all.len(),
+            3,
+            "lab's two AI members (aria, nox) plus the synthetic system bucket"
+        );
         let aria_entry = &all.iter().find(|(id, _)| id == "aria").unwrap().1;
         assert_eq!(aria_entry.models["gpt-4o-mini"].requests, 2);
+        let system_entry = &all.iter().find(|(id, _)| id == SYSTEM_PERSONA_ID).unwrap().1;
+        assert!(
+            system_entry.models.is_empty(),
+            "no compression/suggestion trace was recorded, so system reports zero"
+        );
 
         // A member persona with no traces in this group reports zero, not the
         // group total.
         assert!(state.persona_debug_totals("lab", "sol").models.is_empty());
+    }
+
+    #[test]
+    fn system_bucket_surfaces_compression_and_suggestion_spend_alongside_real_personas() {
+        let state = AppState::with_runtime(AgentRuntime::mock());
+        state.record_trace("lab", trace_as("lab", "aria", "gpt-4o-mini", 100));
+        state.record_trace(
+            "lab",
+            trace_as("lab", SYSTEM_PERSONA_ID, "gpt-4o-mini", 500),
+        );
+
+        let all = state.persona_debug_totals_all("lab");
+        let system_entry = &all.iter().find(|(id, _)| id == SYSTEM_PERSONA_ID).unwrap().1;
+        assert_eq!(
+            system_entry.models["gpt-4o-mini"].prompt_tokens, 500,
+            "compression/suggestion cost is attributed to the system bucket, not lost"
+        );
+    }
+
+    #[test]
+    fn global_persona_totals_sum_one_persona_across_every_group_it_appears_in() {
+        let state = AppState::with_runtime(AgentRuntime::mock());
+        // "lab" and "lounge" are both seeded groups with aria as an AI member;
+        // nox is only in "lab".
+        state.record_trace("lab", trace_as("lab", "aria", "gpt-4o-mini", 100));
+        state.record_trace("lounge", trace_as("lounge", "aria", "gpt-4o-mini", 300));
+        state.record_trace("lab", trace_as("lab", "nox", "gpt-4o-mini", 900));
+
+        let global = state.global_persona_debug_totals_all();
+        let aria_entry = &global.iter().find(|(id, _)| id == "aria").unwrap().1;
+        assert_eq!(
+            aria_entry.models["gpt-4o-mini"].prompt_tokens, 400,
+            "aria's spend summed across both groups she's in"
+        );
+        assert_eq!(aria_entry.models["gpt-4o-mini"].requests, 2);
+
+        let nox_entry = &global.iter().find(|(id, _)| id == "nox").unwrap().1;
+        assert_eq!(
+            nox_entry.models["gpt-4o-mini"].prompt_tokens, 900,
+            "nox only appears in lab, so her global total is just that group's"
+        );
     }
 }

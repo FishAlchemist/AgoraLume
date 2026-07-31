@@ -233,6 +233,7 @@ export const en = {
     showDetails: 'Show details',
     byModel: 'By model',
     byPersona: 'By character',
+    systemPersona: 'System (summaries & suggestions)',
     unknownModel: 'Mock (no real model)',
     export: 'Export',
     exportTitle: 'Export this group’s debug trace as JSON',

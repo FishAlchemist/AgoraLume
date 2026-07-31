@@ -1,10 +1,62 @@
 import { Accordion, Alert, Badge, Code, Group, Stack, Text, Tooltip } from '@mantine/core';
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { DebugUsage, ModelUsage } from '../lib/api/types';
+import type { DebugUsage, ModelUsage, PersonaUsage } from '../lib/api/types';
+import type { Persona } from '../types';
 
 const fmt = (n: number) => n.toLocaleString();
 const pct = (ratio: number) => `${(ratio * 100).toFixed(1)}%`;
+
+/** Mirrors the backend's `SYSTEM_PERSONA_ID` (models.rs) — the synthetic
+ * persona id context compression and chat-suggestion traces are recorded
+ * under. Not a real character, so it needs its own label rather than falling
+ * back to a raw "system" id with no persona to look up. If the backend
+ * constant is ever renamed, this needs to follow. */
+const SYSTEM_PERSONA_ID = 'system';
+
+/**
+ * One character's row in a by-persona usage breakdown — shared by the
+ * per-group debug panel and Settings' site-wide breakdown, which differ only
+ * in which {@link PersonaUsage} list they pass in.
+ */
+export function PersonaUsageRow({
+  entry,
+  personas,
+}: {
+  entry: PersonaUsage;
+  personas: Map<string, Persona>;
+}) {
+  const { t } = useTranslation();
+  const persona = personas.get(entry.personaId);
+  const name =
+    entry.personaId === SYSTEM_PERSONA_ID
+      ? t('debug.systemPersona')
+      : (persona?.name ?? entry.personaId);
+  const cost = entry.usage.estimatedCost;
+  const meta = [
+    `${fmt(entry.usage.requests)}×`,
+    `${fmt(entry.usage.promptTokens)}→${fmt(entry.usage.completionTokens)}`,
+    entry.usage.cachedPromptTokens > 0 &&
+      `${t('debug.cached')} ${fmt(entry.usage.cachedPromptTokens)}`,
+  ]
+    .filter(Boolean)
+    .join('  ·  ');
+  return (
+    <Group gap="xs" wrap="nowrap" justify="space-between">
+      <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+        <Text size="xs" fw={600} truncate>
+          {name}
+        </Text>
+        <Text size="xs" c="dimmed" ff="monospace" truncate>
+          {meta}
+        </Text>
+      </Group>
+      <Text size="xs" c="dimmed" ff="monospace">
+        {cost ? `${cost.total.toFixed(4)} ${cost.currency}` : '—'}
+      </Text>
+    </Group>
+  );
+}
 
 /** One labelled figure in the detail grid. */
 function Stat({ label, value }: { label: string; value: string }) {

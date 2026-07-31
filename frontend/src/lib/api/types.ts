@@ -333,6 +333,14 @@ export interface ChatApi {
   getPersonaUsage(groupId: string): Promise<PersonaUsage[]>;
 
   /**
+   * Usage broken down by persona, site-wide — the global analogue of
+   * {@link getPersonaUsage}: each AI persona's own spend summed across every
+   * group it's a member of, plus the synthetic "system" bucket (context
+   * compression, chat suggestions). Sorted by total tokens descending.
+   */
+  getGlobalPersonaUsage(): Promise<PersonaUsage[]>;
+
+  /**
    * Recent agent traces for a group — for hydrating the debug panel on open.
    * Live updates then arrive via {@link subscribeDebug}.
    */

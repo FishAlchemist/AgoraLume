@@ -21,6 +21,17 @@ export interface paths {
      */
     get: operations["debug_usage"];
   };
+  "/debug/usage/by-persona": {
+    /**
+     * Usage broken down by persona, site-wide — the global analogue of
+     * [`group_debug_usage_by_persona`], for spotting which character is
+     * expensive across every group rather than within one chat. Covers every AI
+     * persona in the workspace plus the synthetic "system" bucket (context
+     * compression, chat suggestions); sorted by total tokens descending. No
+     * group to miss, so unlike the per-group endpoints there's no 404 case.
+     */
+    get: operations["global_debug_usage_by_persona"];
+  };
   "/departments": {
     get: operations["list_depts"];
     post: operations["create_dept"];
@@ -632,9 +643,10 @@ export interface components {
      */
     PersonaKind: "user" | "ai";
     /**
-     * @description One persona's own slice of a group's usage — a further breakdown of that
-     * group's [`DebugUsage`] by which character is driving the spend. `GET
-     * /groups/{id}/debug/usage/by-persona`.
+     * @description One persona's own slice of a usage total — a further breakdown by which
+     * character is driving the spend. Serves both `GET
+     * /groups/{id}/debug/usage/by-persona` (one group's [`DebugUsage`]) and the
+     * site-wide `GET /debug/usage/by-persona` (summed across every group).
      */
     PersonaUsage: {
       personaId: string;
@@ -842,6 +854,24 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["DebugUsage"];
+        };
+      };
+    };
+  };
+  /**
+   * Usage broken down by persona, site-wide — the global analogue of
+   * [`group_debug_usage_by_persona`], for spotting which character is
+   * expensive across every group rather than within one chat. Covers every AI
+   * persona in the workspace plus the synthetic "system" bucket (context
+   * compression, chat suggestions); sorted by total tokens descending. No
+   * group to miss, so unlike the per-group endpoints there's no 404 case.
+   */
+  global_debug_usage_by_persona: {
+    responses: {
+      /** @description Every AI persona's usage, summed across every group */
+      200: {
+        content: {
+          "application/json": components["schemas"]["PersonaUsage"][];
         };
       };
     };

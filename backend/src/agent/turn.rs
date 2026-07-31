@@ -22,7 +22,9 @@ use crate::agent::brain::{
 };
 use crate::agent::event::{Event, Salience, appraise};
 use crate::agent::mock::RuleBrain;
-use crate::models::{AgentTrace, GroupSuggestions, Message, TurnMemberState, TurnTrigger, now_ms};
+use crate::models::{
+    AgentTrace, GroupSuggestions, Message, SYSTEM_PERSONA_ID, TurnMemberState, TurnTrigger, now_ms,
+};
 use crate::state::{AppState, GroupSummary};
 use crate::workspace::RosterMember;
 
@@ -278,7 +280,7 @@ async fn maybe_compress(state: &Arc<AppState>, group_id: &str) {
                 AgentTrace {
                     ts: now_ms(),
                     group_id: group_id.to_string(),
-                    persona_id: "system".to_string(),
+                    persona_id: SYSTEM_PERSONA_ID.to_string(),
                     persona_name: "Context summary".to_string(),
                     system: String::new(),
                     conversation: folded,
@@ -865,7 +867,7 @@ pub async fn generate_suggestions(state: Arc<AppState>, group_id: String) {
                     AgentTrace {
                         ts: now_ms(),
                         group_id: group_id.clone(),
-                        persona_id: "system".to_string(),
+                        persona_id: SYSTEM_PERSONA_ID.to_string(),
                         persona_name: "Chat suggestions".to_string(),
                         // The exact prompt the pass ran on, so the debug panel shows
                         // what informed the openers beyond the standing instruction.

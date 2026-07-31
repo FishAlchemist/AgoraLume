@@ -33,6 +33,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(debug_traces))
         .routes(routes!(group_debug_usage))
         .routes(routes!(group_debug_usage_by_persona))
+        .routes(routes!(global_debug_usage_by_persona))
         .routes(routes!(stream))
 }
 
@@ -119,6 +120,25 @@ async fn group_debug_usage_by_persona(
         .collect();
     list.sort_by_key(|p| std::cmp::Reverse(p.usage.total_tokens));
     Ok(Json(list))
+}
+
+/// Usage broken down by persona, site-wide — the global analogue of
+/// [`group_debug_usage_by_persona`], for spotting which character is
+/// expensive across every group rather than within one chat. Covers every AI
+/// persona in the workspace plus the synthetic "system" bucket (context
+/// compression, chat suggestions); sorted by total tokens descending. No
+/// group to miss, so unlike the per-group endpoints there's no 404 case.
+#[utoipa::path(get, path = "/debug/usage/by-persona", tag = "service",
+    responses(
+        (status = 200, description = "Every AI persona's usage, summed across every group", body = Vec<PersonaUsage>)))]
+async fn global_debug_usage_by_persona(State(state): State<Arc<AppState>>) -> Json<Vec<PersonaUsage>> {
+    let mut list: Vec<PersonaUsage> = state
+        .global_persona_debug_totals_all()
+        .into_iter()
+        .map(|(persona_id, totals)| PersonaUsage { persona_id, usage: debug_usage_view(totals) })
+        .collect();
+    list.sort_by_key(|p| std::cmp::Reverse(p.usage.total_tokens));
+    Json(list)
 }
 
 /// Turns a raw per-model breakdown into the `DebugUsage` wire shape: the grand

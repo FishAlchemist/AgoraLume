@@ -232,6 +232,7 @@ export const zhHant: TranslationSchema = {
     showDetails: '顯示明細',
     byModel: '依模型',
     byPersona: '依角色',
+    systemPersona: '系統（摘要／建議）',
     unknownModel: '模擬（無實際模型）',
     export: '匯出',
     exportTitle: '將此群組的除錯紀錄匯出成 JSON',

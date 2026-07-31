@@ -22,7 +22,7 @@ import { useBackendStatus } from '../lib/useBackendStatus';
 import { useConnection } from '../store/connection';
 import type { Persona } from '../types';
 import { CopyIconButton } from './CopyIconButton';
-import { UsageSummary } from './UsageSummary';
+import { PersonaUsageRow, UsageSummary } from './UsageSummary';
 
 const fmt = (n: number) => n.toLocaleString();
 
@@ -249,35 +249,6 @@ export function DebugPanel({ groupId, personas }: Props) {
         )}
       </Stack>
     </Paper>
-  );
-}
-
-/** One character's row in the by-persona usage breakdown. */
-function PersonaUsageRow({
-  entry,
-  personas,
-}: {
-  entry: PersonaUsage;
-  personas: Map<string, Persona>;
-}) {
-  const persona = personas.get(entry.personaId);
-  const name = persona?.name ?? entry.personaId;
-  const cost = entry.usage.estimatedCost;
-  return (
-    <Group gap="xs" wrap="nowrap" justify="space-between">
-      <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-        <Text size="xs" fw={600} truncate>
-          {name}
-        </Text>
-        <Text size="xs" c="dimmed" ff="monospace" truncate>
-          {fmt(entry.usage.requests)}× · {fmt(entry.usage.promptTokens)}→
-          {fmt(entry.usage.completionTokens)}
-        </Text>
-      </Group>
-      <Text size="xs" c="dimmed" ff="monospace">
-        {cost ? `${cost.total.toFixed(4)} ${cost.currency}` : '—'}
-      </Text>
-    </Group>
   );
 }
 

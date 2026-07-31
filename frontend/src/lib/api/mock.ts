@@ -171,6 +171,15 @@ export class MockChatApi implements ChatApi {
     return aiIds.map((personaId) => ({ personaId, usage }));
   }
 
+  // Same reasoning again, at global scope: every AI persona in the workspace,
+  // not scoped to any one group.
+  async getGlobalPersonaUsage(): Promise<PersonaUsage[]> {
+    const state = useWorkspace.getState();
+    const aiIds = state.personas.filter((p) => p.kind === 'ai').map((p) => p.id);
+    const usage = await this.getUsage();
+    return aiIds.map((personaId) => ({ personaId, usage }));
+  }
+
   async listTraces(): Promise<AgentTrace[]> {
     return [];
   }
