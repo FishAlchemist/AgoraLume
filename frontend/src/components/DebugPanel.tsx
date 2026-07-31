@@ -304,6 +304,21 @@ function TraceItem({
   const fullTime = new Date(trace.ts).toLocaleString(i18n.language);
   const contextText = trace.conversation.trim();
 
+  // One coherent, dot-joined line rather than several independently-wrapping
+  // chips — the same "a · b→c" idiom PersonaUsageRow/ModelRow already use for
+  // a row's secondary detail line, so it reads as one stat readout instead of
+  // loose fragments jammed next to each other.
+  const meta = [
+    time,
+    duration,
+    trace.usage &&
+      `${t('debug.inputTokens')} ${fmt(trace.usage.promptTokens)} → ${t('debug.outputTokens')} ${fmt(trace.usage.completionTokens)}`,
+    trace.estimatedCost &&
+      `${trace.estimatedCost.total.toFixed(4)} ${trace.estimatedCost.currency}`,
+  ]
+    .filter(Boolean)
+    .join('  ·  ');
+
   return (
     <Accordion.Item value={value}>
       <Accordion.Control>
@@ -316,27 +331,9 @@ function TraceItem({
               {trace.action}
             </Badge>
           </Group>
-          <Group gap={8} wrap="wrap">
-            <Text size="xs" c="dimmed" title={fullTime}>
-              {time}
-            </Text>
-            {duration && (
-              <Text size="xs" c="dimmed" ff="monospace">
-                {duration}
-              </Text>
-            )}
-            {trace.usage && (
-              <Text size="xs" c="dimmed" ff="monospace">
-                {t('debug.inputTokens')} {fmt(trace.usage.promptTokens)} → {t('debug.outputTokens')}{' '}
-                {fmt(trace.usage.completionTokens)}
-              </Text>
-            )}
-            {trace.estimatedCost && (
-              <Text size="xs" c="dimmed" ff="monospace">
-                {trace.estimatedCost.total.toFixed(4)} {trace.estimatedCost.currency}
-              </Text>
-            )}
-          </Group>
+          <Text size="xs" c="dimmed" ff="monospace" title={fullTime}>
+            {meta}
+          </Text>
         </Stack>
       </Accordion.Control>
       <Accordion.Panel>
