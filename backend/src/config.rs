@@ -5,13 +5,30 @@
 //! without a restart and shouldn't round-trip a key through a client.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use crate::persist;
+
+/// The account served when nothing overrides `AGORALUME_ACCOUNT_ID`. There's
+/// no create-account flow yet — every install effectively has exactly this
+/// one account — so a fixed name is fine for now; see
+/// [`Config::account_data_dir`].
+const DEFAULT_ACCOUNT_ID: &str = "default";
 
 pub struct Config {
     /// Address the HTTP server binds to.
     pub bind: SocketAddr,
-    /// Directory for on-disk state (`workspace.json`, `messages/`, `usage.json`,
-    /// `llm.toml`), read from `AGORALUME_DATA_DIR`.
+    /// Root directory for on-disk state, read from `AGORALUME_DATA_DIR`.
+    /// `llm.toml` lives directly under this root (shared, operator-level);
+    /// everything else lives under this account's own subtree — see
+    /// [`Self::account_data_dir`].
     pub data_dir: String,
+    /// Which account's data this run serves, from `AGORALUME_ACCOUNT_ID`
+    /// (default `"default"`). The backend can already keep several accounts'
+    /// data apart on disk, but there's no login yet to choose between them
+    /// per request — one process still serves exactly one account, picked
+    /// here at startup.
+    pub account_id: String,
     /// Explicit override for whether the workspace and chat logs persist to
     /// `data_dir` (`AGORALUME_PERSIST`). `None` means "use the default", which
     /// `main` resolves once `llm.toml` is loaded — a real-model run defaults to
@@ -64,6 +81,8 @@ impl Config {
             .parse()
             .unwrap_or_else(|_| panic!("invalid AGORALUME_BIND `{bind}` (want host:port)"));
         let data_dir = std::env::var("AGORALUME_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+        let account_id =
+            std::env::var("AGORALUME_ACCOUNT_ID").unwrap_or_else(|_| DEFAULT_ACCOUNT_ID.to_string());
         let persist_override = env_flag_opt("AGORALUME_PERSIST");
         let web_dir = std::env::var("AGORALUME_WEB_DIR").ok();
         // Default on, so double-clicking the bundle "just works"; only an
@@ -80,11 +99,20 @@ impl Config {
         Self {
             bind,
             data_dir,
+            account_id,
             persist_override,
             web_dir,
             open_browser,
             cors_allowed_origins,
         }
+    }
+
+    /// This account's own subtree under `data_dir`:
+    /// `<data_dir>/accounts/<sanitized account_id>`. The only thing that
+    /// currently reads this is `main`, to point `Persistence` at it —
+    /// `llm.toml` stays at `data_dir`'s root regardless of account.
+    pub fn account_data_dir(&self) -> PathBuf {
+        PathBuf::from(&self.data_dir).join("accounts").join(persist::sanitize(&self.account_id))
     }
 }
 
@@ -136,5 +164,29 @@ mod tests {
     fn parse_csv_all_blank_is_empty() {
         assert!(parse_csv(" , , ").is_empty());
         assert!(parse_csv("").is_empty());
+    }
+
+    fn config_with(data_dir: &str, account_id: &str) -> Config {
+        Config {
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            data_dir: data_dir.to_string(),
+            account_id: account_id.to_string(),
+            persist_override: None,
+            web_dir: None,
+            open_browser: false,
+            cors_allowed_origins: None,
+        }
+    }
+
+    #[test]
+    fn account_data_dir_nests_the_account_under_the_data_root() {
+        let config = config_with("./data", "default");
+        assert_eq!(config.account_data_dir(), PathBuf::from("./data/accounts/default"));
+    }
+
+    #[test]
+    fn account_data_dir_sanitizes_the_account_id() {
+        let config = config_with("./data", "../evil");
+        assert_eq!(config.account_data_dir(), PathBuf::from("./data/accounts/___evil"));
     }
 }

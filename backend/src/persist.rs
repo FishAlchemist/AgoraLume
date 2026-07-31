@@ -1,6 +1,7 @@
 //! Optional on-disk persistence for the workspace and per-group chat logs.
 //!
-//! Layout under the data directory (`AGORALUME_DATA_DIR`):
+//! Layout under an account's data directory
+//! (`<AGORALUME_DATA_DIR>/accounts/<account_id>/` — see [`crate::config::Config`]):
 //!
 //! ```text
 //! workspace.json               the whole editable workspace (small; loaded at startup)
@@ -11,6 +12,14 @@
 //! usage/<group_id>.json                  one group's own usage counters + accrued cost (loaded with its log)
 //! usage/<group_id>/<persona_id>.json     one persona's own usage within that group (loaded lazily, per persona)
 //! ```
+//!
+//! `Persistence` itself doesn't know accounts exist — it's just handed
+//! whichever directory is its account's own subtree; see
+//! [`migrate_legacy_layout`] for the one-time upgrade from the pre-account
+//! flat layout (everything directly under `data_dir`, no `accounts/` level).
+//! `llm.toml` (see [`crate::llm_config`]) is the one exception: it stays at
+//! the `data_dir` root, shared by every account, since it's operator-level
+//! provider configuration rather than per-account data.
 //!
 //! Splitting the message logs off the workspace means a running server only
 //! reads a group's history the first time that group is touched — the "read on
@@ -357,8 +366,10 @@ fn write_atomic<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
 
 /// Keeps a group id usable as a filename. Ids are uuids or short slugs, but a
 /// hand-supplied id could contain a path separator; mapping anything outside
-/// `[A-Za-z0-9_-]` to `_` keeps writes inside the messages directory.
-fn sanitize(id: &str) -> String {
+/// `[A-Za-z0-9_-]` to `_` keeps writes inside the messages directory. Also
+/// used by [`crate::config::Config::account_data_dir`] for the same reason,
+/// applied to an account id instead of a group/persona one.
+pub(crate) fn sanitize(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
@@ -381,6 +392,65 @@ fn quarantine(path: &Path) {
             tracing::warn!(path = %path.display(), error = %e, "could not preserve an unreadable file");
         }
     }
+}
+
+/// The top-level entries a pre-account install could have directly under
+/// `data_dir`. Kept as one list so [`migrate_legacy_layout`] and its tests
+/// can't drift from each other.
+const LEGACY_ENTRIES: &[&str] =
+    &["workspace.json", "messages", "summaries", "suggestions", "usage.json", "usage"];
+
+/// One-time upgrade from the pre-account flat layout (`<data_dir>/workspace.json`
+/// etc., directly under the data dir) to the per-account layout
+/// (`<data_dir>/accounts/<id>/workspace.json`). Safe to call on every startup:
+/// a no-op once there's nothing left at the legacy paths.
+///
+/// Moves rather than copies — each entry is renamed, not deleted, so a
+/// failure partway through leaves the remainder at their old paths instead of
+/// losing them. Never overwrites: if `account_dir` already has its own
+/// `workspace.json`, migration is skipped entirely and the legacy files are
+/// left untouched, since that shape (both present) means either migration
+/// already ran or something else wrote there — either way, guessing wrong
+/// would destroy data.
+///
+/// `llm.toml` is never touched: it lives at `data_dir`'s root regardless of
+/// account, so there's nothing to move for it.
+pub fn migrate_legacy_layout(data_dir: &Path, account_dir: &Path) {
+    let legacy_workspace = data_dir.join("workspace.json");
+    if !legacy_workspace.is_file() {
+        return; // fresh install, or already migrated
+    }
+    if account_dir.join("workspace.json").is_file() {
+        tracing::warn!(
+            legacy = %data_dir.display(),
+            account = %account_dir.display(),
+            "both a legacy flat workspace.json and an account workspace.json exist; leaving both alone"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(account_dir) {
+        tracing::warn!(dir = %account_dir.display(), error = %e, "could not create the account data directory; skipping migration");
+        return;
+    }
+    for name in LEGACY_ENTRIES {
+        let src = data_dir.join(name);
+        if !src.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&src, account_dir.join(name)) {
+            tracing::warn!(
+                entry = name,
+                from = %src.display(),
+                to = %account_dir.display(),
+                error = %e,
+                "failed to migrate a legacy data entry into the account directory"
+            );
+        }
+    }
+    tracing::info!(
+        account = %account_dir.display(),
+        "migrated legacy flat data layout into the account directory"
+    );
 }
 
 #[cfg(test)]
@@ -582,6 +652,84 @@ mod tests {
 
         assert!(store.load_workspace().is_none());
         assert!(!store.workspace_path().exists(), "the corrupt file was moved aside");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writes a minimal legacy (pre-account) flat layout directly under `dir`:
+    /// a `workspace.json`, one message log, and `llm.toml` — enough to prove
+    /// the six known entries move and the untouched sibling doesn't.
+    fn write_legacy_layout(dir: &Path) {
+        std::fs::write(dir.join("workspace.json"), b"{\"version\":1,\"data\":{}}").unwrap();
+        std::fs::create_dir_all(dir.join("messages")).unwrap();
+        std::fs::write(dir.join("messages").join("g1.json"), b"[]").unwrap();
+        std::fs::write(dir.join("usage.json"), b"{}").unwrap();
+        std::fs::write(dir.join("llm.toml"), b"enabled = false\n").unwrap();
+    }
+
+    #[test]
+    fn migrate_legacy_layout_moves_known_entries_and_leaves_llm_toml() {
+        let dir = temp_dir();
+        write_legacy_layout(&dir);
+        let account_dir = dir.join("accounts").join("default");
+
+        migrate_legacy_layout(&dir, &account_dir);
+
+        assert!(account_dir.join("workspace.json").is_file());
+        assert!(account_dir.join("messages").join("g1.json").is_file());
+        assert!(account_dir.join("usage.json").is_file());
+        assert!(!dir.join("workspace.json").exists(), "legacy workspace.json was moved, not copied");
+        assert!(!dir.join("messages").exists());
+        assert!(dir.join("llm.toml").is_file(), "llm.toml stays at the data-dir root");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_legacy_layout_is_a_no_op_the_second_time() {
+        let dir = temp_dir();
+        write_legacy_layout(&dir);
+        let account_dir = dir.join("accounts").join("default");
+
+        migrate_legacy_layout(&dir, &account_dir);
+        // Nothing left at the legacy paths, so a second call must be a no-op
+        // rather than erroring on a missing source.
+        migrate_legacy_layout(&dir, &account_dir);
+
+        assert!(account_dir.join("workspace.json").is_file());
+        assert!(account_dir.join("messages").join("g1.json").is_file());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_legacy_layout_no_ops_when_there_is_nothing_legacy_to_move() {
+        let dir = temp_dir();
+        let account_dir = dir.join("accounts").join("default");
+
+        migrate_legacy_layout(&dir, &account_dir);
+
+        assert!(!account_dir.exists(), "a fresh install has nothing to migrate");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_legacy_layout_refuses_to_clobber_an_existing_account_workspace() {
+        let dir = temp_dir();
+        write_legacy_layout(&dir);
+        let account_dir = dir.join("accounts").join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(account_dir.join("workspace.json"), b"{\"version\":1,\"data\":{\"already\":true}}")
+            .unwrap();
+
+        migrate_legacy_layout(&dir, &account_dir);
+
+        // Neither side was touched: the legacy files are still there, and the
+        // account's own workspace.json is still whatever it already had.
+        assert!(dir.join("workspace.json").is_file(), "legacy file left alone");
+        let account_contents = std::fs::read_to_string(account_dir.join("workspace.json")).unwrap();
+        assert!(account_contents.contains("already"), "existing account file left alone");
 
         std::fs::remove_dir_all(&dir).ok();
     }

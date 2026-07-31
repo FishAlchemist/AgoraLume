@@ -18,7 +18,7 @@ mod state;
 mod workspace;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
@@ -94,7 +94,12 @@ async fn main() {
     // demo is throwaway — but either can be forced via `AGORALUME_PERSIST`.
     let persist = config.persist_override.unwrap_or(llm_settings.enabled);
     let state = if persist {
-        AppState::with_persistence(runtime, Persistence::new(&config.data_dir))
+        // One-time upgrade from the pre-account flat layout, if this data dir
+        // still has one — a no-op on every later run once nothing legacy is
+        // left. See `persist::migrate_legacy_layout`.
+        let account_dir = config.account_data_dir();
+        persist::migrate_legacy_layout(Path::new(&config.data_dir), &account_dir);
+        AppState::with_persistence(runtime, Persistence::new(&account_dir))
     } else {
         AppState::with_runtime(runtime)
     }
@@ -160,6 +165,7 @@ async fn main() {
     tracing::info!(
         %url,
         data_dir = %config.data_dir,
+        account_id = %config.account_id,
         persist,
         serving_web = web_dir.is_some(),
         "AgoraLume backend listening ({store}; {replies})"
