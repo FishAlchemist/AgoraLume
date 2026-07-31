@@ -19,6 +19,7 @@ const API_PREFIXES = [
   '/personas',
   '/groups',
   '/settings',
+  '/llm',
 ];
 
 // This config runs under Node; declare the globals we read so the app's
