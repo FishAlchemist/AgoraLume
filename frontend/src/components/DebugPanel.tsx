@@ -2,6 +2,7 @@ import {
   Accordion,
   ActionIcon,
   Badge,
+  Button,
   Code,
   Divider,
   Group,
@@ -12,7 +13,7 @@ import {
   Text,
   Tooltip,
 } from '@mantine/core';
-import { IconDownload } from '@tabler/icons-react';
+import { IconChevronUp, IconDownload } from '@tabler/icons-react';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../lib/api';
@@ -52,6 +53,12 @@ function formatTraceTime(ts: number, locale: string): string {
 interface Props {
   groupId: string;
   personas: Map<string, Persona>;
+  /** Collapses the whole panel. Also offered as a button at the panel's own
+   * end — on a phone, a busy group's panel (usage, by-persona breakdown, a
+   * page of traces) can run well past a screen height, and the header toggle
+   * that opened it scrolls out of view with it. Without this, closing means
+   * scrolling all the way back up first. */
+  onCollapse: () => void;
 }
 
 /** First 8 hex chars — enough to tell identity versions apart at a glance. */
@@ -63,7 +70,7 @@ const shortHash = (hash: string) => hash.slice(0, 8);
  * each character received and what it decided. Live via the group's `debug` SSE
  * frames. Harmless against the mock (shows zeros and a note).
  */
-export function DebugPanel({ groupId, personas }: Props) {
+export function DebugPanel({ groupId, personas, onCollapse }: Props) {
   const { t } = useTranslation();
   const backendUrl = useConnection((s) => s.backendUrl);
   const status = useBackendStatus();
@@ -247,6 +254,24 @@ export function DebugPanel({ groupId, personas }: Props) {
             </Group>
           </>
         )}
+
+        <Divider />
+
+        {/* Full-width so it's an easy tap target on a phone, and reachable
+            without scrolling back up to the header toggle that opened this
+            panel — the same reason it's a plain button, not just an icon,
+            since a thumb aiming at a tiny target after scrolling past a page
+            of traces is exactly the failure mode this exists to avoid. */}
+        <Button
+          variant="subtle"
+          color="gray"
+          size="xs"
+          fullWidth
+          leftSection={<IconChevronUp size={14} />}
+          onClick={onCollapse}
+        >
+          {t('debug.collapse')}
+        </Button>
       </Stack>
     </Paper>
   );

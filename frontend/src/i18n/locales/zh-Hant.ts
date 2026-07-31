@@ -236,6 +236,7 @@ export const zhHant: TranslationSchema = {
     unknownModel: '模擬（無實際模型）',
     export: '匯出',
     exportTitle: '將此群組的除錯紀錄匯出成 JSON',
+    collapse: '收合除錯面板',
   },
   settings: {
     title: '設定',

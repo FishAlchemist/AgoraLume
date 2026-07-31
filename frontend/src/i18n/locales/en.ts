@@ -237,6 +237,7 @@ export const en = {
     unknownModel: 'Mock (no real model)',
     export: 'Export',
     exportTitle: 'Export this group’s debug trace as JSON',
+    collapse: 'Collapse debug panel',
   },
   settings: {
     title: 'Settings',

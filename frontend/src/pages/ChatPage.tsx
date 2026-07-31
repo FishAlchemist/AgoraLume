@@ -151,7 +151,9 @@ export function ChatPage() {
 
       <Box flex={1} mih={0}>
         <Stack h="100%" gap={0}>
-          {debugOpen && <DebugPanel groupId={group.id} personas={personaMap} />}
+          {debugOpen && (
+            <DebugPanel groupId={group.id} personas={personaMap} onCollapse={debugHandlers.close} />
+          )}
           <Box flex={1} mih={0}>
             <ChatView key={group.id} group={group} personas={personaMap} />
           </Box>
