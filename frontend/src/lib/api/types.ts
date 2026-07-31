@@ -168,6 +168,15 @@ export interface LlmSettingsView {
   compressKeep: number;
   compressMaxTokens: number;
   pricing?: PricingSettings | null;
+  /**
+   * Whether *this caller* may write this config (`PATCH /llm/settings`,
+   * `POST /llm/models`) — the server's own permission decision (see
+   * `backend/src/models.rs`'s `LlmSettingsView::can_edit`), not something the
+   * frontend derives from its own copy of the session role. `SettingsPage`
+   * keys its write controls off this field so it can't drift from whatever
+   * the server actually enforces.
+   */
+  canEdit: boolean;
 }
 
 /**

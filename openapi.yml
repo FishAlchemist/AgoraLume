@@ -61,6 +61,48 @@ paths:
             text/plain:
               schema:
                 type: string
+  /v1beta/accounts/{account_id}:
+    patch:
+      tags:
+      - accounts
+      summary: |-
+        Changes an existing account's username, password, or both. Existing
+        access/refresh tokens for that account keep working across the change —
+        nothing here revokes them — the same as every other credentials update in
+        this codebase (there's no token blocklist yet).
+      operationId: update_account
+      parameters:
+      - name: account_id
+        in: path
+        description: The account to edit
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountRequest'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountSummary'
+        '401':
+          description: Missing/invalid token, or a valid token that isn't the admin role
+          content:
+            text/plain:
+              schema:
+                type: string
+        '422':
+          description: unknown account_id, empty/reserved/already-taken username, empty password, or no persistent data directory configured
+          content:
+            text/plain:
+              schema:
+                type: string
   /v1beta/auth/login:
     post:
       tags:
@@ -664,7 +706,10 @@ paths:
         already configured — otherwise the request must carry its own key. Without
         that check, an operator (or anything else that can reach this API) could
         point `baseUrl` at an arbitrary third-party URL and have the server hand it
-        the real provider key in an outbound `Authorization` header.
+        the real provider key in an outbound `Authorization` header. Admin-only
+        (see [`CurrentAdmin`]) — it exists only to serve the edit workflow above,
+        and it can spend the stored key on an outbound request, which a read-only
+        account has no reason to trigger.
       operationId: list_llm_models
       requestBody:
         content:
@@ -680,7 +725,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/LlmModelsView'
         '401':
-          description: Missing or invalid access token
+          description: Missing/invalid token, or a valid token that isn't the admin role
           content:
             text/plain:
               schema:
@@ -698,8 +743,12 @@ paths:
       summary: |-
         The live LLM provider configuration. `apiKey` is never included — only
         `hasApiKey`, whether one is currently stored. Requires an authenticated
-        caller (see [`AuthenticatedSubject`]) — this is shared server config, not
-        per-account data, but still not something an anonymous guest should read.
+        caller (see [`AuthenticatedSubject`]) — admin or a regular account, either
+        is fine to *read* this shared, operator-level config. `canEdit` in the
+        response tells the caller whether *writing* it (below) is open to them —
+        today that's exactly "is this an admin token", but computed here from the
+        resolved `Subject` rather than hard-coded on the frontend, so a future
+        change to who's allowed to write only has to change this one line.
       operationId: get_llm_settings
       responses:
         '200':
@@ -722,7 +771,9 @@ paths:
         immediately — no restart needed. The candidate configuration is validated
         (the brain it describes must actually build) before anything is swapped in
         or written to `llm.toml`; an invalid patch is rejected with 422 and changes
-        nothing.
+        nothing. Admin-only (see [`CurrentAdmin`]) — a regular account can read
+        this config through `GET /llm/settings` but not change shared, operator-
+        level server config or its real-model spend.
       operationId: update_llm_settings
       requestBody:
         content:
@@ -738,7 +789,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/LlmSettingsView'
         '401':
-          description: Missing or invalid access token
+          description: Missing/invalid token, or a valid token that isn't the admin role
           content:
             text/plain:
               schema:
@@ -1129,9 +1180,8 @@ components:
       type: object
       description: |-
         One account, as admin sees it: its opaque id and its login name. Never
-        carries a password or its hash. `account_id` isn't used by anything this
-        round — it's returned for a later one (editing/reassigning an existing
-        account's login).
+        carries a password or its hash. `account_id` is what [`UpdateAccountRequest`]
+        targets via `PATCH /accounts/{account_id}`.
       required:
       - accountId
       - username
@@ -1552,11 +1602,23 @@ components:
       - compressAfter
       - compressKeep
       - compressMaxTokens
+      - canEdit
       properties:
         baseUrl:
           type:
           - string
           - 'null'
+        canEdit:
+          type: boolean
+          description: |-
+            Whether *this caller* may write this config (`PATCH /llm/settings`,
+            `POST /llm/models`) — admin-only today (see `CurrentAdmin` in
+            `backend/src/state.rs`), computed by the `GET /llm/settings` handler
+            from the caller's actual `Subject`, not by anything in this struct's
+            `From` impl (which always seeds it `false`, having no caller to ask).
+            The frontend keys its write controls off this field instead of
+            re-deriving "am I admin" from its own copy of the session role, so it
+            can't drift from whatever the server actually enforces.
         compressAfter:
           type: integer
           minimum: 0
@@ -2224,6 +2286,23 @@ components:
         What kicked off a turn: a conversation line someone sent, or an environment
         event that carries no message of its own. Tagged by `kind` to match the
         TypeScript union.
+    UpdateAccountRequest:
+      type: object
+      description: |-
+        The `PATCH /accounts/{account_id}` request: admin changing an existing
+        account's login — its username, its password, or both. Both fields are
+        optional and independent (`None` leaves that field untouched); an empty
+        patch is a harmless no-op. There's still no self-service path — this is
+        admin editing *someone else's* login, not an account changing its own.
+      properties:
+        password:
+          type:
+          - string
+          - 'null'
+        username:
+          type:
+          - string
+          - 'null'
 tags:
 - name: service
   description: Liveness and server mode

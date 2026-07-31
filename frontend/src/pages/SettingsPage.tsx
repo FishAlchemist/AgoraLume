@@ -412,14 +412,16 @@ function buildPatch(draft: LlmDraft, apiKey?: string): LlmSettingsPatch {
  * pricing. Only meaningful against a real backend (configuring a backend's
  * LLM without a backend is a contradiction), so this renders a hint instead
  * of a form when the app is on the in-browser mock. It's also shared server
- * config, not per-account data — the backend requires an authenticated
- * caller on all three routes (see `AuthenticatedSubject` in
- * `backend/src/state.rs`) and is the sole enforcement of that. This
- * deliberately does *not* pre-hide the form for a guest based on client-side
- * state: it renders the same form either way and lets the real request 401,
- * surfacing the backend's actual rejection (see `LlmProviderForm`'s load and
- * save error handling) — a client-side guess here would just be one more
- * thing that can drift from what the server actually enforces.
+ * config, not per-account data — reading it needs any authenticated caller,
+ * writing it needs the admin role specifically (see `AuthenticatedSubject`
+ * and `CurrentAdmin` in `backend/src/state.rs`), and the backend is the sole
+ * enforcement of both. `LlmProviderForm` disables its write controls when the
+ * loaded settings say `canEdit: false` — the server's own permission
+ * decision, read straight off the response, not re-derived here from a local
+ * copy of the session's role (which could drift if the write rule ever grows
+ * past a flat admin check). That's still decoration on top of the real
+ * enforcement, not a substitute for it: the form sends the same real request
+ * either way and would surface a genuine 401 if `canEdit` were ever wrong.
  */
 function LlmProviderSettings() {
   const { t } = useTranslation();
@@ -436,7 +438,7 @@ function LlmProviderSettings() {
 
 function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
   const { t } = useTranslation();
-  const readOnly = useReadOnly((s) => s.readOnly);
+  const deviceReadOnly = useReadOnly((s) => s.readOnly);
   const [draft, setDraft] = useState<LlmDraft | null>(null);
   // The API key field: always blank on load (the server never sends the
   // stored key back), and tracked separately from `draft` so "the operator
@@ -445,6 +447,14 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
   const [apiKeyDraft, setApiKeyDraft] = useState('');
   const [apiKeyTouched, setApiKeyTouched] = useState(false);
   const [hasApiKey, setHasApiKey] = useState(false);
+  // Whether this session may write this config, straight from the server's
+  // own `canEdit` on the loaded settings (see `LlmSettingsView.canEdit`) —
+  // not derived here from the session's role, so this can't drift from
+  // whatever the backend actually enforces. Defaults `true` so the form isn't
+  // disabled for a flash before the first load resolves; `!draft` already
+  // hides the whole form until then anyway.
+  const [canEdit, setCanEdit] = useState(true);
+  const readOnly = deviceReadOnly || !canEdit;
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [error, setError] = useState('');
   // The fetched model list — offered as Autocomplete suggestions, never a
@@ -465,6 +475,7 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
         if (!active) return;
         setDraft(draftFromView(view));
         setHasApiKey(view.hasApiKey);
+        setCanEdit(view.canEdit);
         setApiKeyDraft('');
         setApiKeyTouched(false);
         setStatus('idle');
@@ -539,6 +550,7 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
       (view) => {
         setDraft(draftFromView(view));
         setHasApiKey(view.hasApiKey);
+        setCanEdit(view.canEdit);
         setApiKeyDraft('');
         setApiKeyTouched(false);
         setStatus('saved');
@@ -566,6 +578,11 @@ function LlmProviderForm({ backendUrl }: { backendUrl: string }) {
 
   return (
     <Stack gap="sm">
+      {!canEdit && !deviceReadOnly && (
+        <Text size="xs" c="dimmed">
+          {t('settings.llmAdminOnly')}
+        </Text>
+      )}
       <Switch
         checked={draft.enabled}
         onChange={(e) => set('enabled', e.currentTarget.checked)}

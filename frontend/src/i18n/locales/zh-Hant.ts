@@ -159,6 +159,7 @@ export const zhHant: TranslationSchema = {
     existingAccounts: '現有帳號',
     noAccounts: '尚無任何帳號。',
     createAccount: '建立帳號',
+    newPasswordHint: '留白則保留原密碼。',
   },
   avatar: {
     upload: '上傳圖片',
@@ -290,6 +291,7 @@ export const zhHant: TranslationSchema = {
     usageNotPersisted: '未啟用持久化：重啟伺服器後會歸零。',
     llmTitle: '真實模型（LLM）',
     llmNeedsBackend: '請先在上方連接後端,才能設定真實模型。',
+    llmAdminOnly: '此為共用設定,僅 admin 可修改;其他帳號僅能檢視。',
     llmEnable: '以真實模型驅動回覆',
     llmEnableHint: '預設關閉(模擬回覆)。儲存後立即生效,不需重啟。',
     llmProvider: '供應商',

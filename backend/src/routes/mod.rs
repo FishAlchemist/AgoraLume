@@ -374,6 +374,26 @@ mod tests {
         router.oneshot(request).await.unwrap().status()
     }
 
+    /// [`get_json_authed`], but also returns the parsed body — for routes
+    /// whose response shape (not just its status) depends on who's asking,
+    /// e.g. `LlmSettingsView.canEdit`.
+    async fn get_json_authed_body(
+        router: Router,
+        path: &str,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .uri(format!("{API_VERSION}{path}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
     /// POSTs a JSON body to `path` (unversioned) with a bearer token attached,
     /// mirroring [`post_json`] + [`get_json_authed`] for the account-management
     /// routes, which are both authenticated and take a body.
@@ -385,6 +405,28 @@ mod tests {
     ) -> (StatusCode, serde_json::Value) {
         let request = Request::builder()
             .method("POST")
+            .uri(format!("{API_VERSION}{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// PATCHes a JSON body to `path` (unversioned) with a bearer token
+    /// attached, mirroring [`post_json_authed`] for `PATCH /accounts/{id}`.
+    async fn patch_json_authed(
+        router: Router,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("PATCH")
             .uri(format!("{API_VERSION}{path}"))
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -462,6 +504,82 @@ mod tests {
 
         let status = get_json_authed(app, "/llm/settings", access_token).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn writing_llm_settings_requires_the_admin_role_not_just_any_token() {
+        // A regular account can read the shared LLM config (the test above)
+        // but must not be able to change it or spend its stored key — see
+        // `CurrentAdmin`'s docs on `routes::llm`.
+        let dir = temp_dir();
+        let account_dir = dir.join("accounts").join("acct-1");
+        let creds = crate::auth::AccountCredentials {
+            username: "alice".to_string(),
+            password_hash: Some(crate::auth::hash_password("alice-pw")),
+            allow_admin_readonly: false,
+        };
+        crate::persist::Persistence::new(&account_dir).save_credentials(&creds);
+
+        let app = router(not_mock_state(Some(dir), false), None);
+        let (_, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "alice", "password": "alice-pw" }),
+        )
+        .await;
+        let account_token = tokens["accessToken"].as_str().expect("an access token");
+
+        let (status, _) = patch_json_authed(
+            app.clone(),
+            "/llm/settings",
+            account_token,
+            serde_json::json!({ "enabled": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) = post_json_authed(
+            app,
+            "/llm/models",
+            account_token,
+            serde_json::json!({ "baseUrl": "https://api.openai.com/v1" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn llm_settings_reports_can_edit_matching_the_caller_s_actual_role() {
+        // The frontend keys its write controls off `canEdit` instead of
+        // re-deriving "am I admin" from its own copy of the session role
+        // (see `LlmSettingsView::can_edit`'s docs) — this pins that the value
+        // it reads actually matches what `PATCH`/`POST /llm/models` will do.
+        let dir = temp_dir();
+        let account_dir = dir.join("accounts").join("acct-1");
+        let creds = crate::auth::AccountCredentials {
+            username: "alice".to_string(),
+            password_hash: Some(crate::auth::hash_password("alice-pw")),
+            allow_admin_readonly: false,
+        };
+        crate::persist::Persistence::new(&account_dir).save_credentials(&creds);
+
+        let app = router(not_mock_state(Some(dir), false), None);
+        let admin_token = admin_access_token(app.clone()).await;
+        let (_, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "alice", "password": "alice-pw" }),
+        )
+        .await;
+        let account_token = tokens["accessToken"].as_str().expect("an access token");
+
+        let (status, body) = get_json_authed_body(app.clone(), "/llm/settings", &admin_token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["canEdit"].as_bool(), Some(true));
+
+        let (status, body) = get_json_authed_body(app, "/llm/settings", account_token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["canEdit"].as_bool(), Some(false));
     }
 
     #[tokio::test]
@@ -630,6 +748,97 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn admin_can_edit_an_existing_account_username_and_password() {
+        let app = router(not_mock_state(Some(temp_dir()), false), None);
+        let admin_token = admin_access_token(app.clone()).await;
+
+        let (_, created) = post_json_authed(
+            app.clone(),
+            "/accounts",
+            &admin_token,
+            serde_json::json!({ "username": "frank", "password": "frank-pw" }),
+        )
+        .await;
+        let account_id = created["accountId"].as_str().expect("an account id");
+
+        let (status, updated) = patch_json_authed(
+            app.clone(),
+            &format!("/accounts/{account_id}"),
+            &admin_token,
+            serde_json::json!({ "username": "franklin", "password": "franklin-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["username"].as_str(), Some("franklin"));
+        assert_eq!(updated["accountId"].as_str(), Some(account_id));
+
+        // The old username/password no longer log in; the new pair does.
+        let (status, _) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "frank", "password": "frank-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, tokens) = post_json(
+            app,
+            "/auth/login",
+            serde_json::json!({ "username": "franklin", "password": "franklin-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tokens["role"].as_str(), Some("account"));
+    }
+
+    #[tokio::test]
+    async fn editing_an_unknown_account_id_is_rejected() {
+        let app = router(not_mock_state(Some(temp_dir()), false), None);
+        let admin_token = admin_access_token(app.clone()).await;
+
+        let (status, _) = patch_json_authed(
+            app,
+            "/accounts/does-not-exist",
+            &admin_token,
+            serde_json::json!({ "username": "someone-else" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn editing_an_account_requires_the_admin_role_not_just_any_token() {
+        let app = router(not_mock_state(Some(temp_dir()), false), None);
+        let admin_token = admin_access_token(app.clone()).await;
+
+        let (_, created) = post_json_authed(
+            app.clone(),
+            "/accounts",
+            &admin_token,
+            serde_json::json!({ "username": "gina", "password": "gina-pw" }),
+        )
+        .await;
+        let account_id = created["accountId"].as_str().expect("an account id");
+
+        let (_, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "gina", "password": "gina-pw" }),
+        )
+        .await;
+        let account_token = tokens["accessToken"].as_str().expect("an access token");
+
+        let (status, _) = patch_json_authed(
+            app,
+            &format!("/accounts/{account_id}"),
+            account_token,
+            serde_json::json!({ "username": "gina-the-second" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

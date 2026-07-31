@@ -473,19 +473,25 @@ impl AccountState {
         }
     }
 
-    /// Overwrites this account's login fields — the only place credentials
-    /// actually change after the account's first open. Used by admin account
-    /// creation (`routes::accounts::create_account`) to replace the seeded
-    /// placeholder (`username: account_id, password_hash: None`) with the
-    /// username/password the admin specified. Persists immediately when
-    /// persistence is enabled, the same as every other credentials write —
-    /// the lock is dropped first so the file write doesn't happen while
-    /// holding it.
-    pub fn set_credentials(&self, username: String, password_hash: String) {
+    /// Updates whichever of this account's login fields are given — the only
+    /// place credentials actually change after the account's first open.
+    /// `None` leaves that field untouched, so a username-only or
+    /// password-only edit doesn't need to know the other. Used by admin
+    /// account creation (`routes::accounts::create_account`, both `Some`,
+    /// replacing the seeded placeholder `username: account_id, password_hash:
+    /// None`) and admin account editing (`routes::accounts::update_account`,
+    /// either or both). Persists immediately when persistence is enabled, the
+    /// same as every other credentials write — the lock is dropped first so
+    /// the file write doesn't happen while holding it.
+    pub fn set_credentials(&self, username: Option<String>, password_hash: Option<String>) {
         let updated = {
             let mut credentials = self.credentials.lock().unwrap();
-            credentials.username = username;
-            credentials.password_hash = Some(password_hash);
+            if let Some(username) = username {
+                credentials.username = username;
+            }
+            if let Some(password_hash) = password_hash {
+                credentials.password_hash = Some(password_hash);
+            }
             credentials.clone()
         };
         if let Some(persistence) = &self.persistence {
@@ -1496,8 +1502,49 @@ impl AppState {
         }
         let account_id = uuid::Uuid::new_v4().to_string();
         let account = self.account_by_id(&account_id);
-        account.set_credentials(username.to_string(), hash_password(password));
+        account.set_credentials(Some(username.to_string()), Some(hash_password(password)));
         Ok((account_id, account.credentials()))
+    }
+
+    /// Changes an existing account's username, password, or both — whichever
+    /// of `username`/`password` is `Some`. Rejects the same way
+    /// [`Self::create_account`] does for an empty or reserved username, or a
+    /// username already taken by a *different* account (taking its own
+    /// current name back is fine — that's a no-op rename). `account_id` must
+    /// already appear in [`Self::list_accounts`]: unlike [`Self::account_by_id`]
+    /// (which opens-or-creates), an edit must never conjure a new account
+    /// into existence just because its id doesn't match anything yet.
+    pub fn update_account(
+        &self,
+        account_id: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<AccountCredentials, String> {
+        if self.data_dir.is_none() {
+            return Err("account editing requires a persistent backend".to_string());
+        }
+        if !self.list_accounts().iter().any(|(id, _)| id == account_id) {
+            return Err(format!("no account \"{account_id}\""));
+        }
+        if let Some(username) = username {
+            if username.is_empty() {
+                return Err("username cannot be empty".to_string());
+            }
+            if username == crate::auth::ADMIN_USERNAME {
+                return Err(format!("\"{username}\" is reserved for the admin role"));
+            }
+            if let Some((existing_id, _)) = self.find_account_by_username(username)
+                && existing_id != account_id
+            {
+                return Err(format!("an account named \"{username}\" already exists"));
+            }
+        }
+        if password.is_some_and(str::is_empty) {
+            return Err("password cannot be empty".to_string());
+        }
+        let account = self.account_by_id(account_id);
+        account.set_credentials(username.map(str::to_string), password.map(hash_password));
+        Ok(account.credentials())
     }
 
     /// Every existing account's id and username, for the admin dashboard's
@@ -1635,12 +1682,16 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for CurrentAccount {
 /// Unlike [`CurrentAccount`], this never resolves the token further into an
 /// `AccountState` — there's nothing account-shaped to load for `Subject::Admin`.
 ///
-/// Narrowing this to admin-only belongs with a future round (account
-/// management/admin dashboard) once the frontend has any notion of "this
-/// session is the admin role" to gate on — `POST /auth/login` doesn't
-/// currently disclose which kind of subject a token belongs to. For now any
-/// authenticated caller passes, matching the scope of the bug this fixed: an
-/// unauthenticated guest silently writing shared server config.
+/// Used for *reading* the shared LLM config (`GET /llm/settings`) — any
+/// logged-in caller, admin or account, is fine there. Writing it
+/// (`PATCH /llm/settings`, `POST /llm/models`) requires [`CurrentAdmin`]
+/// instead. `GET /llm/settings`'s handler still carries the resolved
+/// `Subject` out (unlike a plain "is there a session" check) so it can report
+/// `LlmSettingsView::can_edit` back to the caller — the server's own
+/// permission decision, not something the frontend re-derives from a copy of
+/// the role it remembers from login. If the write rule ever grows past a flat
+/// admin check (e.g. a future explicit per-account grant), only this one
+/// `can_edit` computation needs to change; nothing client-side does.
 pub struct AuthenticatedSubject(pub Subject);
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for AuthenticatedSubject {
@@ -1654,7 +1705,10 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AuthenticatedSubject {
         // documented as "exactly the same condition [`CurrentAccount`] bypasses
         // on". Diverging here would make `authRequired: false` (from `/meta`) a
         // lie for these routes specifically, breaking mock mode and
-        // `AGORALUME_AUTH_DISABLED` dev setups for no reason.
+        // `AGORALUME_AUTH_DISABLED` dev setups for no reason. `Subject::Admin`
+        // is the bypass value here too, matching `CurrentAdmin`'s own bypass —
+        // in mock/auth-disabled mode `can_edit` reports `true`, the same
+        // "everything's allowed" the bypass already grants for real.
         if state.operator.runtime.is_mock() || state.auth_disabled {
             return Ok(AuthenticatedSubject(Subject::Admin));
         }
@@ -1674,9 +1728,11 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AuthenticatedSubject {
 /// Proof the request carries an admin token specifically — not just any
 /// authenticated session (contrast [`AuthenticatedSubject`]) and not a
 /// regular account (contrast [`CurrentAccount`], which rejects the *other*
-/// way — admin instead of account). Used by `routes::accounts`: creating or
-/// listing accounts is an operator duty, unlike the shared LLM config that
-/// any logged-in caller can currently reach through `AuthenticatedSubject`.
+/// way — admin instead of account). Used by `routes::accounts` (creating,
+/// listing, and editing accounts is an operator duty) and by the *write*
+/// half of `routes::llm` (`PATCH /llm/settings`, `POST /llm/models`) — a
+/// regular account can still read the shared LLM config through
+/// [`AuthenticatedSubject`], just not change it or spend its stored key.
 pub struct CurrentAdmin;
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for CurrentAdmin {

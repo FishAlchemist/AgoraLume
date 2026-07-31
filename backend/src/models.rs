@@ -630,6 +630,15 @@ pub struct LlmSettingsView {
     pub compress_max_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<crate::llm_config::Pricing>,
+    /// Whether *this caller* may write this config (`PATCH /llm/settings`,
+    /// `POST /llm/models`) — admin-only today (see `CurrentAdmin` in
+    /// `backend/src/state.rs`), computed by the `GET /llm/settings` handler
+    /// from the caller's actual `Subject`, not by anything in this struct's
+    /// `From` impl (which always seeds it `false`, having no caller to ask).
+    /// The frontend keys its write controls off this field instead of
+    /// re-deriving "am I admin" from its own copy of the session role, so it
+    /// can't drift from whatever the server actually enforces.
+    pub can_edit: bool,
 }
 
 impl From<&crate::llm_config::LlmSettings> for LlmSettingsView {
@@ -647,6 +656,7 @@ impl From<&crate::llm_config::LlmSettings> for LlmSettingsView {
             compress_keep: s.compress_keep,
             compress_max_tokens: s.compress_max_tokens,
             pricing: s.pricing.clone(),
+            can_edit: false,
         }
     }
 }
@@ -782,14 +792,27 @@ pub struct CreateAccountRequest {
 }
 
 /// One account, as admin sees it: its opaque id and its login name. Never
-/// carries a password or its hash. `account_id` isn't used by anything this
-/// round — it's returned for a later one (editing/reassigning an existing
-/// account's login).
+/// carries a password or its hash. `account_id` is what [`UpdateAccountRequest`]
+/// targets via `PATCH /accounts/{account_id}`.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountSummary {
     pub account_id: String,
     pub username: String,
+}
+
+/// The `PATCH /accounts/{account_id}` request: admin changing an existing
+/// account's login — its username, its password, or both. Both fields are
+/// optional and independent (`None` leaves that field untouched); an empty
+/// patch is a harmless no-op. There's still no self-service path — this is
+/// admin editing *someone else's* login, not an account changing its own.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAccountRequest {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 #[cfg(test)]

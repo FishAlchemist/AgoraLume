@@ -3,8 +3,9 @@ import type { AccountSummary } from './types';
 import { versionedBase } from './version';
 
 /**
- * Admin account management client — `GET`/`POST /accounts` on a real
- * backend. Same shape as `llmSettings.ts`: outside the {@link ChatApi}
+ * Admin account management client — `GET`/`POST /accounts` and
+ * `PATCH /accounts/{id}` on a real backend. Same shape as `llmSettings.ts`:
+ * outside the {@link ChatApi}
  * contract (there's nothing to mock — creating accounts only makes sense
  * against a real backend), goes through `authFetch` so the admin's token is
  * attached, and doesn't pre-guess who's allowed to call it — a non-admin
@@ -46,6 +47,33 @@ export async function createAccount(
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
     throw new Error(detail || `createAccount failed: ${res.status}`);
+  }
+  return (await res.json()) as AccountSummary;
+}
+
+/**
+ * Changes an existing account's username, password, or both — whichever of
+ * `patch.username`/`patch.password` is given; the other is left untouched.
+ * There's still no self-service path — this is admin editing someone else's
+ * login. Existing tokens for that account keep working across the change
+ * (nothing revokes them).
+ */
+export async function updateAccount(
+  backendUrl: string,
+  accountId: string,
+  patch: { username?: string; password?: string },
+): Promise<AccountSummary> {
+  const res = await authFetch(
+    `${versionedBase(backendUrl)}/accounts/${encodeURIComponent(accountId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    },
+  );
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(detail || `updateAccount failed: ${res.status}`);
   }
   return (await res.json()) as AccountSummary;
 }

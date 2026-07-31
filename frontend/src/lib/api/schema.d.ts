@@ -20,6 +20,15 @@ export interface paths {
      */
     post: operations["create_account"];
   };
+  "/v1beta/accounts/{account_id}": {
+    /**
+     * Changes an existing account's username, password, or both. Existing
+     * access/refresh tokens for that account keep working across the change —
+     * nothing here revokes them — the same as every other credentials update in
+     * this codebase (there's no token blocklist yet).
+     */
+    patch: operations["update_account"];
+  };
   "/v1beta/auth/login": {
     /**
      * Logs in as the admin (username `"admin"`) or a regular account (its own
@@ -182,7 +191,10 @@ export interface paths {
      * already configured — otherwise the request must carry its own key. Without
      * that check, an operator (or anything else that can reach this API) could
      * point `baseUrl` at an arbitrary third-party URL and have the server hand it
-     * the real provider key in an outbound `Authorization` header.
+     * the real provider key in an outbound `Authorization` header. Admin-only
+     * (see [`CurrentAdmin`]) — it exists only to serve the edit workflow above,
+     * and it can spend the stored key on an outbound request, which a read-only
+     * account has no reason to trigger.
      */
     post: operations["list_llm_models"];
   };
@@ -190,8 +202,12 @@ export interface paths {
     /**
      * The live LLM provider configuration. `apiKey` is never included — only
      * `hasApiKey`, whether one is currently stored. Requires an authenticated
-     * caller (see [`AuthenticatedSubject`]) — this is shared server config, not
-     * per-account data, but still not something an anonymous guest should read.
+     * caller (see [`AuthenticatedSubject`]) — admin or a regular account, either
+     * is fine to *read* this shared, operator-level config. `canEdit` in the
+     * response tells the caller whether *writing* it (below) is open to them —
+     * today that's exactly "is this an admin token", but computed here from the
+     * resolved `Subject` rather than hard-coded on the frontend, so a future
+     * change to who's allowed to write only has to change this one line.
      */
     get: operations["get_llm_settings"];
     /**
@@ -199,7 +215,9 @@ export interface paths {
      * immediately — no restart needed. The candidate configuration is validated
      * (the brain it describes must actually build) before anything is swapped in
      * or written to `llm.toml`; an invalid patch is rejected with 422 and changes
-     * nothing.
+     * nothing. Admin-only (see [`CurrentAdmin`]) — a regular account can read
+     * this config through `GET /llm/settings` but not change shared, operator-
+     * level server config or its real-model spend.
      */
     patch: operations["update_llm_settings"];
   };
@@ -289,9 +307,8 @@ export interface components {
     };
     /**
      * @description One account, as admin sees it: its opaque id and its login name. Never
-     * carries a password or its hash. `account_id` isn't used by anything this
-     * round — it's returned for a later one (editing/reassigning an existing
-     * account's login).
+     * carries a password or its hash. `account_id` is what [`UpdateAccountRequest`]
+     * targets via `PATCH /accounts/{account_id}`.
      */
     AccountSummary: {
       accountId: string;
@@ -533,6 +550,17 @@ export interface components {
      */
     LlmSettingsView: {
       baseUrl?: string | null;
+      /**
+       * @description Whether *this caller* may write this config (`PATCH /llm/settings`,
+       * `POST /llm/models`) — admin-only today (see `CurrentAdmin` in
+       * `backend/src/state.rs`), computed by the `GET /llm/settings` handler
+       * from the caller's actual `Subject`, not by anything in this struct's
+       * `From` impl (which always seeds it `false`, having no caller to ask).
+       * The frontend keys its write controls off this field instead of
+       * re-deriving "am I admin" from its own copy of the session role, so it
+       * can't drift from whatever the server actually enforces.
+       */
+      canEdit: boolean;
       compressAfter: number;
       compressKeep: number;
       /** Format: int64 */
@@ -909,6 +937,17 @@ export interface components {
       kind: "event";
       label: string;
     }]>;
+    /**
+     * @description The `PATCH /accounts/{account_id}` request: admin changing an existing
+     * account's login — its username, its password, or both. Both fields are
+     * optional and independent (`None` leaves that field untouched); an empty
+     * patch is a harmless no-op. There's still no self-service path — this is
+     * admin editing *someone else's* login, not an account changing its own.
+     */
+    UpdateAccountRequest: {
+      password?: string | null;
+      username?: string | null;
+    };
   };
   responses: never;
   parameters: never;
@@ -963,6 +1002,44 @@ export interface operations {
         };
       };
       /** @description empty username/password, a reserved or already-taken username, or no persistent data directory configured */
+      422: {
+        content: {
+          "text/plain": string;
+        };
+      };
+    };
+  };
+  /**
+   * Changes an existing account's username, password, or both. Existing
+   * access/refresh tokens for that account keep working across the change —
+   * nothing here revokes them — the same as every other credentials update in
+   * this codebase (there's no token blocklist yet).
+   */
+  update_account: {
+    parameters: {
+      path: {
+        /** @description The account to edit */
+        account_id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["UpdateAccountRequest"];
+      };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["AccountSummary"];
+        };
+      };
+      /** @description Missing/invalid token, or a valid token that isn't the admin role */
+      401: {
+        content: {
+          "text/plain": string;
+        };
+      };
+      /** @description unknown account_id, empty/reserved/already-taken username, empty password, or no persistent data directory configured */
       422: {
         content: {
           "text/plain": string;
@@ -1501,7 +1578,10 @@ export interface operations {
    * already configured — otherwise the request must carry its own key. Without
    * that check, an operator (or anything else that can reach this API) could
    * point `baseUrl` at an arbitrary third-party URL and have the server hand it
-   * the real provider key in an outbound `Authorization` header.
+   * the real provider key in an outbound `Authorization` header. Admin-only
+   * (see [`CurrentAdmin`]) — it exists only to serve the edit workflow above,
+   * and it can spend the stored key on an outbound request, which a read-only
+   * account has no reason to trigger.
    */
   list_llm_models: {
     requestBody: {
@@ -1515,7 +1595,7 @@ export interface operations {
           "application/json": components["schemas"]["LlmModelsView"];
         };
       };
-      /** @description Missing or invalid access token */
+      /** @description Missing/invalid token, or a valid token that isn't the admin role */
       401: {
         content: {
           "text/plain": string;
@@ -1532,8 +1612,12 @@ export interface operations {
   /**
    * The live LLM provider configuration. `apiKey` is never included — only
    * `hasApiKey`, whether one is currently stored. Requires an authenticated
-   * caller (see [`AuthenticatedSubject`]) — this is shared server config, not
-   * per-account data, but still not something an anonymous guest should read.
+   * caller (see [`AuthenticatedSubject`]) — admin or a regular account, either
+   * is fine to *read* this shared, operator-level config. `canEdit` in the
+   * response tells the caller whether *writing* it (below) is open to them —
+   * today that's exactly "is this an admin token", but computed here from the
+   * resolved `Subject` rather than hard-coded on the frontend, so a future
+   * change to who's allowed to write only has to change this one line.
    */
   get_llm_settings: {
     responses: {
@@ -1555,7 +1639,9 @@ export interface operations {
    * immediately — no restart needed. The candidate configuration is validated
    * (the brain it describes must actually build) before anything is swapped in
    * or written to `llm.toml`; an invalid patch is rejected with 422 and changes
-   * nothing.
+   * nothing. Admin-only (see [`CurrentAdmin`]) — a regular account can read
+   * this config through `GET /llm/settings` but not change shared, operator-
+   * level server config or its real-model spend.
    */
   update_llm_settings: {
     requestBody: {
@@ -1570,7 +1656,7 @@ export interface operations {
           "application/json": components["schemas"]["LlmSettingsView"];
         };
       };
-      /** @description Missing or invalid access token */
+      /** @description Missing/invalid token, or a valid token that isn't the admin role */
       401: {
         content: {
           "text/plain": string;

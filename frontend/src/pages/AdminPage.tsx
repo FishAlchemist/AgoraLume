@@ -1,19 +1,20 @@
 import {
+  ActionIcon,
   Alert,
   Box,
   Button,
   Card,
   Group,
-  List,
   PasswordInput,
   Stack,
   Text,
   TextInput,
   Title,
 } from '@mantine/core';
+import { IconPencil } from '@tabler/icons-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { createAccount, listAccounts } from '../lib/api/accounts';
+import { createAccount, listAccounts, updateAccount } from '../lib/api/accounts';
 import type { AccountSummary } from '../lib/api/types';
 import { useConnection } from '../store/connection';
 
@@ -62,6 +63,10 @@ export function AdminPage() {
     }
   };
 
+  const handleAccountUpdated = (updated: AccountSummary) => {
+    setAccounts((prev) => prev.map((a) => (a.accountId === updated.accountId ? updated : a)));
+  };
+
   if (!backendUrl) {
     return (
       <Box p="lg" maw={560}>
@@ -95,11 +100,16 @@ export function AdminPage() {
                 {t('admin.noAccounts')}
               </Text>
             ) : (
-              <List size="sm" spacing={4}>
+              <Stack gap="xs">
                 {accounts.map((a) => (
-                  <List.Item key={a.accountId}>{a.username}</List.Item>
+                  <AccountRow
+                    key={a.accountId}
+                    account={a}
+                    backendUrl={backendUrl}
+                    onUpdated={handleAccountUpdated}
+                  />
                 ))}
-              </List>
+              </Stack>
             )}
           </Stack>
         </Card>
@@ -142,5 +152,108 @@ export function AdminPage() {
         </Card>
       </Stack>
     </Box>
+  );
+}
+
+/**
+ * One account in the list, togglable between a plain readout and an inline
+ * edit form (username + an optional new password — blank keeps the current
+ * one, same "leave it out to not change it" contract as `updateAccount`'s
+ * patch). Its own row-local state, not lifted into `AdminPage`, since only
+ * one row is ever mid-edit and nothing else needs to know that while it's
+ * happening.
+ */
+function AccountRow({
+  account,
+  backendUrl,
+  onUpdated,
+}: {
+  account: AccountSummary;
+  backendUrl: string;
+  onUpdated: (updated: AccountSummary) => void;
+}) {
+  const { t } = useTranslation();
+  const [editing, setEditing] = useState(false);
+  const [username, setUsername] = useState(account.username);
+  const [password, setPassword] = useState('');
+  const [status, setStatus] = useState<'idle' | 'submitting' | 'error'>('idle');
+  const [error, setError] = useState('');
+
+  const startEdit = () => {
+    setUsername(account.username);
+    setPassword('');
+    setStatus('idle');
+    setError('');
+    setEditing(true);
+  };
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (status === 'submitting') return;
+    setStatus('submitting');
+    setError('');
+    try {
+      const updated = await updateAccount(backendUrl, account.accountId, {
+        username,
+        ...(password && { password }),
+      });
+      onUpdated(updated);
+      setEditing(false);
+    } catch (e) {
+      setStatus('error');
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  if (!editing) {
+    return (
+      <Group justify="space-between" wrap="nowrap">
+        <Text size="sm">{account.username}</Text>
+        <ActionIcon size="sm" variant="subtle" onClick={startEdit} aria-label={t('common.edit')}>
+          <IconPencil size={14} />
+        </ActionIcon>
+      </Group>
+    );
+  }
+
+  return (
+    <form onSubmit={(e) => void handleSubmit(e)}>
+      <Stack gap="xs">
+        {status === 'error' && (
+          <Alert color="red" variant="light" py={4}>
+            <Text size="xs">{error}</Text>
+          </Alert>
+        )}
+        <TextInput
+          size="xs"
+          label={t('auth.username')}
+          value={username}
+          onChange={(e) => setUsername(e.currentTarget.value)}
+          autoComplete="off"
+          required
+        />
+        <PasswordInput
+          size="xs"
+          label={t('auth.password')}
+          description={t('admin.newPasswordHint')}
+          value={password}
+          onChange={(e) => setPassword(e.currentTarget.value)}
+          autoComplete="new-password"
+        />
+        <Group justify="flex-end" gap="xs">
+          <Button
+            size="xs"
+            variant="subtle"
+            onClick={() => setEditing(false)}
+            disabled={status === 'submitting'}
+          >
+            {t('common.cancel')}
+          </Button>
+          <Button size="xs" type="submit" loading={status === 'submitting'}>
+            {t('common.save')}
+          </Button>
+        </Group>
+      </Stack>
+    </form>
   );
 }

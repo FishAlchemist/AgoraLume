@@ -158,6 +158,7 @@ export const en = {
     existingAccounts: 'Existing accounts',
     noAccounts: 'No accounts yet.',
     createAccount: 'Create account',
+    newPasswordHint: 'Leave blank to keep the current password.',
   },
   avatar: {
     upload: 'Upload image',
@@ -292,6 +293,7 @@ export const en = {
     usageNotPersisted: 'No persistence: resets on server restart.',
     llmTitle: 'Real model (LLM)',
     llmNeedsBackend: 'Connect a backend above to configure a real model.',
+    llmAdminOnly: 'Only admin can change this shared setting; other accounts see it read-only.',
     llmEnable: 'Drive replies with a real model',
     llmEnableHint: 'Off by default (simulated replies). Applies immediately — no restart needed.',
     llmProvider: 'Provider',

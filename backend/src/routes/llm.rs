@@ -14,7 +14,7 @@ use utoipa_axum::routes;
 
 use crate::agent::llm::normalize_base_url;
 use crate::models::{LlmModelsQuery, LlmModelsView, LlmSettingsPatch, LlmSettingsView};
-use crate::state::{AppState, AuthenticatedSubject};
+use crate::state::{AppState, AuthenticatedSubject, CurrentAdmin};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new().routes(routes!(
@@ -26,34 +26,42 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
 
 /// The live LLM provider configuration. `apiKey` is never included — only
 /// `hasApiKey`, whether one is currently stored. Requires an authenticated
-/// caller (see [`AuthenticatedSubject`]) — this is shared server config, not
-/// per-account data, but still not something an anonymous guest should read.
+/// caller (see [`AuthenticatedSubject`]) — admin or a regular account, either
+/// is fine to *read* this shared, operator-level config. `canEdit` in the
+/// response tells the caller whether *writing* it (below) is open to them —
+/// today that's exactly "is this an admin token", but computed here from the
+/// resolved `Subject` rather than hard-coded on the frontend, so a future
+/// change to who's allowed to write only has to change this one line.
 #[utoipa::path(get, path = "/llm/settings", tag = "llm",
     responses(
         (status = 200, body = LlmSettingsView),
         (status = 401, description = "Missing or invalid access token", body = String),
     ))]
 async fn get_llm_settings(
-    _subject: AuthenticatedSubject,
+    AuthenticatedSubject(subject): AuthenticatedSubject,
     State(s): State<Arc<AppState>>,
 ) -> Json<LlmSettingsView> {
-    Json(LlmSettingsView::from(&s.llm_settings()))
+    let mut view = LlmSettingsView::from(&s.llm_settings());
+    view.can_edit = matches!(subject, crate::auth::Subject::Admin);
+    Json(view)
 }
 
 /// Merges a partial update onto the LLM provider configuration and applies it
 /// immediately — no restart needed. The candidate configuration is validated
 /// (the brain it describes must actually build) before anything is swapped in
 /// or written to `llm.toml`; an invalid patch is rejected with 422 and changes
-/// nothing.
+/// nothing. Admin-only (see [`CurrentAdmin`]) — a regular account can read
+/// this config through `GET /llm/settings` but not change shared, operator-
+/// level server config or its real-model spend.
 #[utoipa::path(patch, path = "/llm/settings", tag = "llm",
     request_body = LlmSettingsPatch,
     responses(
         (status = 200, description = "Applied immediately; persisted to llm.toml", body = LlmSettingsView),
-        (status = 401, description = "Missing or invalid access token", body = String),
+        (status = 401, description = "Missing/invalid token, or a valid token that isn't the admin role", body = String),
         (status = 422, description = "e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct", body = String),
     ))]
 async fn update_llm_settings(
-    AuthenticatedSubject(subject): AuthenticatedSubject,
+    _admin: CurrentAdmin,
     State(s): State<Arc<AppState>>,
     Json(patch): Json<LlmSettingsPatch>,
 ) -> Result<Json<LlmSettingsView>, (StatusCode, String)> {
@@ -62,15 +70,16 @@ async fn update_llm_settings(
     let applied = s
         .apply_llm_settings(settings)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    // `subject` is always `Subject::Admin` when auth isn't enforced (mock mode,
-    // `AGORALUME_AUTH_DISABLED`) — that's `AuthenticatedSubject`'s bypass value,
-    // not a real admin login, so it isn't logged as one.
     if s.auth_required() {
-        tracing::info!(?subject, "LLM provider settings updated");
+        tracing::info!("LLM provider settings updated by admin");
     } else {
         tracing::info!("LLM provider settings updated (auth not enforced on this server)");
     }
-    Ok(Json(LlmSettingsView::from(&applied)))
+    // Reaching this line already proved `CurrentAdmin`, so this response's
+    // `canEdit` is `true` too — same fact `GET` would report right after.
+    let mut view = LlmSettingsView::from(&applied);
+    view.can_edit = true;
+    Ok(Json(view))
 }
 
 /// Lists the models a provider endpoint offers, so the Settings page can offer
@@ -79,16 +88,19 @@ async fn update_llm_settings(
 /// already configured — otherwise the request must carry its own key. Without
 /// that check, an operator (or anything else that can reach this API) could
 /// point `baseUrl` at an arbitrary third-party URL and have the server hand it
-/// the real provider key in an outbound `Authorization` header.
+/// the real provider key in an outbound `Authorization` header. Admin-only
+/// (see [`CurrentAdmin`]) — it exists only to serve the edit workflow above,
+/// and it can spend the stored key on an outbound request, which a read-only
+/// account has no reason to trigger.
 #[utoipa::path(post, path = "/llm/models", tag = "llm",
     request_body = LlmModelsQuery,
     responses(
         (status = 200, body = LlmModelsView),
-        (status = 401, description = "Missing or invalid access token", body = String),
+        (status = 401, description = "Missing/invalid token, or a valid token that isn't the admin role", body = String),
         (status = 422, description = "empty baseUrl, no usable key, or the endpoint rejected the request", body = String),
     ))]
 async fn list_llm_models(
-    _subject: AuthenticatedSubject,
+    _admin: CurrentAdmin,
     State(s): State<Arc<AppState>>,
     Json(query): Json<LlmModelsQuery>,
 ) -> Result<Json<LlmModelsView>, (StatusCode, String)> {
