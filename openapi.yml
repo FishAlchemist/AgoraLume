@@ -1915,8 +1915,17 @@ components:
       - mock
       - llm
       - persistent
+      - authRequired
       - version
       properties:
+        authRequired:
+          type: boolean
+          description: |-
+            Whether a client must log in (`POST /auth/login`) before anything
+            else works — false under mock mode or `AGORALUME_AUTH_DISABLED`, in
+            which case every request resolves to the bootstrap account with no
+            token at all. Independent of `mock`/`llm`: a persistent server with
+            no real model wired in still enforces login.
         llm:
           type: boolean
           description: An LLM is wired in to generate replies.

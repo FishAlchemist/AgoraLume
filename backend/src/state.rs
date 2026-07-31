@@ -1419,6 +1419,16 @@ impl AppState {
         self.data_dir.is_some()
     }
 
+    /// Whether [`CurrentAccount`] actually enforces login on this server —
+    /// exactly the same condition it bypasses on, so a client can tell
+    /// (via `/meta`) whether to show a login screen at all instead of
+    /// guessing from `mock`/`llm`, which track something else (whether a
+    /// real model drives the agents) and can each be true or false
+    /// independently of whether auth is enforced.
+    pub fn auth_required(&self) -> bool {
+        !self.operator.runtime.is_mock() && !self.auth_disabled
+    }
+
     /// Verifies a username/password against the admin account (the fixed
     /// [`crate::auth::ADMIN_USERNAME`]) or a regular account (found by
     /// scanning `accounts/*/credentials.json` — no index; an operator is

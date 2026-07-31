@@ -456,4 +456,42 @@ mod tests {
         let status = get_json_authed(app, "/organizations", access_token).await;
         assert_eq!(status, StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn stream_route_requires_the_same_bearer_header_as_every_other_route() {
+        // The group SSE stream is just another CurrentAccount route — no
+        // query-param fallback. EventSource can't set headers, so the
+        // frontend reads this stream via `fetch` instead (which can), rather
+        // than the backend accepting a token in the URL, where a forwarding
+        // proxy could log it.
+        let dir = temp_dir();
+        let account_dir = dir.join("accounts").join("acct-1");
+        let creds = crate::auth::AccountCredentials {
+            username: "alice".to_string(),
+            password_hash: Some(crate::auth::hash_password("alice-pw")),
+            allow_admin_readonly: false,
+        };
+        crate::persist::Persistence::new(&account_dir).save_credentials(&creds);
+
+        let app = router(not_mock_state(Some(dir), false), None);
+        let (status, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "alice", "password": "alice-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let access_token = tokens["accessToken"].as_str().expect("an access token");
+
+        let status = get_json_authed(app.clone(), "/groups/lounge/stream", access_token).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A token in the query string alone must not work.
+        let request = Request::builder()
+            .uri(format!("{API_VERSION}/groups/lounge/stream?access_token={access_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let status = app.oneshot(request).await.unwrap().status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
 }

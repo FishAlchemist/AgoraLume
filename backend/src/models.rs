@@ -211,6 +211,12 @@ pub struct ServerMeta {
     pub llm: bool,
     /// State is persisted and survives a restart.
     pub persistent: bool,
+    /// Whether a client must log in (`POST /auth/login`) before anything
+    /// else works — false under mock mode or `AGORALUME_AUTH_DISABLED`, in
+    /// which case every request resolves to the bootstrap account with no
+    /// token at all. Independent of `mock`/`llm`: a persistent server with
+    /// no real model wired in still enforces login.
+    pub auth_required: bool,
     /// Server crate version.
     pub version: String,
 }

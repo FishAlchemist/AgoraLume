@@ -746,6 +746,14 @@ export interface components {
      * server is reachable at all.
      */
     ServerMeta: {
+      /**
+       * @description Whether a client must log in (`POST /auth/login`) before anything
+       * else works — false under mock mode or `AGORALUME_AUTH_DISABLED`, in
+       * which case every request resolves to the bootstrap account with no
+       * token at all. Independent of `mock`/`llm`: a persistent server with
+       * no real model wired in still enforces login.
+       */
+      authRequired: boolean;
       /** @description An LLM is wired in to generate replies. */
       llm: boolean;
       /**

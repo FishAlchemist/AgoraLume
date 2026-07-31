@@ -25,7 +25,7 @@ use crate::agent::mock::RuleBrain;
 use crate::models::{
     AgentTrace, GroupSuggestions, Message, SYSTEM_PERSONA_ID, TurnMemberState, TurnTrigger, now_ms,
 };
-use crate::state::{AccountState, GroupSummary, OperatorState};
+use crate::state::{AccountState, GroupSummary};
 use crate::workspace::RosterMember;
 
 /// Tunables for the loop. The bounded compute per triggering message — the "not
@@ -1142,7 +1142,7 @@ mod tests {
     };
     use crate::agent::mock::RuleBrain;
     use crate::models::TokenUsage;
-    use crate::state::StreamEvent;
+    use crate::state::{OperatorState, StreamEvent};
 
     /// Deterministic, delay-free config so tests are reproducible and fast.
     fn cfg() -> LoopConfig {

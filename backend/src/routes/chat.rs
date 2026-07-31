@@ -58,6 +58,7 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
         mock: !llm && !persistent,
         llm,
         persistent,
+        auth_required: state.auth_required(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
