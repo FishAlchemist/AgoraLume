@@ -90,7 +90,7 @@ function Shell() {
     >
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between">
-          <Group gap="sm">
+          <Group gap="sm" wrap="nowrap">
             <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
             <Title order={4} style={{ cursor: 'pointer' }} onClick={() => navigate('/')}>
               <Text
@@ -114,7 +114,7 @@ function Shell() {
       </AppShell.Navbar>
 
       <AppShell.Main>
-        <div style={{ height: `calc(100dvh - ${HEADER_HEIGHT}px)`, overflowY: 'auto' }}>
+        <div style={{ height: 'calc(100dvh - var(--app-shell-header-height))', overflowY: 'auto' }}>
           <Suspense fallback={<PageLoader />}>
             <Routes>
               <Route path="/" element={<IndexRedirect />} />
