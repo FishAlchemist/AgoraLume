@@ -7,8 +7,15 @@ import { versionedBase } from './version';
 // race the first. Every caller awaits this same in-flight promise instead.
 let refreshing: Promise<boolean> | null = null;
 
-/** Exchanges the stored refresh token for a new access token, if it still works. */
-async function refreshAccessToken(): Promise<boolean> {
+/**
+ * Exchanges the stored refresh token for a new access token, if it still
+ * works. Exported so `App.tsx` can also call this once on mount — a token
+ * restored from `localStorage` is never verified until something needs it,
+ * so a session left over from a since-restarted backend (tokens are
+ * in-memory only, see `backend/src/auth.rs`) would otherwise sit there
+ * looking logged-in until the first authorized request got rejected.
+ */
+export async function refreshAccessToken(): Promise<boolean> {
   if (refreshing) return refreshing;
   refreshing = (async () => {
     const backendUrl = useConnection.getState().backendUrl;

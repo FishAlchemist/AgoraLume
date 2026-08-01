@@ -10,7 +10,9 @@ import { HeaderControls } from './components/HeaderControls';
 import { MemoryDrawer } from './components/MemoryDrawer';
 import { PersonaCard } from './components/PersonaCard';
 import { PersonaFormModal } from './components/PersonaFormModal';
+import { refreshAccessToken } from './lib/api/authFetch';
 import { LoginPage } from './pages/LoginPage';
+import { useAuth } from './store/auth';
 import { useUi } from './store/ui';
 import { useWorkspace } from './store/workspace';
 
@@ -78,6 +80,19 @@ function Shell() {
     void i18n.changeLanguage(uiLanguage);
     document.documentElement.lang = uiLanguage;
   }, [uiLanguage, i18n]);
+
+  // A session restored from localStorage is never checked against the
+  // backend until something needs it — since tokens live only in the
+  // backend's memory (see backend/src/auth.rs), a restart there leaves a
+  // stale-but-persisted token looking logged-in in the header until the
+  // first authorized request gets rejected. Verify it once up front instead.
+  useEffect(() => {
+    const { refreshToken, clear } = useAuth.getState();
+    if (!refreshToken) return;
+    void refreshAccessToken().then((ok) => {
+      if (!ok) clear();
+    });
+  }, []);
 
   return (
     <AppShell
