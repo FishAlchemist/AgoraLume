@@ -494,11 +494,25 @@ struct ActivityFrame {
     active: bool,
 }
 
+/// `/groups/{groupId}/stream`'s query parameters.
+#[derive(Deserialize, IntoParams)]
+#[serde(rename_all = "camelCase")]
+struct StreamQuery {
+    /// Switches this connection to carrying *only* `debug` frames — every
+    /// other event kind is filtered out. Defaults to `false`, so the
+    /// ordinary chat connection never carries `AgentTrace` payloads at all.
+    #[serde(default)]
+    debug: bool,
+}
+
 /// Server-Sent Events for a group.
 ///
 /// Frames: unnamed = `Message`; `read` = `ReadReceipt`; `activity` =
-/// `{ "active": bool }`; `turn` = `Turn`; `debug` = `AgentTrace`;
-/// `suggestions` = `GroupSuggestions`. `activity` and `turn` are seeded on connect.
+/// `{ "active": bool }`; `turn` = `Turn`; `suggestions` = `GroupSuggestions`.
+/// `activity` and `turn` are seeded on connect. `?debug=true` switches to a
+/// connection carrying only `debug` (`AgentTrace`) frames instead — see
+/// `debug`'s own doc comment on [`StreamQuery`] for why that's a separate
+/// connection rather than one more frame kind on this one.
 //
 // The token goes in the `Authorization` header like every other route — there
 // is deliberately no `?access_token=` fallback, since a forwarding proxy logs
@@ -506,13 +520,18 @@ struct ActivityFrame {
 // OpenAPI can't type per-event-name bodies, so the media type is all the
 // document can state; the frame shapes are in the doc comment above.
 #[utoipa::path(get, path = "/groups/{groupId}/stream", tag = "chat",
-    params(("groupId" = String, Path, description = "The group to stream")),
+    params(("groupId" = String, Path, description = "The group to stream"), StreamQuery),
     responses((status = 200, description = "An open event stream", content_type = "text/event-stream")))]
-async fn stream(state: CurrentAccount, Path(id): Path<String>) -> impl IntoResponse {
+async fn stream(
+    state: CurrentAccount,
+    Path(id): Path<String>,
+    Query(query): Query<StreamQuery>,
+) -> impl IntoResponse {
     // Subscribe before reading the activity flag: any change that races this
     // arrives on `live` afterwards, so the seed can only be stale, never lost.
     let receiver = state.channel(&id).subscribe();
-    let live = BroadcastStream::new(receiver).filter_map(to_sse_event);
+    let wants_debug = query.debug;
+    let live = BroadcastStream::new(receiver).filter_map(move |item| to_sse_event(item, wants_debug));
     // Emit a comment the instant the client subscribes. Without an initial byte
     // the response body stays empty until the first keep-alive (~15s), and a
     // buffering reverse proxy (Vite's dev proxy, nginx, …) holds the response
@@ -522,14 +541,23 @@ async fn stream(state: CurrentAccount, Path(id): Path<String>) -> impl IntoRespo
     // Seed the just-connected client with the current turn activity, reusing the
     // same serialization as live frames. A reconnect (common through a tunnel)
     // missed the `activity` frames broadcast while it was down, so without this
-    // its composer lock could stay stuck until a manual refresh.
-    let seed = tokio_stream::iter(to_sse_event(Ok(StreamEvent::Activity(state.is_active(&id)))));
+    // its composer lock could stay stuck until a manual refresh. Empty on the
+    // debug-only connection — a debug panel doesn't drive the composer lock.
+    let seed = tokio_stream::iter(
+        (!wants_debug)
+            .then(|| StreamEvent::Activity(state.is_active(&id)))
+            .and_then(|event| to_sse_event(Ok(event), false)),
+    );
     // Seed the current turn too, so the pinned progress bar shows the group's
     // latest processing state the instant the client connects — independently of
     // how much message history it loads, and even for an event-triggered round
-    // that left no user message to reconstruct it from.
+    // that left no user message to reconstruct it from. Empty on the debug-only
+    // connection, same reasoning as `seed` above.
     let turn_seed = tokio_stream::iter(
-        state.current_turn(&id).and_then(|turn| to_sse_event(Ok(StreamEvent::Turn(turn)))),
+        (!wants_debug)
+            .then(|| state.current_turn(&id))
+            .flatten()
+            .and_then(|turn| to_sse_event(Ok(StreamEvent::Turn(turn)), false)),
     );
     let events = opened.chain(seed).chain(turn_seed).chain(live);
     Sse::new(events).keep_alive(KeepAlive::default())
@@ -538,10 +566,26 @@ async fn stream(state: CurrentAccount, Path(id): Path<String>) -> impl IntoRespo
 /// Renders a broadcast item as an SSE frame, dropping lag errors. Messages use
 /// the default `message` event; read receipts use a named `read` event, matching
 /// the two listeners in the frontend's `HttpChatApi`.
+///
+/// `wants_debug` splits one channel into two disjoint connections: `true`
+/// keeps only `Debug` frames, `false` drops them — never both on the same
+/// connection. Before this, every subscriber of a group's stream received
+/// every `AgentTrace` regardless of whether its tab had a debug panel open at
+/// all, which put trace content (a step closer to raw prompt/reasoning
+/// content than anything else this API sends) into browser memory nobody
+/// asked for.
 fn to_sse_event(
     item: Result<StreamEvent, tokio_stream::wrappers::errors::BroadcastStreamRecvError>,
+    wants_debug: bool,
 ) -> Option<Result<Event, Infallible>> {
-    let event = match item.ok()? {
+    let item = item.ok()?;
+    // Exactly one of the two connection kinds carries any given item — a
+    // debug-only connection filters everything *but* `Debug`, the default
+    // connection filters `Debug` out.
+    if matches!(item, StreamEvent::Debug(_)) != wants_debug {
+        return None;
+    }
+    let event = match item {
         StreamEvent::Message(message) => Event::default().json_data(message).ok()?,
         StreamEvent::Read(receipt) => Event::default().event("read").json_data(receipt).ok()?,
         StreamEvent::Activity(active) => {
@@ -554,4 +598,39 @@ fn to_sse_event(
         StreamEvent::Turn(turn) => Event::default().event("turn").json_data(turn).ok()?,
     };
     Some(Ok(event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trace() -> AgentTrace {
+        AgentTrace {
+            ts: 0,
+            group_id: "lounge".to_string(),
+            persona_id: "nyx".to_string(),
+            persona_name: "Nyx".to_string(),
+            system: String::new(),
+            conversation: String::new(),
+            action: "speak".to_string(),
+            message: None,
+            mood: None,
+            usage: None,
+            model: None,
+            duration_ms: None,
+            estimated_cost: None,
+        }
+    }
+
+    #[test]
+    fn the_default_connection_drops_debug_frames() {
+        assert!(to_sse_event(Ok(StreamEvent::Debug(trace())), false).is_none());
+        assert!(to_sse_event(Ok(StreamEvent::Activity(true)), false).is_some());
+    }
+
+    #[test]
+    fn the_debug_only_connection_drops_everything_else() {
+        assert!(to_sse_event(Ok(StreamEvent::Debug(trace())), true).is_some());
+        assert!(to_sse_event(Ok(StreamEvent::Activity(true)), true).is_none());
+    }
 }

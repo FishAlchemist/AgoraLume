@@ -16,7 +16,7 @@ use utoipa_axum::routes;
 
 use crate::api_error::ApiError;
 use crate::auth::Subject;
-use crate::state::AppState;
+use crate::state::{AppState, LoginError};
 
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     // Separate `.routes()` calls, not one `routes!(login, refresh)` group:
@@ -55,6 +55,15 @@ struct TokenPair {
     role: String,
 }
 
+/// `"admin"` or `"account"`, straight from a resolved [`Subject`] — the one
+/// place that mapping happens, so `login` and `refresh` can't disagree on it.
+fn role_of(subject: &Subject) -> &'static str {
+    match subject {
+        Subject::Admin => "admin",
+        Subject::Account(_) => "account",
+    }
+}
+
 /// Logs in as the admin (username `"admin"`) or a regular account (its own
 /// stored username). An account with no fixed password yet accepts this
 /// boot's generated one instead — see the server log at startup.
@@ -62,7 +71,9 @@ struct TokenPair {
     request_body = LoginRequest,
     responses(
         (status = 200, description = "A fresh token pair and the session's role", body = TokenPair),
-        (status = 401, description = "Unknown username or wrong password (not distinguished)")))]
+        (status = 401, description = "Unknown username or wrong password (not distinguished)"),
+        (status = 429, description = "Too many recent failed attempts for this username",
+            headers(("Retry-After" = u32, description = "Seconds to wait before trying again")))))]
 async fn login(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LoginRequest>,
@@ -70,17 +81,20 @@ async fn login(
     // One message for both "no such username" and "wrong password": saying
     // which would confirm whether an account exists. The timing is equalized
     // too — see `DUMMY_PASSWORD_HASH`.
-    let (issued, subject) = state.login(&body.username, &body.password).ok_or_else(|| {
-        ApiError::unauthorized("invalid-credentials", "invalid username or password", "Bearer")
+    let (issued, subject) = state.login(&body.username, &body.password).map_err(|e| match e {
+        LoginError::InvalidCredentials => {
+            ApiError::unauthorized("invalid-credentials", "invalid username or password", "Bearer")
+        }
+        LoginError::TooManyAttempts { retry_after_secs } => ApiError::too_many_requests(
+            "too-many-attempts",
+            "too many recent failed attempts for this username",
+            retry_after_secs,
+        ),
     })?;
-    let role = match subject {
-        Subject::Admin => "admin",
-        Subject::Account(_) => "account",
-    };
     Ok(Json(TokenPair {
         access_token: issued.access_token,
         refresh_token: issued.refresh_token,
-        role: role.to_string(),
+        role: role_of(&subject).to_string(),
     }))
 }
 
@@ -90,32 +104,32 @@ struct RefreshRequest {
     refresh_token: String,
 }
 
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct AccessToken {
-    access_token: String,
-}
-
-/// Mints a fresh access token from a still-valid refresh token, without
-/// asking for the password again. The refresh token itself is not rotated —
-/// it keeps working until its own (much longer) expiry.
+/// Mints a fresh access/refresh pair from a still-valid refresh token,
+/// without asking for the password again. The presented refresh token is
+/// rotated out — it stops working the moment its replacement is issued (a
+/// short grace window covers two callers racing on the same one; see
+/// `TokenStore::refresh`).
 #[utoipa::path(post, path = "/auth/refresh", tag = "auth", security(()),
     request_body = RefreshRequest,
     responses(
-        (status = 200, description = "A fresh access token; the refresh token is unchanged", body = AccessToken),
-        (status = 401, description = "Unknown, expired, revoked, or not a refresh token")))]
+        (status = 200, description = "A fresh token pair; the old refresh token stops working", body = TokenPair),
+        (status = 401, description = "Unknown, expired, or already-rotated refresh token")))]
 async fn refresh(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RefreshRequest>,
-) -> Result<Json<AccessToken>, ApiError> {
-    let access_token = state.refresh_access_token(&body.refresh_token).ok_or_else(|| {
+) -> Result<Json<TokenPair>, ApiError> {
+    let (issued, subject) = state.refresh_access_token(&body.refresh_token).ok_or_else(|| {
         ApiError::unauthorized(
             "invalid-token",
             "invalid or expired refresh token",
             "Bearer error=\"invalid_token\"",
         )
     })?;
-    Ok(Json(AccessToken { access_token }))
+    Ok(Json(TokenPair {
+        access_token: issued.access_token,
+        refresh_token: issued.refresh_token,
+        role: role_of(&subject).to_string(),
+    }))
 }
 
 /// The body of a sign-out request.

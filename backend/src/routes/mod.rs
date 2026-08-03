@@ -504,6 +504,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_wrong_passwords_are_throttled_with_a_retry_after() {
+        let app = router(not_mock_state(None, false), None);
+        for _ in 0..3 {
+            let (status, _) = post_json(
+                app.clone(),
+                "/auth/login",
+                serde_json::json!({ "username": "admin", "password": "wrong" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        // The 4th attempt is refused before the password is even checked —
+        // even the *correct* password doesn't get through while throttled.
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("{API_VERSION}/auth/login"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "username": "admin", "password": "admin-pw" }).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get(header::RETRY_AFTER).is_some());
+    }
+
+    #[tokio::test]
     async fn admin_login_then_refresh_round_trips() {
         let app = router(not_mock_state(None, false), None);
         let (status, tokens) = post_json(
@@ -516,9 +543,26 @@ mod tests {
         assert_eq!(tokens["role"].as_str(), Some("admin"));
         let refresh_token = tokens["refreshToken"].as_str().expect("a refresh token");
 
-        let (status, _) =
-            post_json(app, "/auth/refresh", serde_json::json!({ "refreshToken": refresh_token })).await;
+        let (status, refreshed) =
+            post_json(app.clone(), "/auth/refresh", serde_json::json!({ "refreshToken": refresh_token }))
+                .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(refreshed["role"].as_str(), Some("admin"));
+        let rotated_refresh_token =
+            refreshed["refreshToken"].as_str().expect("a fresh refresh token");
+        assert_ne!(
+            rotated_refresh_token, refresh_token,
+            "the refresh token must rotate on every use, not stay the same"
+        );
+
+        // The access token from the refresh response actually works — `/llm/settings`
+        // rather than `/organizations`, since that one is per-account and an
+        // admin subject is rejected there by design (see `CurrentAccount`).
+        let fresh_access_token = refreshed["accessToken"].as_str().expect("a fresh access token");
+        assert_eq!(
+            get_json_authed(app, "/llm/settings", fresh_access_token).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

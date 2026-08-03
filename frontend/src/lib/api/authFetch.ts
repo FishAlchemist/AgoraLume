@@ -29,8 +29,12 @@ export async function refreshAccessToken(): Promise<boolean> {
         body: JSON.stringify({ refreshToken }),
       });
       if (!res.ok) return false;
-      const data = (await res.json()) as { accessToken: string };
-      useAuth.getState().setAccessToken(data.accessToken);
+      // The refresh token is rotated on every use (see
+      // `backend/src/auth.rs`'s `TokenStore::refresh`) — the one just spent
+      // is already dead server-side, so both fields must be stored, not just
+      // the access token.
+      const data = (await res.json()) as { accessToken: string; refreshToken: string };
+      useAuth.getState().setRefreshedTokens(data.accessToken, data.refreshToken);
       return true;
     } catch {
       return false;

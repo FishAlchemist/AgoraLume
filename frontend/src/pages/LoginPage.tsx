@@ -18,6 +18,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { UI_LANGUAGES } from '../i18n';
 import { login } from '../lib/api/auth';
+import { ApiError } from '../lib/api/problem';
 import { useAuth } from '../store/auth';
 import { useConnection } from '../store/connection';
 import { useUi } from '../store/ui';
@@ -57,9 +58,16 @@ export function LoginPage() {
       setTokens({ ...tokens, username });
       closeLogin();
       navigate(tokens.role === 'admin' ? '/admin' : '/');
-    } catch {
+    } catch (e) {
       setStatus('error');
-      setError(t('auth.invalidCredentials'));
+      // A 429 means the password was never even checked — showing "invalid
+      // credentials" for it would tell a user who typed the right password
+      // that they didn't.
+      setError(
+        e instanceof ApiError && e.status === 429
+          ? t('auth.tooManyAttempts', { seconds: e.retryAfterSecs ?? 8 })
+          : t('auth.invalidCredentials'),
+      );
       return;
     }
     setStatus('idle');

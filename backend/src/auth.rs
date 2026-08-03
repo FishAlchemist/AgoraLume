@@ -131,6 +131,31 @@ struct TokenRecord {
     expires_at: i64,
 }
 
+/// A refresh token this store already exchanged once, kept just long enough
+/// to answer a second, racing presentation of it the same way instead of
+/// refusing it — see [`TokenStore::refresh`].
+struct RetiredRefresh {
+    replacement: String,
+    subject: Subject,
+    retired_at: i64,
+}
+
+/// How long a rotated-out refresh token is still honoured as a stand-in for
+/// its replacement. Long enough to cover a genuine race (two tabs sharing one
+/// refresh token, a client retrying a request whose response it never saw);
+/// short enough that it isn't a second, shadow validity window. Shrunk in
+/// tests so "past the window" is a `sleep`, not a slow test.
+#[cfg(not(test))]
+const REUSE_GRACE_MS: i64 = 10_000;
+// 500ms rather than something tighter: `cargo test` runs suites in parallel,
+// and a shared, loaded CI runner can plausibly deschedule a test thread for
+// tens of milliseconds between two back-to-back calls with no sleep between
+// them — which would turn "a racing second use" into a flaky "past the
+// window" failure. 500ms is short enough that the grace-expiry test's sleep
+// stays fast.
+#[cfg(test)]
+const REUSE_GRACE_MS: i64 = 500;
+
 /// The live access/refresh tokens issued so far, entirely in-memory —
 /// consistent with every token being minted fresh at login and this project's
 /// per-boot admin/account password bootstrap: nothing here is meant to
@@ -142,6 +167,7 @@ struct TokenRecord {
 pub struct TokenStore {
     access: Mutex<HashMap<String, TokenRecord>>,
     refresh: Mutex<HashMap<String, TokenRecord>>,
+    retired_refresh: Mutex<HashMap<String, RetiredRefresh>>,
 }
 
 /// A freshly issued token pair.
@@ -218,25 +244,197 @@ impl TokenStore {
         self.refresh.lock().unwrap().retain(|_, record| record.subject != *subject);
     }
 
-    /// Mints a fresh access token for whoever `refresh_token` belongs to,
-    /// without rotating the refresh token itself. `None` for an unknown,
-    /// expired, or already-revoked refresh token.
-    pub fn refresh(&self, refresh_token: &str) -> Option<String> {
-        let mut refresh = self.refresh.lock().unwrap();
-        let record = refresh.get(refresh_token)?;
-        if record.expires_at < now_ms() {
-            refresh.remove(refresh_token);
+    /// Mints a fresh access/refresh pair for whoever `refresh_token` belongs
+    /// to, and retires `refresh_token` itself — it stops working the instant
+    /// its replacement exists, same as any other rotated credential. `None`
+    /// for a refresh token that's unknown, expired, or was rotated out longer
+    /// ago than [`REUSE_GRACE_MS`].
+    //
+    // Rotation without this project having cross-tab token sync yet is what
+    // makes the grace window necessary: two tabs sharing one refresh token
+    // (only one physically talks to `/auth/refresh` first) would otherwise
+    // have the second tab treated as presenting a dead token. A presentation
+    // past the grace window is just denied, not treated as a theft signal
+    // that revokes every session for the subject — this store has no way to
+    // tell "a stale background tab finally woke up" apart from "someone
+    // replayed a captured token," and guessing wrong signs a real user out
+    // for no reason. Rotation alone already closes the actual gap (a
+    // captured refresh token used to stay valid, unrotated, for its whole
+    // 30-day life); reuse *detection* is a further hardening step that needs
+    // that sync built first.
+    pub fn refresh(&self, refresh_token: &str) -> Option<(IssuedTokens, Subject)> {
+        self.prune_retired();
+        {
+            let mut refresh = self.refresh.lock().unwrap();
+            if let Some(record) = refresh.get(refresh_token) {
+                if record.expires_at < now_ms() {
+                    refresh.remove(refresh_token);
+                    return None;
+                }
+                let subject = record.subject.clone();
+                refresh.remove(refresh_token);
+                drop(refresh);
+                let issued = self.rotate(refresh_token, subject.clone());
+                return Some((issued, subject));
+            }
+        }
+        let retired = self.retired_refresh.lock().unwrap();
+        let record = retired.get(refresh_token)?;
+        if now_ms() - record.retired_at > REUSE_GRACE_MS {
             return None;
         }
+        let replacement = record.replacement.clone();
         let subject = record.subject.clone();
-        drop(refresh);
+        drop(retired);
+        // The replacement itself may have been revoked since rotation (a
+        // password change, an explicit logout) — honouring a grace-window
+        // replay in that case would resurrect a session that was
+        // deliberately ended.
+        if !self.refresh.lock().unwrap().contains_key(&replacement) {
+            return None;
+        }
+        let access_token = generate_token();
+        self.access.lock().unwrap().insert(
+            access_token.clone(),
+            TokenRecord { subject: subject.clone(), expires_at: now_ms() + ACCESS_TOKEN_TTL_MS },
+        );
+        Some((IssuedTokens { access_token, refresh_token: replacement }, subject))
+    }
+
+    /// Mints the replacement pair for `old_token` and records the retirement.
+    fn rotate(&self, old_token: &str, subject: Subject) -> IssuedTokens {
         let now = now_ms();
         let access_token = generate_token();
         self.access.lock().unwrap().insert(
             access_token.clone(),
-            TokenRecord { subject, expires_at: now + ACCESS_TOKEN_TTL_MS },
+            TokenRecord { subject: subject.clone(), expires_at: now + ACCESS_TOKEN_TTL_MS },
         );
-        Some(access_token)
+        let new_refresh = generate_token();
+        self.refresh.lock().unwrap().insert(
+            new_refresh.clone(),
+            TokenRecord { subject: subject.clone(), expires_at: now + REFRESH_TOKEN_TTL_MS },
+        );
+        self.retired_refresh.lock().unwrap().insert(
+            old_token.to_string(),
+            RetiredRefresh { replacement: new_refresh.clone(), subject, retired_at: now },
+        );
+        IssuedTokens { access_token, refresh_token: new_refresh }
+    }
+
+    /// Drops retirement records past their grace window — lazily, on the same
+    /// "nothing sweeps on a timer" principle [`Self::verify_access`] already
+    /// follows, since this map is only ever consulted from [`Self::refresh`].
+    fn prune_retired(&self) {
+        let now = now_ms();
+        self.retired_refresh.lock().unwrap().retain(|_, r| now - r.retired_at <= REUSE_GRACE_MS);
+    }
+}
+
+struct LoginAttempts {
+    failures: u32,
+    /// Set once `failures` crosses [`LoginThrottle::FREE_ATTEMPTS`]; an
+    /// absolute timestamp, not a duration, so [`LoginThrottle::retry_after_secs`]
+    /// only has to compare against "now" rather than re-derive one.
+    retry_after: Option<i64>,
+}
+
+/// Slows down online password guessing against `POST /auth/login`.
+///
+/// Keyed on the literal username *typed in*, not on whether it belongs to a
+/// real account — a nonexistent username gets throttled exactly like a real
+/// one, so presence or absence of a lockout can't be used to probe which
+/// usernames exist (the same concern [`DUMMY_PASSWORD_HASH`] exists for, just
+/// on the throughput axis instead of the timing one). Deliberately not a hard
+/// lockout: a fixed, short `Retry-After` that never compounds into something
+/// unbounded, because `ADMIN_USERNAME` is a fixed, guessable string — an
+/// attacker who can make the admin account unusable for minutes at a time by
+/// failing its password a few times is its own denial-of-service.
+#[derive(Default)]
+pub struct LoginThrottle {
+    by_username: Mutex<HashMap<String, LoginAttempts>>,
+}
+
+impl LoginThrottle {
+    /// Failures below this many don't slow anything down — a mistyped
+    /// password shouldn't cost a real user a wait.
+    const FREE_ATTEMPTS: u32 = 2;
+    const RETRY_AFTER_MS: i64 = 8_000;
+    /// A hard ceiling on distinct usernames tracked at once. A flood of
+    /// requests carrying different junk usernames could otherwise grow this
+    /// map without bound; hitting the cap only happens under an actual
+    /// attack, so clearing it outright and starting over is an acceptable,
+    /// rare cost rather than a bookkeeping scheme for something this small.
+    const MAX_TRACKED: usize = 10_000;
+
+    /// `Some(seconds)` if `username` must wait before its password is even
+    /// checked.
+    pub fn retry_after_secs(&self, username: &str) -> Option<u32> {
+        let now = now_ms();
+        let map = self.by_username.lock().unwrap();
+        let until = map.get(username)?.retry_after?;
+        (until > now).then(|| ((until - now + 999) / 1000) as u32)
+    }
+
+    pub fn record_failure(&self, username: &str) {
+        let now = now_ms();
+        let mut map = self.by_username.lock().unwrap();
+        if map.len() >= Self::MAX_TRACKED && !map.contains_key(username) {
+            map.clear();
+        }
+        let attempts =
+            map.entry(username.to_string()).or_insert(LoginAttempts { failures: 0, retry_after: None });
+        attempts.failures += 1;
+        if attempts.failures > Self::FREE_ATTEMPTS {
+            attempts.retry_after = Some(now + Self::RETRY_AFTER_MS);
+        }
+    }
+
+    /// Clears any record for `username` — a successful login means whatever
+    /// came before it doesn't matter anymore.
+    pub fn record_success(&self, username: &str) {
+        self.by_username.lock().unwrap().remove(username);
+    }
+}
+
+#[cfg(test)]
+mod login_throttle_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_two_failures_are_free() {
+        let throttle = LoginThrottle::default();
+        throttle.record_failure("alice");
+        throttle.record_failure("alice");
+        assert_eq!(throttle.retry_after_secs("alice"), None);
+    }
+
+    #[test]
+    fn the_third_failure_starts_a_short_wait() {
+        let throttle = LoginThrottle::default();
+        for _ in 0..3 {
+            throttle.record_failure("alice");
+        }
+        let wait = throttle.retry_after_secs("alice").expect("throttled after 3 failures");
+        assert!(wait > 0 && wait <= 8);
+    }
+
+    #[test]
+    fn a_success_clears_the_throttle() {
+        let throttle = LoginThrottle::default();
+        for _ in 0..3 {
+            throttle.record_failure("alice");
+        }
+        throttle.record_success("alice");
+        assert_eq!(throttle.retry_after_secs("alice"), None);
+    }
+
+    #[test]
+    fn usernames_are_throttled_independently() {
+        let throttle = LoginThrottle::default();
+        for _ in 0..3 {
+            throttle.record_failure("alice");
+        }
+        assert_eq!(throttle.retry_after_secs("bob"), None);
     }
 }
 
@@ -317,8 +515,9 @@ mod tests {
     fn refresh_token_mints_a_new_working_access_token() {
         let store = TokenStore::default();
         let issued = store.issue(Subject::Admin);
-        let fresh = store.refresh(&issued.refresh_token).expect("a valid refresh token");
-        assert_eq!(store.verify_access(&fresh), Some(Subject::Admin));
+        let (fresh, subject) = store.refresh(&issued.refresh_token).expect("a valid refresh token");
+        assert_eq!(subject, Subject::Admin);
+        assert_eq!(store.verify_access(&fresh.access_token), Some(Subject::Admin));
     }
 
     #[test]
@@ -326,6 +525,52 @@ mod tests {
         let store = TokenStore::default();
         let issued = store.issue(Subject::Admin);
         assert!(store.refresh(&issued.access_token).is_none());
+    }
+
+    #[test]
+    fn refreshing_rotates_the_refresh_token() {
+        let store = TokenStore::default();
+        let issued = store.issue(Subject::Admin);
+        let (fresh, _) = store.refresh(&issued.refresh_token).expect("a valid refresh token");
+        assert_ne!(fresh.refresh_token, issued.refresh_token);
+        // The new pair actually works.
+        assert_eq!(store.verify_access(&fresh.access_token), Some(Subject::Admin));
+        assert!(store.refresh(&fresh.refresh_token).is_some());
+    }
+
+    #[test]
+    fn a_racing_second_use_of_a_just_rotated_token_gets_the_same_replacement() {
+        // Two tabs sharing one refresh token: only one physically wins the
+        // race to rotate it first. The second must not be treated as reusing
+        // a dead token — it should land on the same replacement the first
+        // one got, not be locked out by its own session's rotation.
+        let store = TokenStore::default();
+        let issued = store.issue(Subject::Admin);
+        let (first, _) = store.refresh(&issued.refresh_token).expect("first use rotates it");
+        let (second, _) = store.refresh(&issued.refresh_token).expect("a racing second use, within grace");
+        assert_eq!(first.refresh_token, second.refresh_token);
+        assert_eq!(store.verify_access(&second.access_token), Some(Subject::Admin));
+    }
+
+    #[test]
+    fn a_rotated_token_is_refused_once_the_grace_window_passes() {
+        let store = TokenStore::default();
+        let issued = store.issue(Subject::Admin);
+        store.refresh(&issued.refresh_token).expect("rotates it");
+        std::thread::sleep(std::time::Duration::from_millis(REUSE_GRACE_MS as u64 + 100));
+        assert!(store.refresh(&issued.refresh_token).is_none());
+    }
+
+    #[test]
+    fn a_grace_window_replay_does_not_resurrect_a_revoked_session() {
+        let store = TokenStore::default();
+        let issued = store.issue(Subject::Account("acct-1".to_string()));
+        store.refresh(&issued.refresh_token).expect("rotates it");
+        store.revoke_subject(&Subject::Account("acct-1".to_string()));
+        // The old token is still within its grace window, but its
+        // replacement was just revoked (e.g. a password change) — honouring
+        // the replay would undo that revocation.
+        assert!(store.refresh(&issued.refresh_token).is_none());
     }
 
     #[test]

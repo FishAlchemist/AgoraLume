@@ -31,7 +31,8 @@ function parseFrame<T>(data: string): T | null {
 /**
  * Per-event-name frame handling, keyed the same way the backend names its SSE
  * events. Each entry parses its payload and fans it out to that event kind's
- * subscribers on the given stream.
+ * subscribers on the given stream. `debug` is deliberately not here — it
+ * never arrives on this connection at all, see {@link DebugStream}.
  */
 const FRAME_HANDLERS: Record<string, (stream: GroupStream, data: string) => void> = {
   message: (stream, data) => {
@@ -49,10 +50,6 @@ const FRAME_HANDLERS: Record<string, (stream: GroupStream, data: string) => void
   turn: (stream, data) => {
     const parsed = parseFrame<Turn>(data);
     if (parsed) for (const h of stream.turn) h(parsed);
-  },
-  debug: (stream, data) => {
-    const parsed = parseFrame<AgentTrace>(data);
-    if (parsed) for (const h of stream.debug) h(parsed);
   },
   suggestions: (stream, data) => {
     const parsed = parseFrame<GroupSuggestions>(data);
@@ -75,7 +72,6 @@ interface GroupStream {
   read: Set<ReadHandler>;
   activity: Set<ActivityHandler>;
   turn: Set<TurnHandler>;
-  debug: Set<DebugHandler>;
   suggestions: Set<SuggestionsHandler>;
   /** Pending close from a grace period; cleared if a subscriber returns first. */
   closeTimer?: ReturnType<typeof setTimeout>;
@@ -83,21 +79,41 @@ interface GroupStream {
   connected?: boolean;
 }
 
+/**
+ * The debug panel's own connection (`?debug=true`), separate from
+ * {@link GroupStream} — see that interface's sibling doc comment on
+ * {@link SharedStreams} for why. Its only subscribers are debug handlers, so
+ * there's nothing to split further within it.
+ */
+interface DebugStream {
+  source: FetchEventStream;
+  debug: Set<DebugHandler>;
+  closeTimer?: ReturnType<typeof setTimeout>;
+}
+
 /** How long an idle group stream lingers before closing (see {@link SharedStreams}). */
 const LINGER_MS = 300;
 
 /**
- * One SSE connection per group, shared by every subscriber. The backend
- * multiplexes replies, read receipts, activity, and debug traces as named
- * events on a single `/stream`, so all four subscription kinds ride one
- * EventSource instead of opening four. The connection opens on the first
- * subscriber and — after a short grace period — closes when the last one
- * leaves. The grace period lets a React StrictMode remount or a quick
- * group switch-back reuse the live connection rather than drop and reopen it,
- * which a tunnel (cloudflared) would otherwise log as a stream cancellation.
+ * One SSE connection per group, shared by every subscriber except the debug
+ * panel. The backend multiplexes replies, read receipts, activity, and turn
+ * progress as named events on a single `/stream`, so those four subscription
+ * kinds ride one connection instead of opening four. The connection opens on
+ * the first subscriber and — after a short grace period — closes when the
+ * last one leaves. The grace period lets a React StrictMode remount or a
+ * quick group switch-back reuse the live connection rather than drop and
+ * reopen it, which a tunnel (cloudflared) would otherwise log as a stream
+ * cancellation.
+ *
+ * `debug` frames carry a step closer to raw prompt/reasoning content than
+ * anything else this API sends, so they ride a second, separate connection
+ * (`?debug=true`, opened only while a debug-panel subscriber exists) instead
+ * of being pushed to every tab that merely has a group open — see
+ * `backend/src/routes/chat.rs`'s `StreamQuery`.
  */
 class SharedStreams {
   private readonly byGroup = new Map<string, GroupStream>();
+  private readonly byGroupDebug = new Map<string, DebugStream>();
 
   constructor(private readonly baseUrl: string) {}
 
@@ -126,9 +142,9 @@ class SharedStreams {
   }
 
   subscribeDebug(groupId: string, handler: DebugHandler): () => void {
-    const stream = this.open(groupId);
+    const stream = this.openDebug(groupId);
     stream.debug.add(handler);
-    return () => this.drop(groupId, stream, stream.debug, handler);
+    return () => this.dropDebug(groupId, stream, handler);
   }
 
   subscribeSuggestions(groupId: string, handler: SuggestionsHandler): () => void {
@@ -155,7 +171,6 @@ class SharedStreams {
       read: new Set<ReadHandler>(),
       activity: new Set<ActivityHandler>(),
       turn: new Set<TurnHandler>(),
-      debug: new Set<DebugHandler>(),
       suggestions: new Set<SuggestionsHandler>(),
     } as GroupStream;
     // The default (unnamed) event carries a Message; the rest are named events.
@@ -218,9 +233,48 @@ class SharedStreams {
       stream.read.size > 0 ||
       stream.activity.size > 0 ||
       stream.turn.size > 0 ||
-      stream.debug.size > 0 ||
       stream.suggestions.size > 0
     );
+  }
+
+  /** {@link open}'s counterpart for the debug-only connection. */
+  private openDebug(groupId: string): DebugStream {
+    const existing = this.byGroupDebug.get(groupId);
+    if (existing) {
+      if (existing.closeTimer) {
+        clearTimeout(existing.closeTimer);
+        existing.closeTimer = undefined;
+      }
+      return existing;
+    }
+
+    const stream = { debug: new Set<DebugHandler>() } as DebugStream;
+    stream.source = new FetchEventStream(
+      `${this.baseUrl}/groups/${groupId}/stream?debug=true`,
+      (eventName, data) => {
+        if (eventName !== 'debug') return;
+        const parsed = parseFrame<AgentTrace>(data);
+        if (parsed) for (const h of stream.debug) h(parsed);
+      },
+      () => {
+        // No resync on reconnect: unlike messages, a missed trace has no
+        // "refetch and replay" story — the panel just picks up live traces
+        // again from whenever the reconnect completes.
+      },
+    );
+    this.byGroupDebug.set(groupId, stream);
+    return stream;
+  }
+
+  /** {@link drop}'s counterpart for the debug-only connection. */
+  private dropDebug(groupId: string, stream: DebugStream, handler: DebugHandler): void {
+    stream.debug.delete(handler);
+    if (stream.debug.size > 0) return;
+    stream.closeTimer = setTimeout(() => {
+      if (stream.debug.size > 0 || this.byGroupDebug.get(groupId) !== stream) return;
+      stream.source.close();
+      this.byGroupDebug.delete(groupId);
+    }, LINGER_MS);
   }
 }
 

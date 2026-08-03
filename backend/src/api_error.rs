@@ -60,6 +60,11 @@ pub struct ApiError {
     /// the value rides along until [`IntoResponse`] can set it.
     #[serde(skip)]
     challenge: Option<&'static str>,
+    /// The `Retry-After` value (seconds) to send alongside a 429. Same
+    /// carry-along mechanism as `challenge`, just for a header whose value
+    /// isn't known until the call site, so it can't be `&'static str`.
+    #[serde(skip)]
+    retry_after_secs: Option<u32>,
 }
 
 impl ApiError {
@@ -72,6 +77,7 @@ impl ApiError {
             status: status.as_u16(),
             detail: Some(detail.into()),
             challenge: None,
+            retry_after_secs: None,
         }
     }
 
@@ -107,6 +113,16 @@ impl ApiError {
     pub fn unprocessable(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid-request", detail)
     }
+
+    /// 429 — this caller (or this specific username, for a login throttle)
+    /// has to wait `retry_after_secs` before trying again. Carries
+    /// `Retry-After` per RFC 9110 §10.2.3.
+    pub fn too_many_requests(slug: &str, detail: impl Into<String>, retry_after_secs: u32) -> Self {
+        Self {
+            retry_after_secs: Some(retry_after_secs),
+            ..Self::new(StatusCode::TOO_MANY_REQUESTS, slug, detail)
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -116,6 +132,7 @@ impl IntoResponse for ApiError {
         // unwrapping keeps a future hand-built value from panicking a handler.
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let challenge = self.challenge;
+        let retry_after_secs = self.retry_after_secs;
         let mut response = (status, Json(self)).into_response();
         // `Json` sets `application/json`; the whole point of a problem document
         // is that it announces itself as one, so overwrite it.
@@ -127,6 +144,9 @@ impl IntoResponse for ApiError {
             response
                 .headers_mut()
                 .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static(challenge));
+        }
+        if let Some(secs) = retry_after_secs {
+            response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(secs));
         }
         response
     }

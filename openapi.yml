@@ -158,6 +158,19 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+        '429':
+          description: Too many recent failed attempts for this username
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                format: int32
+                minimum: 0
+              description: Seconds to wait before trying again
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
       security:
       - {}
   /v1beta/auth/logout:
@@ -184,9 +197,11 @@ paths:
       tags:
       - auth
       summary: |-
-        Mints a fresh access token from a still-valid refresh token, without
-        asking for the password again. The refresh token itself is not rotated —
-        it keeps working until its own (much longer) expiry.
+        Mints a fresh access/refresh pair from a still-valid refresh token,
+        without asking for the password again. The presented refresh token is
+        rotated out — it stops working the moment its replacement is issued (a
+        short grace window covers two callers racing on the same one; see
+        `TokenStore::refresh`).
       operationId: refresh
       requestBody:
         content:
@@ -196,13 +211,13 @@ paths:
         required: true
       responses:
         '200':
-          description: A fresh access token; the refresh token is unchanged
+          description: A fresh token pair; the old refresh token stops working
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/AccessToken'
+                $ref: '#/components/schemas/TokenPair'
         '401':
-          description: Unknown, expired, revoked, or not a refresh token
+          description: Unknown, expired, or already-rotated refresh token
           content:
             application/problem+json:
               schema:
@@ -781,8 +796,11 @@ paths:
       summary: Server-Sent Events for a group.
       description: |-
         Frames: unnamed = `Message`; `read` = `ReadReceipt`; `activity` =
-        `{ "active": bool }`; `turn` = `Turn`; `debug` = `AgentTrace`;
-        `suggestions` = `GroupSuggestions`. `activity` and `turn` are seeded on connect.
+        `{ "active": bool }`; `turn` = `Turn`; `suggestions` = `GroupSuggestions`.
+        `activity` and `turn` are seeded on connect. `?debug=true` switches to a
+        connection carrying only `debug` (`AgentTrace`) frames instead — see
+        `debug`'s own doc comment on [`StreamQuery`] for why that's a separate
+        connection rather than one more frame kind on this one.
       operationId: stream
       parameters:
       - name: groupId
@@ -791,6 +809,15 @@ paths:
         required: true
         schema:
           type: string
+      - name: debug
+        in: query
+        description: |-
+          Switches this connection to carrying *only* `debug` frames — every
+          other event kind is filtered out. Defaults to `false`, so the
+          ordinary chat connection never carries `AgentTrace` payloads at all.
+        required: false
+        schema:
+          type: boolean
       responses:
         '200':
           description: An open event stream
@@ -1788,13 +1815,6 @@ paths:
                 $ref: '#/components/schemas/ApiError'
 components:
   schemas:
-    AccessToken:
-      type: object
-      required:
-      - accessToken
-      properties:
-        accessToken:
-          type: string
     AccountSummary:
       type: object
       description: |-

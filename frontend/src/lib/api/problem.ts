@@ -34,6 +34,8 @@ export class ApiError extends Error {
     readonly status: number,
     readonly type: string,
     message: string,
+    /** From the `Retry-After` header on a 429 (see `ApiError::too_many_requests`); undefined otherwise. */
+    readonly retryAfterSecs?: number,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -76,7 +78,13 @@ export async function throwIfNotOk(res: Response, context: string): Promise<Resp
 
   const detail = typeof problem?.detail === 'string' ? problem.detail : '';
   const type = typeof problem?.type === 'string' ? problem.type : '';
-  throw new ApiError(res.status, type, detail || `${context} failed: ${res.status}`);
+  const retryAfter = Number(res.headers.get('Retry-After'));
+  throw new ApiError(
+    res.status,
+    type,
+    detail || `${context} failed: ${res.status}`,
+    Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+  );
 }
 
 /** {@link throwIfNotOk}, then the parsed JSON body. */

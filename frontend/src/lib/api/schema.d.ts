@@ -45,9 +45,11 @@ export interface paths {
   };
   "/v1beta/auth/refresh": {
     /**
-     * Mints a fresh access token from a still-valid refresh token, without
-     * asking for the password again. The refresh token itself is not rotated —
-     * it keeps working until its own (much longer) expiry.
+     * Mints a fresh access/refresh pair from a still-valid refresh token,
+     * without asking for the password again. The presented refresh token is
+     * rotated out — it stops working the moment its replacement is issued (a
+     * short grace window covers two callers racing on the same one; see
+     * `TokenStore::refresh`).
      */
     post: operations["refresh"];
   };
@@ -110,8 +112,11 @@ export interface paths {
     /**
      * Server-Sent Events for a group.
      * @description Frames: unnamed = `Message`; `read` = `ReadReceipt`; `activity` =
-     * `{ "active": bool }`; `turn` = `Turn`; `debug` = `AgentTrace`;
-     * `suggestions` = `GroupSuggestions`. `activity` and `turn` are seeded on connect.
+     * `{ "active": bool }`; `turn` = `Turn`; `suggestions` = `GroupSuggestions`.
+     * `activity` and `turn` are seeded on connect. `?debug=true` switches to a
+     * connection carrying only `debug` (`AgentTrace`) frames instead — see
+     * `debug`'s own doc comment on [`StreamQuery`] for why that's a separate
+     * connection rather than one more frame kind on this one.
      */
     get: operations["stream"];
   };
@@ -253,9 +258,6 @@ export type webhooks = Record<string, never>;
 
 export interface components {
   schemas: {
-    AccessToken: {
-      accessToken: string;
-    };
     /**
      * @description One account, as admin sees it: its opaque id and its login name. Never
      * carries a password or its hash. `account_id` is what [`UpdateAccountRequest`]
@@ -1145,6 +1147,16 @@ export interface operations {
           "application/problem+json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Too many recent failed attempts for this username */
+      429: {
+        headers: {
+          /** @description Seconds to wait before trying again */
+          "Retry-After"?: number;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
     };
   };
   /**
@@ -1165,9 +1177,11 @@ export interface operations {
     };
   };
   /**
-   * Mints a fresh access token from a still-valid refresh token, without
-   * asking for the password again. The refresh token itself is not rotated —
-   * it keeps working until its own (much longer) expiry.
+   * Mints a fresh access/refresh pair from a still-valid refresh token,
+   * without asking for the password again. The presented refresh token is
+   * rotated out — it stops working the moment its replacement is issued (a
+   * short grace window covers two callers racing on the same one; see
+   * `TokenStore::refresh`).
    */
   refresh: {
     requestBody: {
@@ -1176,13 +1190,13 @@ export interface operations {
       };
     };
     responses: {
-      /** @description A fresh access token; the refresh token is unchanged */
+      /** @description A fresh token pair; the old refresh token stops working */
       200: {
         content: {
-          "application/json": components["schemas"]["AccessToken"];
+          "application/json": components["schemas"]["TokenPair"];
         };
       };
-      /** @description Unknown, expired, revoked, or not a refresh token */
+      /** @description Unknown, expired, or already-rotated refresh token */
       401: {
         content: {
           "application/problem+json": components["schemas"]["ApiError"];
@@ -1701,11 +1715,22 @@ export interface operations {
   /**
    * Server-Sent Events for a group.
    * @description Frames: unnamed = `Message`; `read` = `ReadReceipt`; `activity` =
-   * `{ "active": bool }`; `turn` = `Turn`; `debug` = `AgentTrace`;
-   * `suggestions` = `GroupSuggestions`. `activity` and `turn` are seeded on connect.
+   * `{ "active": bool }`; `turn` = `Turn`; `suggestions` = `GroupSuggestions`.
+   * `activity` and `turn` are seeded on connect. `?debug=true` switches to a
+   * connection carrying only `debug` (`AgentTrace`) frames instead — see
+   * `debug`'s own doc comment on [`StreamQuery`] for why that's a separate
+   * connection rather than one more frame kind on this one.
    */
   stream: {
     parameters: {
+      query?: {
+        /**
+         * @description Switches this connection to carrying *only* `debug` frames — every
+         * other event kind is filtered out. Defaults to `false`, so the
+         * ordinary chat connection never carries `AgentTrace` payloads at all.
+         */
+        debug?: boolean;
+      };
       path: {
         /** @description The group to stream */
         groupId: string;

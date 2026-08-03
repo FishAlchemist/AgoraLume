@@ -19,8 +19,8 @@ use crate::agent::turn::{
     AgentRuntime, coordinator_loop, current_time_of_day, generate_suggestions,
 };
 use crate::auth::{
-    AccountCredentials, Subject, TokenStore, generate_boot_password, hash_password,
-    verify_password as verify_password_hash,
+    AccountCredentials, IssuedTokens, LoginThrottle, Subject, TokenStore, generate_boot_password,
+    hash_password, verify_password as verify_password_hash,
 };
 use crate::llm_config::{LlmConfigStore, LlmSettings, Pricing};
 use crate::models::{
@@ -1341,6 +1341,19 @@ pub struct AppState {
     /// testing, independent of mock-ness — see [`Self::with_admin_auth`].
     auth_disabled: bool,
     tokens: TokenStore,
+    login_throttle: LoginThrottle,
+}
+
+/// Why [`AppState::login`] refused a login attempt — distinct from an
+/// [`ApiError`] so the route layer decides the wire shape (401 vs 429,
+/// `WWW-Authenticate` vs `Retry-After`), not this module.
+pub enum LoginError {
+    /// Unknown username or wrong password — deliberately not distinguished
+    /// any further than that, same as before this existed.
+    InvalidCredentials,
+    /// This username has failed enough recent attempts that its password
+    /// isn't even being checked right now.
+    TooManyAttempts { retry_after_secs: u32 },
 }
 
 impl AppState {
@@ -1361,6 +1374,7 @@ impl AppState {
             admin_password_hash: hash_password(&generate_boot_password()),
             auth_disabled: false,
             tokens: TokenStore::default(),
+            login_throttle: LoginThrottle::default(),
         }
     }
 
@@ -1472,19 +1486,35 @@ impl AppState {
     /// username's wrong-password attempt pays — see that constant's doc
     /// comment for why: without it, response timing alone reveals which
     /// usernames exist.
-    pub fn login(&self, username: &str, password: &str) -> Option<(crate::auth::IssuedTokens, Subject)> {
-        if username == crate::auth::ADMIN_USERNAME {
-            return verify_password_hash(password, &self.admin_password_hash)
-                .then(|| (self.tokens.issue(Subject::Admin), Subject::Admin));
+    ///
+    /// The throttle check below is skipped entirely when [`Self::auth_required`]
+    /// is false (mock mode, `AGORALUME_AUTH_DISABLED`) — a lockout during
+    /// scripted local testing would fight the reason that escape hatch exists.
+    pub fn login(&self, username: &str, password: &str) -> Result<(IssuedTokens, Subject), LoginError> {
+        if self.auth_required()
+            && let Some(retry_after_secs) = self.login_throttle.retry_after_secs(username)
+        {
+            return Err(LoginError::TooManyAttempts { retry_after_secs });
         }
-        let Some((account_id, account)) = self.find_account_by_username(username) else {
+        let outcome = if username == crate::auth::ADMIN_USERNAME {
+            verify_password_hash(password, &self.admin_password_hash)
+                .then(|| (self.tokens.issue(Subject::Admin), Subject::Admin))
+        } else if let Some((account_id, account)) = self.find_account_by_username(username) {
+            account.verify_password(password).then(|| {
+                let subject = Subject::Account(account_id);
+                (self.tokens.issue(subject.clone()), subject)
+            })
+        } else {
             verify_password_hash(password, &crate::auth::DUMMY_PASSWORD_HASH);
-            return None;
+            None
         };
-        account.verify_password(password).then(|| {
-            let subject = Subject::Account(account_id);
-            (self.tokens.issue(subject.clone()), subject)
-        })
+        if self.auth_required() {
+            match &outcome {
+                Some(_) => self.login_throttle.record_success(username),
+                None => self.login_throttle.record_failure(username),
+            }
+        }
+        outcome.ok_or(LoginError::InvalidCredentials)
     }
 
     /// Admin-only: provisions a brand-new account with a chosen username and
@@ -1584,9 +1614,11 @@ impl AppState {
             .collect()
     }
 
-    /// Mints a fresh access token from a refresh token, or `None` if it's
-    /// unknown, expired, or was never a refresh token to begin with.
-    pub fn refresh_access_token(&self, refresh_token: &str) -> Option<String> {
+    /// Mints a fresh access/refresh pair from a refresh token, rotating out
+    /// the one presented — see [`TokenStore::refresh`]. `None` if it's
+    /// unknown, expired, never a refresh token to begin with, or was rotated
+    /// out longer ago than its grace window.
+    pub fn refresh_access_token(&self, refresh_token: &str) -> Option<(IssuedTokens, Subject)> {
         self.tokens.refresh(refresh_token)
     }
 
@@ -2012,7 +2044,7 @@ mod tests {
 
         let time = |username: &str, password: &str| {
             let start = std::time::Instant::now();
-            state.login(username, password);
+            let _ = state.login(username, password);
             start.elapsed()
         };
 

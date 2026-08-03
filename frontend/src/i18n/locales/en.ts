@@ -32,6 +32,7 @@ export const en = {
     signOut: 'Sign out',
     signedInAs: 'Signed in as {{username}}',
     invalidCredentials: 'Invalid username or password',
+    tooManyAttempts: 'Too many attempts — try again in {{seconds}}s',
   },
   common: {
     save: 'Save',
