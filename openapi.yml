@@ -1,11 +1,21 @@
 openapi: 3.1.0
 info:
   title: AgoraLume API
-  description: 'AgoraLume API: user + multi-AI group chat with modular personas. The backend is the single source of truth for the workspace (organizations, departments, personas, groups, settings) and streams chat over SSE. This is the production API contract; the current build backs it with an in-memory store and simulated agent replies until an LLM is connected.'
+  description: |-
+    User + multi-AI group chat with modular personas. The backend owns the workspace and streams chat over SSE.
+
+    POST creates (201), PATCH merges a partial body (200), DELETE returns 204. Failures are RFC 9457 problem documents; `type` is a stable `urn:agoralume:error:…`.
   license:
     name: AGPL-3.0-only
     identifier: AGPL-3.0-only
   version: 0.1.0
+servers:
+- url: /
+  description: 'Same-origin: the bundled build, where the SPA and the API share a host'
+- url: /api
+  description: Behind an edge/dev proxy (VITE_API_PREFIX=/api)
+- url: http://127.0.0.1:8080
+  description: A local backend (pnpm dev:api)
 paths:
   /v1beta/accounts:
     get:
@@ -15,7 +25,7 @@ paths:
       operationId: list_accounts
       responses:
         '200':
-          description: ''
+          description: Every account's id and login name; never a password
           content:
             application/json:
               schema:
@@ -23,11 +33,17 @@ paths:
                 items:
                   $ref: '#/components/schemas/AccountSummary'
         '401':
-          description: Missing/invalid token, or a valid token that isn't the admin role
+          description: Not signed in
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       tags:
       - accounts
@@ -43,36 +59,41 @@ paths:
               $ref: '#/components/schemas/CreateAccountRequest'
         required: true
       responses:
-        '200':
-          description: ''
+        '201':
+          description: The created account
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccountSummary'
         '401':
-          description: Missing/invalid token, or a valid token that isn't the admin role
+          description: Not signed in
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '422':
-          description: empty username/password, a reserved or already-taken username, or no persistent data directory configured
+          description: Empty/reserved/taken username, empty password, or no persistent backend
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
-  /v1beta/accounts/{account_id}:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/accounts/{accountId}:
     patch:
       tags:
       - accounts
       summary: |-
-        Changes an existing account's username, password, or both. Existing
-        access/refresh tokens for that account keep working across the change —
-        nothing here revokes them — the same as every other credentials update in
-        this codebase (there's no token blocklist yet).
+        Changes an existing account's username, password, or both. Every live
+        session for that account is revoked: its tokens stop working immediately and
+        the holder must sign in again.
       operationId: update_account
       parameters:
-      - name: account_id
+      - name: accountId
         in: path
         description: The account to edit
         required: true
@@ -86,23 +107,29 @@ paths:
         required: true
       responses:
         '200':
-          description: ''
+          description: The updated account; its sessions are revoked
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccountSummary'
         '401':
-          description: Missing/invalid token, or a valid token that isn't the admin role
+          description: Not signed in
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '422':
-          description: unknown account_id, empty/reserved/already-taken username, empty password, or no persistent data directory configured
+          description: Unknown id, empty/reserved/taken username, empty password, or no persistent backend
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
   /v1beta/auth/login:
     post:
       tags:
@@ -120,17 +147,38 @@ paths:
         required: true
       responses:
         '200':
-          description: ''
+          description: A fresh token pair and the session's role
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TokenPair'
         '401':
-          description: Unknown username or wrong password
+          description: Unknown username or wrong password (not distinguished)
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
+      security:
+      - {}
+  /v1beta/auth/logout:
+    post:
+      tags:
+      - auth
+      summary: |-
+        Ends the current session: the presented access token (from the
+        `Authorization` header) and refresh token stop working immediately.
+      operationId: logout
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+        required: true
+      responses:
+        '204':
+          description: Signed out (idempotent)
+      security:
+      - {}
   /v1beta/auth/refresh:
     post:
       tags:
@@ -148,74 +196,50 @@ paths:
         required: true
       responses:
         '200':
-          description: ''
+          description: A fresh access token; the refresh token is unchanged
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccessToken'
         '401':
-          description: Unknown, expired, or not actually a refresh token
+          description: Unknown, expired, revoked, or not a refresh token
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
-  /v1beta/debug/usage:
-    get:
-      tags:
-      - service
-      summary: |-
-        Cumulative LLM usage — the global "total usage" readout: request count,
-        token breakdown, cache-hit ratio, the running estimated cost (always an
-        estimate, for reference only), and the same totals broken down by model.
-        When persistence is on, this survives a server restart; the cost is accrued
-        one trace at a time at whatever rate was configured when each trace was
-        recorded, so a later change to the configured rates never reprices history.
-      operationId: debug_usage
-      responses:
-        '200':
-          description: Cumulative LLM usage
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DebugUsage'
-  /v1beta/debug/usage/by-persona:
-    get:
-      tags:
-      - service
-      summary: |-
-        Usage broken down by persona, site-wide — the global analogue of
-        [`group_debug_usage_by_persona`], for spotting which character is
-        expensive across every group rather than within one chat. Covers every AI
-        persona in the workspace plus the synthetic "system" bucket (context
-        compression, chat suggestions); sorted by total tokens descending. No
-        group to miss, so unlike the per-group endpoints there's no 404 case.
-      operationId: global_debug_usage_by_persona
-      responses:
-        '200':
-          description: Every AI persona's usage, summed across every group
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/PersonaUsage'
+                $ref: '#/components/schemas/ApiError'
+      security:
+      - {}
   /v1beta/departments:
     get:
       tags:
       - departments
+      summary: Every department in the workspace, across all organizations.
       operationId: list_depts
       responses:
         '200':
-          description: ''
+          description: Every department, across all organizations
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Department'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       tags:
       - departments
+      summary: Creates a department.
       operationId: create_dept
       requestBody:
         content:
@@ -225,53 +249,103 @@ paths:
         required: true
       responses:
         '201':
-          description: ''
+          description: The created department
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Department'
-  /v1beta/departments/{id}:
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/departments/{departmentId}:
     get:
       tags:
       - departments
+      summary: One department by id.
       operationId: get_dept
       parameters:
-      - name: id
+      - name: departmentId
         in: path
+        description: The department to read
         required: true
         schema:
           type: string
       responses:
         '200':
-          description: ''
+          description: The department
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Department'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown department
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     delete:
       tags:
       - departments
+      summary: Deletes a department.
       operationId: delete_dept
       parameters:
-      - name: id
+      - name: departmentId
         in: path
+        description: The department to delete
         required: true
         schema:
           type: string
       responses:
         '204':
-          description: ''
+          description: Deleted
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown department
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     patch:
       tags:
       - departments
+      summary: Merges a partial update onto a department.
       operationId: update_dept
       parameters:
-      - name: id
+      - name: departmentId
         in: path
+        description: The department to update
         required: true
         schema:
           type: string
@@ -279,34 +353,70 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Department'
+              $ref: '#/components/schemas/DepartmentPatch'
         required: true
       responses:
         '200':
-          description: ''
+          description: The updated department
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Department'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown department
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '422':
+          description: Malformed patch
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1beta/groups:
     get:
       tags:
       - groups
+      summary: Every chat group in the workspace.
       operationId: list_groups
       responses:
         '200':
-          description: ''
+          description: Every group
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Group'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       tags:
       - groups
+      summary: Creates a group.
       operationId: create_group
       requestBody:
         content:
@@ -316,53 +426,103 @@ paths:
         required: true
       responses:
         '201':
-          description: ''
+          description: The created group
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Group'
-  /v1beta/groups/{id}:
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/groups/{groupId}:
     get:
       tags:
       - groups
+      summary: One group by id.
       operationId: get_group
       parameters:
-      - name: id
+      - name: groupId
         in: path
+        description: The group to read
         required: true
         schema:
           type: string
       responses:
         '200':
-          description: ''
+          description: The group
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Group'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown group
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     delete:
       tags:
       - groups
+      summary: Deletes a group.
       operationId: delete_group
       parameters:
-      - name: id
+      - name: groupId
         in: path
+        description: The group to delete
         required: true
         schema:
           type: string
       responses:
         '204':
-          description: ''
+          description: Deleted
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown group
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     patch:
       tags:
       - groups
+      summary: Merges a partial update onto a group.
       operationId: update_group
       parameters:
-      - name: id
+      - name: groupId
         in: path
+        description: The group to update
         required: true
         schema:
           type: string
@@ -370,114 +530,52 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Group'
+              $ref: '#/components/schemas/GroupPatch'
         required: true
       responses:
         '200':
-          description: ''
+          description: The updated group
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Group'
-        '404':
-          description: ''
-  /v1beta/groups/{id}/debug/traces:
-    get:
-      tags:
-      - chat
-      summary: |-
-        Recent agent traces for a group — the exact prompt each character received
-        and what it decided — for hydrating the debug panel. Live updates then arrive
-        as `debug` SSE frames on the group stream.
-      operationId: debug_traces
-      parameters:
-      - name: id
-        in: path
-        description: Group id
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Recent agent traces, oldest first
+        '401':
+          description: Not signed in
           content:
-            application/json:
+            application/problem+json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/AgentTrace'
-  /v1beta/groups/{id}/debug/usage:
-    get:
-      tags:
-      - chat
-      summary: |-
-        One group's own cumulative LLM usage — independent of every other group's,
-        unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
-        every group's usage (plus any spend from groups since deleted); this is one
-        group's own slice of it. 404s for an unknown group, matching every other
-        `/groups/{id}/...` handler — [`group_debug_usage_by_persona`] needs the
-        workspace to know the group's current members, so the two must agree on
-        what "unknown group" means rather than one 200-with-zeros and the other
-        silently returning nothing.
-      operationId: group_debug_usage
-      parameters:
-      - name: id
-        in: path
-        description: Group id
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: One group's own cumulative LLM usage
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: '#/components/schemas/DebugUsage'
+                $ref: '#/components/schemas/ApiError'
         '404':
           description: Unknown group
-  /v1beta/groups/{id}/debug/usage/by-persona:
-    get:
-      tags:
-      - chat
-      summary: |-
-        A group's usage broken down by persona — which character is driving the
-        spend, within that group's own total from [`group_debug_usage`]. Covers
-        the group's current AI members; sorted by total tokens descending, like
-        the per-model breakdown inside each [`DebugUsage`].
-      operationId: group_debug_usage_by_persona
-      parameters:
-      - name: id
-        in: path
-        description: Group id
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: That group's usage, one entry per current AI member
           content:
-            application/json:
+            application/problem+json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/PersonaUsage'
-        '404':
-          description: Unknown group
-  /v1beta/groups/{id}/events:
+                $ref: '#/components/schemas/ApiError'
+        '422':
+          description: Malformed patch
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/groups/{groupId}/events:
     post:
       tags:
       - chat
       summary: |-
-        Posts an environment event into a group — rain, time passing, an emergency —
-        letting the world outside the chat influence the agents. Accepted and queued
-        for the group's coordinator; its effect (reactions, moods) arrives on the
-        group's SSE stream.
+        Posts an environment event — rain, time passing, an emergency — letting the
+        world outside the chat influence the agents. Its effect arrives on the SSE
+        stream.
       operationId: post_event
       parameters:
-      - name: id
+      - name: groupId
         in: path
-        description: Group id
+        description: The group to post the event into
         required: true
         schema:
           type: string
@@ -489,32 +587,49 @@ paths:
         required: true
       responses:
         '202':
-          description: Event accepted
+          description: Queued
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
           description: Unknown group
-  /v1beta/groups/{id}/messages:
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '422':
+          description: Blank or over-long description
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/groups/{groupId}/messages:
     get:
       tags:
       - chat
       summary: |-
-        A contiguous window of a group's message history, oldest first. One shape drives
-        every navigation: the initial open (`before` + `since`), paging earlier
-        (`anchor` + `before`), paging later (`anchor` + `after`), and jumping to an
-        arbitrary line (`anchor` + `before` + `after`). With no query it returns the
-        whole log.
+        A contiguous window of message history, oldest first. Max 500 lines (160
+        without an `anchor`).
       operationId: list_messages
       parameters:
-      - name: id
+      - name: groupId
         in: path
-        description: Group id
+        description: The group whose history to read
         required: true
         schema:
           type: string
       - name: anchor
         in: query
-        description: |-
-          The line to build the window around (its id). Omitted, the window ends at
-          the newest line — the initial open and "jump to latest".
+        description: Line id to centre the window on. Omitted, the window ends at the newest line.
         required: false
         schema:
           type:
@@ -522,28 +637,29 @@ paths:
           - 'null'
       - name: before
         in: query
-        description: How many lines before the anchor (or before the tail) to include.
+        description: Lines before the anchor (or before the tail). Clamped to 500.
         required: false
         schema:
           type:
           - integer
           - 'null'
+          maximum: 500
           minimum: 0
       - name: after
         in: query
-        description: How many lines after the anchor to include. Ignored without an `anchor`.
+        description: Lines after the anchor. Ignored without an `anchor`. Clamped to 500.
         required: false
         schema:
           type:
           - integer
           - 'null'
+          maximum: 500
           minimum: 0
       - name: since
         in: query
         description: |-
-          The client's read mark (epoch millis), for the initial open only (no
-          `anchor`): the window is extended back to cover every line newer than this,
-          so the whole unread run loads and its divider stays exact.
+          Read mark (epoch ms). Without an `anchor`, widens the window back to cover
+          every unread line.
         required: false
         schema:
           type:
@@ -552,25 +668,36 @@ paths:
           format: int64
       responses:
         '200':
-          description: Message history window, oldest first
+          description: The window, oldest first; empty for an unknown group
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Message'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       tags:
       - chat
       summary: |-
-        Posts a user message and kicks off the agents' turn. The returned line is the
-        stored user message; AI replies, moods, and read receipts arrive on the
-        group's SSE stream.
+        Posts a user message and starts the agents' turn. Replies, moods, and read
+        receipts arrive on the SSE stream.
       operationId: send_message
       parameters:
-      - name: id
+      - name: groupId
         in: path
-        description: Group id
+        description: The group to post into
         required: true
         schema:
           type: string
@@ -582,134 +709,246 @@ paths:
         required: true
       responses:
         '200':
-          description: The stored user message
+          description: The stored message
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Message'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
           description: Unknown group
-  /v1beta/groups/{id}/retry:
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '422':
+          description: Blank or over-long text, or a `personaId` that is not a user identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/groups/{groupId}/retry:
     post:
       tags:
       - chat
       summary: |-
-        Resumes a turn that was suspended by a failed agent inference: the agents who
-        have not yet read the pending message respond to the current chat. A no-op if
-        nothing is suspended (e.g. the pending turn was already voided by a newer
-        message). Its effect arrives on the group's SSE stream.
+        Resumes a turn suspended by a failed agent inference. A no-op if nothing is
+        suspended. Its effect arrives on the SSE stream.
       operationId: retry_turn
       parameters:
-      - name: id
+      - name: groupId
         in: path
-        description: Group id
+        description: The group whose suspended turn to resume
         required: true
         schema:
           type: string
       responses:
         '202':
-          description: Retry accepted
+          description: Accepted
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
           description: Unknown group
-  /v1beta/groups/{id}/stream:
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/groups/{groupId}/stream:
     get:
       tags:
       - chat
-      summary: |-
-        Server-Sent Events for a group: default `message` events (AI replies and
-        moods), named `read` events (read receipts), named `activity` events (the
-        agent loop turning busy/idle), and named `turn` events (the current
-        processing round's per-member progress, seeded on connect).
+      summary: Server-Sent Events for a group.
+      description: |-
+        Frames: unnamed = `Message`; `read` = `ReadReceipt`; `activity` =
+        `{ "active": bool }`; `turn` = `Turn`; `debug` = `AgentTrace`;
+        `suggestions` = `GroupSuggestions`. `activity` and `turn` are seeded on connect.
       operationId: stream
       parameters:
-      - name: id
+      - name: groupId
         in: path
-        description: Group id
+        description: The group to stream
         required: true
         schema:
           type: string
       responses:
         '200':
-          description: 'text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `turn` frames carry a Turn, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions'
-  /v1beta/groups/{id}/suggestions:
+          description: An open event stream
+          content:
+            text/event-stream: {}
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/groups/{groupId}/suggestions:
     get:
       tags:
       - chat
       summary: |-
-        Cached conversation-starter suggestions for a group. Returned immediately from
-        the server-side cache; if they're stale (the conversation moved on, or the
-        part of day changed) a fresh generation is kicked off in the background and
-        arrives on the group's `suggestions` SSE frame. The frontend only fetches and
-        displays — it never generates. Empty (`generatedAt == 0`) before the first
-        generation completes.
+        Cached conversation-starter suggestions, served from the server-side cache.
+        Empty (`generatedAt == 0`) until the first generation completes.
       operationId: get_suggestions
       parameters:
-      - name: id
+      - name: groupId
         in: path
-        description: Group id
+        description: The group whose suggestions to read
         required: true
         schema:
           type: string
       responses:
         '200':
-          description: The cached suggestions (a background refresh may follow on the stream)
+          description: The cached suggestions; a refresh may follow on the stream
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/GroupSuggestions'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
           description: Unknown group
-  /v1beta/groups/{id}/suggestions/regenerate:
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       tags:
       - chat
       summary: |-
-        Forces a fresh suggestion generation for a group (the composer's "give me
-        other ideas" action). Accepted and generated in the background; the result
-        arrives on the group's `suggestions` SSE frame. Rate-limited server-side: a
-        call inside the cooldown window, or while a generation is already running, is
-        quietly ignored — so the button can't be used to hammer the model.
+        Creates a fresh set of suggestions (the composer's "give me other ideas").
+        Generated in the background; the result arrives on the `suggestions` SSE
+        frame. Rate-limited server-side — repeated calls coalesce.
       operationId: regenerate_suggestions
       parameters:
-      - name: id
+      - name: groupId
         in: path
-        description: Group id
+        description: The group to regenerate suggestions for
         required: true
         schema:
           type: string
       responses:
         '202':
-          description: Regeneration accepted (or coalesced with a recent one)
+          description: Accepted, or coalesced with a recent one
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
           description: Unknown group
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/groups/{groupId}/traces:
+    get:
+      tags:
+      - diagnostics
+      summary: |-
+        Recent agent traces: the prompt each character received and what it decided.
+        Live updates arrive as `debug` SSE frames.
+      operationId: list_traces
+      parameters:
+      - name: groupId
+        in: path
+        description: The group whose traces to read
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Traces, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AgentTrace'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Unknown group
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1beta/health:
     get:
       tags:
       - service
-      summary: Liveness probe — cheap "is the server up" check.
+      summary: Liveness probe, for an orchestrator rather than the app.
       operationId: health
       responses:
         '200':
-          description: Service is up
+          description: Up; the body is the literal `ok`
           content:
             text/plain:
               schema:
                 type: string
+      security:
+      - {}
   /v1beta/llm/models:
     post:
       tags:
       - llm
       summary: |-
-        Lists the models a provider endpoint offers, so the Settings page can offer
-        a picker instead of a blind text field. `apiKey` is optional: when omitted,
-        the stored key is used, but *only* when `baseUrl` names the same endpoint
-        already configured — otherwise the request must carry its own key. Without
-        that check, an operator (or anything else that can reach this API) could
-        point `baseUrl` at an arbitrary third-party URL and have the server hand it
-        the real provider key in an outbound `Authorization` header. Admin-only
-        (see [`CurrentAdmin`]) — it exists only to serve the edit workflow above,
-        and it can spend the stored key on an outbound request, which a read-only
-        account has no reason to trigger.
+        Lists the models a provider endpoint offers, so the model field can be a
+        picker. Admin-only. `apiKey` is required unless `baseUrl` matches the
+        already-configured endpoint.
       operationId: list_llm_models
       requestBody:
         content:
@@ -719,61 +958,62 @@ paths:
         required: true
       responses:
         '200':
-          description: ''
+          description: The models that endpoint reports
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/LlmModelsView'
         '401':
-          description: Missing/invalid token, or a valid token that isn't the admin role
+          description: Not signed in
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '422':
-          description: empty baseUrl, no usable key, or the endpoint rejected the request
+          description: Empty or non-HTTP(S) baseUrl, no usable key, or the endpoint refused
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
   /v1beta/llm/settings:
     get:
       tags:
       - llm
       summary: |-
-        The live LLM provider configuration. `apiKey` is never included — only
-        `hasApiKey`, whether one is currently stored. Requires an authenticated
-        caller (see [`AuthenticatedSubject`]) — admin or a regular account, either
-        is fine to *read* this shared, operator-level config. `canEdit` in the
-        response tells the caller whether *writing* it (below) is open to them —
-        today that's exactly "is this an admin token", but computed here from the
-        resolved `Subject` rather than hard-coded on the frontend, so a future
-        change to who's allowed to write only has to change this one line.
+        The live LLM provider configuration. Any signed-in caller may read it;
+        `canEdit` says whether this caller may write it.
       operationId: get_llm_settings
       responses:
         '200':
-          description: ''
+          description: The live configuration; the API key is reduced to `hasApiKey`
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/LlmSettingsView'
         '401':
-          description: Missing or invalid access token
+          description: Not signed in
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     patch:
       tags:
       - llm
       summary: |-
         Merges a partial update onto the LLM provider configuration and applies it
-        immediately — no restart needed. The candidate configuration is validated
-        (the brain it describes must actually build) before anything is swapped in
-        or written to `llm.toml`; an invalid patch is rejected with 422 and changes
-        nothing. Admin-only (see [`CurrentAdmin`]) — a regular account can read
-        this config through `GET /llm/settings` but not change shared, operator-
-        level server config or its real-model spend.
+        immediately. Admin-only.
       operationId: update_llm_settings
       requestBody:
         content:
@@ -783,55 +1023,75 @@ paths:
         required: true
       responses:
         '200':
-          description: Applied immediately; persisted to llm.toml
+          description: Applied and persisted to llm.toml; no restart needed
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/LlmSettingsView'
         '401':
-          description: Missing/invalid token, or a valid token that isn't the admin role
+          description: Not signed in
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '422':
-          description: e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct
+          description: The resulting configuration would not build; nothing changed
           content:
-            text/plain:
+            application/problem+json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ApiError'
   /v1beta/meta:
     get:
       tags:
       - service
-      summary: |-
-        The server's mode, so the client can distinguish a mock build (no LLM,
-        in-memory) from a production one — separately from mere reachability.
+      summary: 'The server''s mode: mock build (no LLM, in-memory) vs. production.'
       operationId: meta
       responses:
         '200':
-          description: Server capabilities
+          description: Server capabilities and mode
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ServerMeta'
+      security:
+      - {}
   /v1beta/organizations:
     get:
       tags:
       - organizations
+      summary: Every organization in the workspace.
       operationId: list_orgs
       responses:
         '200':
-          description: ''
+          description: Every organization
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Organization'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       tags:
       - organizations
+      summary: Creates an organization.
       operationId: create_org
       requestBody:
         content:
@@ -841,53 +1101,103 @@ paths:
         required: true
       responses:
         '201':
-          description: ''
+          description: The created organization
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Organization'
-  /v1beta/organizations/{id}:
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/organizations/{organizationId}:
     get:
       tags:
       - organizations
+      summary: One organization by id.
       operationId: get_org
       parameters:
-      - name: id
+      - name: organizationId
         in: path
+        description: The organization to read
         required: true
         schema:
           type: string
       responses:
         '200':
-          description: ''
+          description: The organization
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Organization'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown organization
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     delete:
       tags:
       - organizations
+      summary: Deletes an organization, cascading to its departments.
       operationId: delete_org
       parameters:
-      - name: id
+      - name: organizationId
         in: path
+        description: The organization to delete
         required: true
         schema:
           type: string
       responses:
         '204':
-          description: Deleted (cascades to its departments)
+          description: Deleted, cascading to its departments
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown organization
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     patch:
       tags:
       - organizations
+      summary: Merges a partial update onto an organization.
       operationId: update_org
       parameters:
-      - name: id
+      - name: organizationId
         in: path
+        description: The organization to update
         required: true
         schema:
           type: string
@@ -895,37 +1205,72 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Organization'
+              $ref: '#/components/schemas/OrganizationPatch'
         required: true
       responses:
         '200':
-          description: ''
+          description: The updated organization
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Organization'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown organization
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '422':
+          description: Malformed patch
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1beta/personas:
     get:
       tags:
       - personas
+      summary: Every persona in the workspace — the one user identity and every AI agent.
       operationId: list_personas
       responses:
         '200':
-          description: ''
+          description: Every persona
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Persona'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       tags:
       - personas
       summary: |-
-        Creates a persona. Rejects (409) a duplicate name (names are globally unique)
-        or a second user identity (there is only ever one "you").
+        Creates a persona. Names are globally unique, and there is only ever one
+        user identity ("you"), so either collision is refused with 409.
       operationId: create_persona
       requestBody:
         content:
@@ -935,63 +1280,119 @@ paths:
         required: true
       responses:
         '201':
-          description: ''
+          description: The created persona
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Persona'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '409':
-          description: 'Refused: name already in use, or a second user identity'
-  /v1beta/personas/{id}:
+          description: Name taken, or a second user identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/personas/{personaId}:
     get:
       tags:
       - personas
+      summary: One persona by id.
       operationId: get_persona
       parameters:
-      - name: id
+      - name: personaId
         in: path
+        description: The persona to read
         required: true
         schema:
           type: string
       responses:
         '200':
-          description: ''
+          description: The persona
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Persona'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown persona
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     delete:
       tags:
       - personas
       summary: |-
-        Deletes a persona. Refuses (409) to remove the last remaining user identity,
-        since every group still needs a "you".
+        Deletes a persona. The last remaining user identity can't go — every group
+        still needs a "you".
       operationId: delete_persona
       parameters:
-      - name: id
+      - name: personaId
         in: path
+        description: The persona to delete
         required: true
         schema:
           type: string
       responses:
         '204':
-          description: ''
+          description: Deleted
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown persona
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '409':
-          description: 'Refused: last remaining user identity'
+          description: 'Refused: the last user identity'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     patch:
       tags:
       - personas
       summary: |-
-        Updates a persona. 404 for an unknown id; 409 for a duplicate name or a change
-        that would produce a second user identity.
+        Merges a partial update onto a persona. `promptHash` is recomputed from the
+        resulting prompt; any value sent for it is ignored.
       operationId: update_persona
       parameters:
-      - name: id
+      - name: personaId
         in: path
+        description: The persona to update
         required: true
         schema:
           type: string
@@ -999,19 +1400,45 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Persona'
+              $ref: '#/components/schemas/PersonaPatch'
         required: true
       responses:
         '200':
-          description: ''
+          description: The updated persona
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Persona'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown persona
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '409':
-          description: 'Refused: name already in use, or a second user identity'
+          description: Name taken, or a second user identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '422':
+          description: Malformed patch
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1beta/personas/{personaId}/memories:
     get:
       tags:
@@ -1023,31 +1450,46 @@ paths:
       parameters:
       - name: personaId
         in: path
+        description: The persona whose memories to list
         required: true
         schema:
           type: string
       responses:
         '200':
-          description: ''
+          description: Every memory, newest first
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Memory'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown persona
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     post:
       tags:
       - personas
-      summary: |-
-        Writes a memory for a persona, tagged with its current identity hash. 404 for
-        an unknown persona; 409 when the persona has no prompt to scope a memory to,
-        or the content is blank.
+      summary: Writes a memory for a persona, tagged with its current identity hash.
       operationId: create_memory
       parameters:
       - name: personaId
         in: path
+        description: The persona to remember this for
         required: true
         schema:
           type: string
@@ -1059,39 +1501,136 @@ paths:
         required: true
       responses:
         '201':
-          description: ''
+          description: The created memory
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Memory'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown persona
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '409':
-          description: 'Refused: persona has no prompt to scope a memory to, or blank content'
+          description: The persona has no prompt to scope a memory to, or blank content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1beta/personas/{personaId}/memories/{memoryId}:
     delete:
       tags:
       - personas
-      summary: |-
-        Deletes one of a persona's memories. 404 when no such memory belongs to that
-        persona.
+      summary: Deletes one of a persona's memories.
       operationId: delete_memory
       parameters:
       - name: personaId
         in: path
+        description: The persona the memory belongs to
         required: true
         schema:
           type: string
       - name: memoryId
         in: path
+        description: The memory to delete
         required: true
         schema:
           type: string
       responses:
         '204':
-          description: ''
+          description: Deleted
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
         '404':
-          description: ''
+          description: Unknown memory for that persona
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/preferences:
+    get:
+      tags:
+      - preferences
+      summary: The signed-in account's own display preferences.
+      operationId: get_preferences
+      responses:
+        '200':
+          description: This account's preferences
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Settings'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+    patch:
+      tags:
+      - preferences
+      summary: Merges a partial update onto the account's preferences.
+      operationId: update_preferences
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettingsPatch'
+        required: true
+      responses:
+        '200':
+          description: The updated preferences
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Settings'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '422':
+          description: Malformed patch
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /v1beta/prompt-labels:
     get:
       tags:
@@ -1102,14 +1641,26 @@ paths:
       operationId: list_prompt_labels
       responses:
         '200':
-          description: ''
+          description: Every named identity hash
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/PromptLabel'
-  /v1beta/prompt-labels/{hash}:
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/prompt-labels/{promptHash}:
     put:
       tags:
       - personas
@@ -1118,8 +1669,9 @@ paths:
         (PUT), keyed by the full hash the client already holds from the persona.
       operationId: set_prompt_label
       parameters:
-      - name: hash
+      - name: promptHash
         in: path
+        description: The full persona identity hash to name
         required: true
         schema:
           type: string
@@ -1131,42 +1683,109 @@ paths:
         required: true
       responses:
         '200':
-          description: ''
+          description: The stored label; empty when cleared
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/PromptLabel'
-  /v1beta/settings:
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/usage:
     get:
       tags:
-      - settings
-      operationId: get_settings
+      - diagnostics
+      summary: |-
+        Cumulative LLM usage: requests, tokens, cache-hit ratio, estimated cost, and
+        the same totals per model. Cost is always an estimate.
+      operationId: usage
+      parameters:
+      - name: groupId
+        in: query
+        description: One group only. Omitted, covers the whole account.
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
       responses:
         '200':
-          description: ''
+          description: Usage for the requested scope
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Settings'
-    patch:
+                $ref: '#/components/schemas/DebugUsage'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Unknown `groupId`
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1beta/usage/by-persona:
+    get:
       tags:
-      - settings
-      operationId: update_settings
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/Settings'
-        required: true
+      - diagnostics
+      summary: |-
+        The same usage broken down by persona, highest total tokens first. Unscoped,
+        it also includes the synthetic `system` bucket (compression, suggestions).
+      operationId: usage_by_persona
+      parameters:
+      - name: groupId
+        in: query
+        description: One group only. Omitted, covers the whole account.
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
       responses:
         '200':
-          description: ''
+          description: One entry per persona
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Settings'
-        '422':
-          description: ''
+                type: array
+                items:
+                  $ref: '#/components/schemas/PersonaUsage'
+        '401':
+          description: Not signed in
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Not permitted for this identity
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Unknown `groupId`
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 components:
   schemas:
     AccessToken:
@@ -1261,6 +1880,47 @@ components:
           - type: 'null'
           - $ref: '#/components/schemas/TokenUsage'
             description: Tokens this inference cost; absent for the mock brain.
+    ApiError:
+      type: object
+      description: |-
+        An RFC 9457 problem document — the body of every 4xx this API produces.
+
+        Constructed through the named helpers below rather than field-by-field, so
+        the slug used for a given status is decided in exactly one place and can't
+        drift between handlers.
+      required:
+      - type
+      - title
+      - status
+      properties:
+        detail:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The human-readable explanation of *this specific* occurrence — the
+            sentence that used to be the entire `text/plain` body. Safe to show a
+            user; never carries a secret, a stack trace, or a provider's raw
+            response.
+        status:
+          type: integer
+          format: int32
+          description: |-
+            The HTTP status code, repeated in the body so a problem document stays
+            meaningful when it's logged or forwarded away from its response.
+          minimum: 0
+        title:
+          type: string
+          description: |-
+            The status code's canonical reason phrase (e.g. `Forbidden`) — a short
+            human summary of the problem *type*, not of this occurrence.
+        type:
+          type: string
+          description: |-
+            Stable, machine-readable identifier for *what* went wrong, e.g.
+            `urn:agoralume:error:not-admin`. Match on this rather than on `detail`,
+            whose wording is free to change. Always present.
+          example: urn:agoralume:error:not-found
     Cost:
       type: object
       description: |-
@@ -1312,7 +1972,7 @@ components:
       description: |-
         Cumulative LLM usage across the whole server (since first run, when
         persisted; since startup otherwise) — the global "total usage" view.
-        `GET /debug/usage`.
+        `GET /usage`.
       required:
       - requests
       - promptTokens
@@ -1395,6 +2055,32 @@ components:
             type: string
           propertyNames:
             type: string
+    DepartmentPatch:
+      type: object
+      description: 'A partial Department: only the properties present are merged. `id` is ignored.'
+      properties:
+        blurb:
+          type:
+          - string
+          - 'null'
+        color:
+          type:
+          - string
+          - 'null'
+        id:
+          type: string
+        name:
+          type: string
+        organizationId:
+          type: string
+        variables:
+          type:
+          - object
+          - 'null'
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
     EventBody:
       type: object
       description: The body of an environment-event request.
@@ -1403,12 +2089,13 @@ components:
       properties:
         description:
           type: string
-          description: A short description of what changed, e.g. "It starts to rain."
+          description: What changed, e.g. "It starts to rain."
+          maxLength: 1000
         urgent:
           type: boolean
           description: |-
-            Urgent events preempt the current turn (discarding the in-flight agent);
-            ordinary ones fold into the context at the next agent boundary.
+            Urgent events preempt the current turn; ordinary ones fold into the
+            context at the next agent boundary.
     Group:
       type: object
       description: |-
@@ -1418,6 +2105,20 @@ components:
       - name
       - personaIds
       - selfPersonaId
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        personaIds:
+          type: array
+          items:
+            type: string
+        selfPersonaId:
+          type: string
+    GroupPatch:
+      type: object
+      description: 'A partial Group: only the properties present are merged. `id` is ignored.'
       properties:
         id:
           type: string
@@ -1671,6 +2372,18 @@ components:
         username:
           type: string
           description: The fixed admin login name, or a regular account's own username.
+    LogoutRequest:
+      type: object
+      description: The body of a sign-out request.
+      properties:
+        refreshToken:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The session's refresh token, so it dies with the access token. Omitting
+            it leaves a token good for another 30 days alive, which is almost never
+            what a sign-out means.
     Memory:
       type: object
       description: |-
@@ -1891,6 +2604,30 @@ components:
             type: string
           propertyNames:
             type: string
+    OrganizationPatch:
+      type: object
+      description: 'A partial Organization: only the properties present are merged. `id` is ignored.'
+      properties:
+        blurb:
+          type:
+          - string
+          - 'null'
+        color:
+          type:
+          - string
+          - 'null'
+        id:
+          type: string
+        name:
+          type: string
+        variables:
+          type:
+          - object
+          - 'null'
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
     Persona:
       type: object
       description: |-
@@ -1961,13 +2698,71 @@ components:
       enum:
       - user
       - ai
+    PersonaPatch:
+      type: object
+      description: 'A partial Persona: only the properties present are merged. `id` is ignored.'
+      properties:
+        avatarUrl:
+          type:
+          - string
+          - 'null'
+        blurb:
+          type:
+          - string
+          - 'null'
+        color:
+          type: string
+        departmentId:
+          type:
+          - string
+          - 'null'
+        emoji:
+          type:
+          - string
+          - 'null'
+        gradient:
+          type:
+          - string
+          - 'null'
+        id:
+          type: string
+        kind:
+          $ref: '#/components/schemas/PersonaKind'
+        name:
+          type: string
+        organizationId:
+          type:
+          - string
+          - 'null'
+        promptHash:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Content hash of the raw `system_prompt` template — the persona's identity
+            "version". Server-computed and effectively read-only on the wire: it is
+            recomputed on every create/update (and on load) and any value a client
+            sends is ignored. `None` when there is no prompt (user identities). Full
+            lowercase-hex SHA-256; the UI shows a truncated prefix. See [`prompt_hash`].
+        systemPrompt:
+          type:
+          - string
+          - 'null'
+        variables:
+          type:
+          - object
+          - 'null'
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
     PersonaUsage:
       type: object
       description: |-
         One persona's own slice of a usage total — a further breakdown by which
         character is driving the spend. Serves both `GET
-        /groups/{id}/debug/usage/by-persona` (one group's [`DebugUsage`]) and the
-        site-wide `GET /debug/usage/by-persona` (summed across every group).
+        /usage/by-persona?groupId=…` (one group's [`DebugUsage`]) and the
+        site-wide `GET /usage/by-persona` (summed across every group).
       required:
       - personaId
       - usage
@@ -2065,11 +2860,12 @@ components:
           - string
           - 'null'
           description: |-
-            The "you" identity to author the message as. When omitted, the group's
-            stored `selfPersonaId` is used.
+            Which user identity to author as; must be a `user` persona, not an AI
+            one. Omitted, the group's `selfPersonaId` is used.
         text:
           type: string
           description: The message text.
+          maxLength: 8000
     ServerMeta:
       type: object
       description: |-
@@ -2112,6 +2908,17 @@ components:
       - uiLanguage
       - nativeLanguage
       - chatFontSize
+      properties:
+        chatFontSize:
+          type: integer
+          format: int32
+        nativeLanguage:
+          type: string
+        uiLanguage:
+          type: string
+    SettingsPatch:
+      type: object
+      description: 'A partial Settings: only the properties present are merged. `id` is ignored.'
       properties:
         chatFontSize:
           type: integer
@@ -2303,6 +3110,13 @@ components:
           type:
           - string
           - 'null'
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'Access token from `POST /auth/login`. Opaque; does not survive a server restart. Waived when `GET /meta` reports `authRequired: false`.'
+security:
+- bearerAuth: []
 tags:
 - name: service
   description: Liveness and server mode
@@ -2316,8 +3130,10 @@ tags:
   description: User identities and AI agents
 - name: groups
   description: Chat rooms and their membership
-- name: settings
-  description: Client preferences
+- name: preferences
+  description: The signed-in account's own display preferences
+- name: diagnostics
+  description: Token usage, estimated cost, and agent traces
 - name: llm
   description: 'Operator: real-model provider configuration'
 - name: auth

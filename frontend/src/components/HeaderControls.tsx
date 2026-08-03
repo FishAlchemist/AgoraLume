@@ -22,6 +22,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { UI_LANGUAGES } from '../i18n';
+import { signOut } from '../lib/api/authFetch';
 import { useAuth } from '../store/auth';
 import { useConnection } from '../store/connection';
 import { useReadOnly } from '../store/readonly';
@@ -39,11 +40,12 @@ export function HeaderControls() {
   const backendUrl = useConnection((s) => s.backendUrl);
   const accessToken = useAuth((s) => s.accessToken);
   const username = useAuth((s) => s.username);
-  const clearAuth = useAuth((s) => s.clear);
   const openLogin = useUi((s) => s.openLogin);
 
   const handleSignOut = () => {
-    clearAuth();
+    // `signOut` clears the local session synchronously and revokes the tokens
+    // server-side in the background, so navigating away immediately is safe.
+    void signOut();
     navigate('/');
   };
 

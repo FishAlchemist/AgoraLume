@@ -79,10 +79,31 @@ pub struct RosterMember {
 pub enum PersonaError {
     /// No persona with the given id (update only).
     NotFound,
+    /// The merged result isn't a persona — see [`PatchError::Invalid`].
+    Invalid,
     /// Another persona already uses this name.
     NameTaken,
     /// Refused to create/produce a second user identity — there is only ever one.
     UserExists,
+}
+
+/// Why a partial update was refused, for the resources whose only two failure
+/// modes these are.
+///
+/// The distinction matters on the wire: these used to collapse into a single
+/// `None`, which the route layer could only report as 404 — so
+/// `PATCH /groups/{id}` with `{"name": 123}` claimed the group didn't exist.
+/// The same malformed patch against `/settings` reported 422, because that
+/// handler happened to map `None` the other way. One failure, two answers,
+/// neither reliable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatchError {
+    /// No resource with the given id.
+    NotFound,
+    /// The patch merged onto the resource, but the result no longer
+    /// deserializes as one — a field given the wrong JSON type, or a required
+    /// field explicitly set to `null`.
+    Invalid,
 }
 
 /// A newly minted id for a created resource.
@@ -90,12 +111,37 @@ fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Whether a client-proposed id is one we're willing to store.
+///
+/// Ids become filenames — `messages/<group_id>.json`, `usage/<group_id>/…` —
+/// and [`crate::persist::sanitize`] rewrites anything outside this set to `_`
+/// before they get there. That stops a path traversal, but it is a *lossy*
+/// mapping: a client that created groups `a/b` and `a_b` would get two distinct
+/// groups in the workspace sharing a single message log, each silently reading
+/// and overwriting the other's history. Rejecting the id up front makes
+/// `sanitize` a second line of defence rather than a semantic transform, and
+/// the two can no longer disagree about what an id means.
+///
+/// The length bound is for the same reason: a filename has one, and an id long
+/// enough to exceed it would fail to persist at write time, far from the
+/// request that caused it.
+fn usable_id(proposed: &str) -> bool {
+    !proposed.is_empty()
+        && proposed.len() <= 64
+        && proposed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Resolves the id for a resource being created. The client may supply its own
 /// id in the POST body (so it can insert optimistically and stay in sync with
-/// the server without a round-trip); we honour it when it's non-empty and not
-/// already taken, and otherwise mint a fresh one.
+/// the server without a round-trip); we honour it when it's usable (see
+/// [`usable_id`]) and not already taken, and otherwise mint a fresh one.
+///
+/// A rejected id is replaced rather than refused: the response carries the id
+/// that was actually stored, so a client that reads it back stays in sync
+/// either way, and there is no reason to fail a create over a detail the
+/// server is willing to decide.
 fn resolve_id<'a>(proposed: String, existing: impl Iterator<Item = &'a str>) -> String {
-    if proposed.is_empty() {
+    if !usable_id(&proposed) {
         return new_id();
     }
     if existing.into_iter().any(|id| id == proposed) {
@@ -231,12 +277,17 @@ impl Workspace {
         org
     }
 
-    pub fn update_organization(&mut self, id: &str, patch: Value) -> Option<Organization> {
-        let org = self.organizations.iter().find(|o| o.id == id)?;
-        let updated = apply_patch(org, patch)?;
-        let slot = self.organizations.iter_mut().find(|o| o.id == id)?;
+    pub fn update_organization(
+        &mut self,
+        id: &str,
+        patch: Value,
+    ) -> Result<Organization, PatchError> {
+        let org = self.organizations.iter().find(|o| o.id == id).ok_or(PatchError::NotFound)?;
+        let updated = apply_patch(org, patch).ok_or(PatchError::Invalid)?;
+        let slot =
+            self.organizations.iter_mut().find(|o| o.id == id).ok_or(PatchError::NotFound)?;
         *slot = updated.clone();
-        Some(updated)
+        Ok(updated)
     }
 
     /// Removes an organization and its departments, and clears the now-dangling
@@ -275,12 +326,12 @@ impl Workspace {
         dept
     }
 
-    pub fn update_department(&mut self, id: &str, patch: Value) -> Option<Department> {
-        let dept = self.departments.iter().find(|d| d.id == id)?;
-        let updated = apply_patch(dept, patch)?;
-        let slot = self.departments.iter_mut().find(|d| d.id == id)?;
+    pub fn update_department(&mut self, id: &str, patch: Value) -> Result<Department, PatchError> {
+        let dept = self.departments.iter().find(|d| d.id == id).ok_or(PatchError::NotFound)?;
+        let updated = apply_patch(dept, patch).ok_or(PatchError::Invalid)?;
+        let slot = self.departments.iter_mut().find(|d| d.id == id).ok_or(PatchError::NotFound)?;
         *slot = updated.clone();
-        Some(updated)
+        Ok(updated)
     }
 
     pub fn delete_department(&mut self, id: &str) -> bool {
@@ -320,7 +371,7 @@ impl Workspace {
     /// yield a second user identity ([`PersonaError::UserExists`]).
     pub fn update_persona(&mut self, id: &str, patch: Value) -> Result<Persona, PersonaError> {
         let persona = self.personas.iter().find(|p| p.id == id).ok_or(PersonaError::NotFound)?;
-        let mut updated = apply_patch(persona, patch).ok_or(PersonaError::NotFound)?;
+        let mut updated = apply_patch(persona, patch).ok_or(PersonaError::Invalid)?;
         // The prompt may have changed; the client can't set the hash — recompute.
         updated.refresh_prompt_hash();
         if self.name_taken(&updated.name, Some(id)) {
@@ -472,12 +523,12 @@ impl Workspace {
         group
     }
 
-    pub fn update_group(&mut self, id: &str, patch: Value) -> Option<Group> {
-        let group = self.groups.iter().find(|g| g.id == id)?;
-        let updated = apply_patch(group, patch)?;
-        let slot = self.groups.iter_mut().find(|g| g.id == id)?;
+    pub fn update_group(&mut self, id: &str, patch: Value) -> Result<Group, PatchError> {
+        let group = self.groups.iter().find(|g| g.id == id).ok_or(PatchError::NotFound)?;
+        let updated = apply_patch(group, patch).ok_or(PatchError::Invalid)?;
+        let slot = self.groups.iter_mut().find(|g| g.id == id).ok_or(PatchError::NotFound)?;
         *slot = updated.clone();
-        Some(updated)
+        Ok(updated)
     }
 
     pub fn delete_group(&mut self, id: &str) -> bool {
@@ -488,10 +539,12 @@ impl Workspace {
 
     // --- Settings -----------------------------------------------------------
 
-    pub fn update_settings(&mut self, patch: Value) -> Option<Settings> {
-        let updated = apply_patch(&self.settings, patch)?;
+    pub fn update_settings(&mut self, patch: Value) -> Result<Settings, PatchError> {
+        // There is exactly one settings record, so `NotFound` is unreachable
+        // here — the only way this fails is a patch that doesn't fit.
+        let updated = apply_patch(&self.settings, patch).ok_or(PatchError::Invalid)?;
         self.settings = updated.clone();
-        Some(updated)
+        Ok(updated)
     }
 
     // --- Turn helpers -------------------------------------------------------
@@ -750,6 +803,45 @@ mod tests {
         assert_eq!(err, PersonaError::NameTaken);
         // A fresh name is accepted.
         assert!(ws.create_persona(ai("fresh", "Vega")).is_ok());
+    }
+
+    /// Two ids that differ only outside `[A-Za-z0-9_-]` used to collapse onto
+    /// one filename once persisted, so two real groups shared a message log.
+    /// A client-proposed id that can't survive that mapping is replaced.
+    #[test]
+    fn a_client_proposed_id_that_would_collide_on_disk_is_replaced() {
+        let mut ws = Workspace::seeded();
+
+        let slashed = ws.create_group(Group {
+            id: "a/b".into(),
+            name: "Slashed".into(),
+            persona_ids: vec![],
+            self_persona_id: "me".into(),
+        });
+        let underscored = ws.create_group(Group {
+            id: "a_b".into(),
+            name: "Underscored".into(),
+            persona_ids: vec![],
+            self_persona_id: "me".into(),
+        });
+
+        assert_ne!(slashed.id, "a/b", "an id with a path separator is not stored verbatim");
+        assert_eq!(underscored.id, "a_b", "an already-safe id is still honoured");
+        assert_ne!(
+            crate::persist::sanitize(&slashed.id),
+            crate::persist::sanitize(&underscored.id),
+            "the two groups must not share a persistence filename"
+        );
+
+        // Over-long ids go the same way — a filename has a length limit, and
+        // failing at write time would be far from the request that caused it.
+        let long = ws.create_group(Group {
+            id: "x".repeat(300),
+            name: "Long".into(),
+            persona_ids: vec![],
+            self_persona_id: "me".into(),
+        });
+        assert!(long.id.len() <= 64);
     }
 
     #[test]

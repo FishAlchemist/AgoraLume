@@ -1,11 +1,15 @@
-//! Chat endpoints: message history, sending, and the live SSE stream.
+//! Chat endpoints: message history, sending, the live SSE stream, and the
+//! diagnostics (token usage, agent traces) that hang off a conversation.
+//!
+//! Every route here except `/health` and `/meta` resolves through
+//! [`CurrentAccount`], so a group id in a path only ever addresses a group in
+//! the caller's own workspace.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use serde::{Deserialize, Serialize};
@@ -16,38 +20,67 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::agent::event::Event as AgentEvent;
+use crate::api_error::ApiError;
 use crate::models::{
     AgentTrace, Cost, DebugUsage, GroupSuggestions, Message, ModelUsage, PersonaUsage, ServerMeta,
 };
 use crate::state::{AppState, CurrentAccount, DebugTotals, StreamEvent};
 
+/// The largest history window a single request may ask for.
+///
+/// The tail of the log was already bounded (`INITIAL_CAP` inside
+/// `AppState::list_window`), but the anchored path was not: `before` is a
+/// `usize`, so `?anchor=…&before=4294967295` walked back to the first line ever
+/// sent and serialized the lot. Treating every request as hostile, that is a
+/// cheap way to make the server do expensive work, so the window is clamped
+/// rather than trusted. The frontend's own page size is 40.
+const MAX_WINDOW: usize = 500;
+
+/// The longest message text accepted from a client.
+///
+/// Nothing enforced a length before, and a chat line is not merely stored: it
+/// is replayed into every agent's prompt for the rest of the conversation, so
+/// an oversized one costs tokens on every subsequent turn, not just once.
+const MAX_MESSAGE_CHARS: usize = 8_000;
+
+/// The longest environment-event description accepted from a client. Shorter
+/// than a message because it is a stage direction ("It starts to rain."), and
+/// it reaches the same prompts.
+const MAX_EVENT_CHARS: usize = 1_000;
+
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(health))
         .routes(routes!(meta))
-        .routes(routes!(debug_usage))
+        .routes(routes!(usage))
+        .routes(routes!(usage_by_persona))
         .routes(routes!(list_messages, send_message))
         .routes(routes!(post_event))
         .routes(routes!(retry_turn))
         .routes(routes!(get_suggestions, regenerate_suggestions))
-        .routes(routes!(debug_traces))
-        .routes(routes!(group_debug_usage))
-        .routes(routes!(group_debug_usage_by_persona))
-        .routes(routes!(global_debug_usage_by_persona))
+        .routes(routes!(list_traces))
         .routes(routes!(stream))
 }
 
-/// Liveness probe — cheap "is the server up" check.
-#[utoipa::path(get, path = "/health", tag = "service",
-    responses((status = 200, description = "Service is up", body = String)))]
+/// Liveness probe, for an orchestrator rather than the app.
+//
+// The app uses `/meta` instead, since it needs the server's mode as well as its
+// reachability. Kept separate on purpose: `/meta` reads runtime and persistence
+// state, so it can fail for reasons that have nothing to do with the process
+// being alive. Public — a probe that needed a token couldn't report that the
+// server is up when auth is what's broken.
+#[utoipa::path(get, path = "/health", tag = "service", security(()),
+    responses((status = 200, description = "Up; the body is the literal `ok`", body = String)))]
 async fn health() -> &'static str {
     "ok"
 }
 
-/// The server's mode, so the client can distinguish a mock build (no LLM,
-/// in-memory) from a production one — separately from mere reachability.
-#[utoipa::path(get, path = "/meta", tag = "service",
-    responses((status = 200, description = "Server capabilities", body = ServerMeta)))]
+/// The server's mode: mock build (no LLM, in-memory) vs. production.
+//
+// Public by necessity: `authRequired` is what tells a client whether it needs
+// to log in at all, so it cannot itself require a login.
+#[utoipa::path(get, path = "/meta", tag = "service", security(()),
+    responses((status = 200, description = "Server capabilities and mode", body = ServerMeta)))]
 async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
     // Liveness and mode are independent facts. `llm` = a real model drives the
     // agents (else the rule-based mock); `persistent` = state is written to disk.
@@ -63,59 +96,79 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<ServerMeta> {
     })
 }
 
-/// Cumulative LLM usage — the global "total usage" readout: request count,
-/// token breakdown, cache-hit ratio, the running estimated cost (always an
-/// estimate, for reference only), and the same totals broken down by model.
-/// When persistence is on, this survives a server restart; the cost is accrued
-/// one trace at a time at whatever rate was configured when each trace was
-/// recorded, so a later change to the configured rates never reprices history.
-#[utoipa::path(get, path = "/debug/usage", tag = "service",
-    responses((status = 200, description = "Cumulative LLM usage", body = DebugUsage)))]
-async fn debug_usage(state: CurrentAccount) -> Json<DebugUsage> {
-    Json(debug_usage_view(state.debug_totals()))
+// --- Diagnostics ------------------------------------------------------------
+//
+// Usage used to be four routes — {site-wide, per-group} × {totals, by persona}
+// — at two different path prefixes and under two different tags, with the
+// per-group pair 404ing and the site-wide pair unable to. They are two
+// questions, not four: "what did this cost" and "which character spent it".
+// Scope is a property of the question, so it is a query parameter, and the two
+// routes now answer for one group or for everything through the same code path.
+
+/// Which slice of usage to report on.
+#[derive(Deserialize, IntoParams)]
+#[serde(rename_all = "camelCase")]
+struct UsageScope {
+    /// One group only. Omitted, covers the whole account.
+    group_id: Option<String>,
 }
 
-/// One group's own cumulative LLM usage — independent of every other group's,
-/// unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
-/// every group's usage (plus any spend from groups since deleted); this is one
-/// group's own slice of it. 404s for an unknown group, matching every other
-/// `/groups/{id}/...` handler — [`group_debug_usage_by_persona`] needs the
-/// workspace to know the group's current members, so the two must agree on
-/// what "unknown group" means rather than one 200-with-zeros and the other
-/// silently returning nothing.
-#[utoipa::path(get, path = "/groups/{id}/debug/usage", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
-    responses(
-        (status = 200, description = "One group's own cumulative LLM usage", body = DebugUsage),
-        (status = 404, description = "Unknown group")))]
-async fn group_debug_usage(
-    state: CurrentAccount,
-    Path(id): Path<String>,
-) -> Result<Json<DebugUsage>, StatusCode> {
-    if state.workspace().turn_members(&id).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+impl UsageScope {
+    /// Resolves the scope, rejecting a group the workspace doesn't have.
+    ///
+    /// Checked even though an unknown group would simply have no recorded
+    /// usage: silently answering "zero" for a typo'd or guessed id is
+    /// indistinguishable from answering for a real but idle group, and every
+    /// other group-scoped route in this file 404s.
+    fn resolve(&self, state: &CurrentAccount) -> Result<Option<&str>, ApiError> {
+        let Some(id) = self.group_id.as_deref() else {
+            return Ok(None);
+        };
+        if state.workspace().turn_members(id).is_none() {
+            return Err(ApiError::not_found(format!("no group with id \"{id}\"")));
+        }
+        Ok(Some(id))
     }
-    Ok(Json(debug_usage_view(state.group_debug_totals(&id))))
 }
 
-/// A group's usage broken down by persona — which character is driving the
-/// spend, within that group's own total from [`group_debug_usage`]. Covers
-/// the group's current AI members; sorted by total tokens descending, like
-/// the per-model breakdown inside each [`DebugUsage`].
-#[utoipa::path(get, path = "/groups/{id}/debug/usage/by-persona", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
+/// Cumulative LLM usage: requests, tokens, cache-hit ratio, estimated cost, and
+/// the same totals per model. Cost is always an estimate.
+//
+// With persistence on this survives a restart. Cost is accrued one trace at a
+// time at whatever rate was configured when that trace was recorded, so
+// changing the configured rates later never reprices history.
+#[utoipa::path(get, path = "/usage", tag = "diagnostics",
+    params(UsageScope),
     responses(
-        (status = 200, description = "That group's usage, one entry per current AI member", body = Vec<PersonaUsage>),
-        (status = 404, description = "Unknown group")))]
-async fn group_debug_usage_by_persona(
+        (status = 200, description = "Usage for the requested scope", body = DebugUsage),
+        (status = 404, description = "Unknown `groupId`")))]
+async fn usage(
     state: CurrentAccount,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<PersonaUsage>>, StatusCode> {
-    if state.workspace().turn_members(&id).is_none() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let mut list: Vec<PersonaUsage> = state
-        .persona_debug_totals_all(&id)
+    Query(scope): Query<UsageScope>,
+) -> Result<Json<DebugUsage>, ApiError> {
+    let totals = match scope.resolve(&state)? {
+        Some(group_id) => state.group_debug_totals(group_id),
+        None => state.debug_totals(),
+    };
+    Ok(Json(debug_usage_view(totals)))
+}
+
+/// The same usage broken down by persona, highest total tokens first. Unscoped,
+/// it also includes the synthetic `system` bucket (compression, suggestions).
+#[utoipa::path(get, path = "/usage/by-persona", tag = "diagnostics",
+    params(UsageScope),
+    responses(
+        (status = 200, description = "One entry per persona", body = Vec<PersonaUsage>),
+        (status = 404, description = "Unknown `groupId`")))]
+async fn usage_by_persona(
+    state: CurrentAccount,
+    Query(scope): Query<UsageScope>,
+) -> Result<Json<Vec<PersonaUsage>>, ApiError> {
+    let per_persona = match scope.resolve(&state)? {
+        Some(group_id) => state.persona_debug_totals_all(group_id),
+        None => state.global_persona_debug_totals_all(),
+    };
+    let mut list: Vec<PersonaUsage> = per_persona
         .into_iter()
         .map(|(persona_id, totals)| PersonaUsage { persona_id, usage: debug_usage_view(totals) })
         .collect();
@@ -123,30 +176,11 @@ async fn group_debug_usage_by_persona(
     Ok(Json(list))
 }
 
-/// Usage broken down by persona, site-wide — the global analogue of
-/// [`group_debug_usage_by_persona`], for spotting which character is
-/// expensive across every group rather than within one chat. Covers every AI
-/// persona in the workspace plus the synthetic "system" bucket (context
-/// compression, chat suggestions); sorted by total tokens descending. No
-/// group to miss, so unlike the per-group endpoints there's no 404 case.
-#[utoipa::path(get, path = "/debug/usage/by-persona", tag = "service",
-    responses(
-        (status = 200, description = "Every AI persona's usage, summed across every group", body = Vec<PersonaUsage>)))]
-async fn global_debug_usage_by_persona(state: CurrentAccount) -> Json<Vec<PersonaUsage>> {
-    let mut list: Vec<PersonaUsage> = state
-        .global_persona_debug_totals_all()
-        .into_iter()
-        .map(|(persona_id, totals)| PersonaUsage { persona_id, usage: debug_usage_view(totals) })
-        .collect();
-    list.sort_by_key(|p| std::cmp::Reverse(p.usage.total_tokens));
-    Json(list)
-}
-
 /// Turns a raw per-model breakdown into the `DebugUsage` wire shape: the grand
 /// totals aren't kept separately anywhere — they're the sum of the per-model
 /// entries, computed here so there is exactly one place that can drift out of
-/// sync with the breakdown: nowhere. Shared by the site-wide and per-group
-/// usage endpoints, which differ only in which [`DebugTotals`] they pass in.
+/// sync with the breakdown: nowhere. Shared by both scopes, which differ only
+/// in which [`DebugTotals`] they pass in.
 fn debug_usage_view(totals: DebugTotals) -> DebugUsage {
     let mut requests = 0u64;
     let mut prompt_tokens = 0u64;
@@ -198,51 +232,73 @@ fn debug_usage_view(totals: DebugTotals) -> DebugUsage {
     }
 }
 
-/// Recent agent traces for a group — the exact prompt each character received
-/// and what it decided — for hydrating the debug panel. Live updates then arrive
-/// as `debug` SSE frames on the group stream.
-#[utoipa::path(get, path = "/groups/{id}/debug/traces", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
-    responses((status = 200, description = "Recent agent traces, oldest first", body = Vec<AgentTrace>)))]
-async fn debug_traces(
+/// Recent agent traces: the prompt each character received and what it decided.
+/// Live updates arrive as `debug` SSE frames.
+//
+// The most revealing read in the API: a trace carries a persona's full system
+// prompt and the conversation context it saw. Scoped to the caller's own
+// workspace like everything else here, so it exposes only that account's own
+// characters to that account.
+#[utoipa::path(get, path = "/groups/{groupId}/traces", tag = "diagnostics",
+    params(("groupId" = String, Path, description = "The group whose traces to read")),
+    responses(
+        (status = 200, description = "Traces, oldest first", body = Vec<AgentTrace>),
+        (status = 404, description = "Unknown group")))]
+async fn list_traces(
     state: CurrentAccount,
     Path(id): Path<String>,
-) -> Json<Vec<AgentTrace>> {
-    Json(state.debug_traces(&id))
+) -> Result<Json<Vec<AgentTrace>>, ApiError> {
+    if state.workspace().turn_members(&id).is_none() {
+        return Err(ApiError::not_found(format!("no group with id \"{id}\"")));
+    }
+    Ok(Json(state.debug_traces(&id)))
 }
 
+// --- Messages ---------------------------------------------------------------
+
 /// Query for a window of message history — one shape for every navigation. All
-/// fields are optional; with none, the whole log is returned (oldest first).
+/// fields are optional.
 #[derive(Deserialize, IntoParams)]
 #[serde(rename_all = "camelCase")]
 struct HistoryQuery {
-    /// The line to build the window around (its id). Omitted, the window ends at
-    /// the newest line — the initial open and "jump to latest".
+    /// Line id to centre the window on. Omitted, the window ends at the newest line.
     anchor: Option<String>,
-    /// How many lines before the anchor (or before the tail) to include.
+    /// Lines before the anchor (or before the tail). Clamped to 500.
+    #[param(maximum = 500)]
     before: Option<usize>,
-    /// How many lines after the anchor to include. Ignored without an `anchor`.
+    /// Lines after the anchor. Ignored without an `anchor`. Clamped to 500.
+    #[param(maximum = 500)]
     after: Option<usize>,
-    /// The client's read mark (epoch millis), for the initial open only (no
-    /// `anchor`): the window is extended back to cover every line newer than this,
-    /// so the whole unread run loads and its divider stays exact.
+    /// Read mark (epoch ms). Without an `anchor`, widens the window back to cover
+    /// every unread line.
     since: Option<i64>,
 }
 
-/// A contiguous window of a group's message history, oldest first. One shape drives
-/// every navigation: the initial open (`before` + `since`), paging earlier
-/// (`anchor` + `before`), paging later (`anchor` + `after`), and jumping to an
-/// arbitrary line (`anchor` + `before` + `after`). With no query it returns the
-/// whole log.
-#[utoipa::path(get, path = "/groups/{id}/messages", tag = "chat",
-    params(("id" = String, Path, description = "Group id"), HistoryQuery),
-    responses((status = 200, description = "Message history window, oldest first", body = Vec<Message>)))]
+/// A contiguous window of message history, oldest first. Max 500 lines (160
+/// without an `anchor`).
+//
+// One shape drives every navigation: initial open (`before` + `since`), paging
+// earlier (`anchor` + `before`), later (`anchor` + `after`), and jumping to an
+// arbitrary line (`anchor` + `before` + `after`).
+//
+// An unknown group id yields an empty list rather than a 404, unlike the other
+// group routes. That's deliberate: clients call this bare to reconcile after an
+// SSE reconnect, so a group deleted in another tab must heal to "no messages"
+// rather than throw.
+#[utoipa::path(get, path = "/groups/{groupId}/messages", tag = "chat",
+    params(("groupId" = String, Path, description = "The group whose history to read"), HistoryQuery),
+    responses((status = 200, description = "The window, oldest first; empty for an unknown group", body = Vec<Message>)))]
 async fn list_messages(
     state: CurrentAccount,
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<Vec<Message>> {
-    Json(state.list_window(&id, query.anchor.as_deref(), query.before, query.after, query.since))
+    // Clamp rather than reject: a client asking for more than the cap wants "as
+    // much as you'll give me", and failing that request would only push it into
+    // paging in a loop for the same total volume.
+    let before = query.before.map(|n| n.min(MAX_WINDOW));
+    let after = query.after.map(|n| n.min(MAX_WINDOW));
+    Json(state.list_window(&id, query.anchor.as_deref(), before, after, query.since))
 }
 
 /// The body of a send request.
@@ -250,39 +306,66 @@ async fn list_messages(
 #[serde(rename_all = "camelCase")]
 struct SendBody {
     /// The message text.
+    #[schema(max_length = 8000)]
     text: String,
-    /// The "you" identity to author the message as. When omitted, the group's
-    /// stored `selfPersonaId` is used.
+    /// Which user identity to author as; must be a `user` persona, not an AI
+    /// one. Omitted, the group's `selfPersonaId` is used.
     #[serde(default)]
     persona_id: Option<String>,
 }
 
-/// Posts a user message and kicks off the agents' turn. The returned line is the
-/// stored user message; AI replies, moods, and read receipts arrive on the
-/// group's SSE stream.
-#[utoipa::path(post, path = "/groups/{id}/messages", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
+/// Posts a user message and starts the agents' turn. Replies, moods, and read
+/// receipts arrive on the SSE stream.
+#[utoipa::path(post, path = "/groups/{groupId}/messages", tag = "chat",
+    params(("groupId" = String, Path, description = "The group to post into")),
     request_body = SendBody,
     responses(
-        (status = 200, description = "The stored user message", body = Message),
-        (status = 404, description = "Unknown group")))]
+        (status = 200, description = "The stored message", body = Message),
+        (status = 404, description = "Unknown group"),
+        (status = 422, description = "Blank or over-long text, or a `personaId` that is not a user identity")))]
 async fn send_message(
     state: CurrentAccount,
     Path(id): Path<String>,
     Json(body): Json<SendBody>,
-) -> Result<Json<Message>, StatusCode> {
+) -> Result<Json<Message>, ApiError> {
     // `turn_members` doubles as an existence check and gives us the group's
     // stored "you" identity to fall back on.
     let Some((self_id, _ai)) = state.workspace().turn_members(&id) else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::not_found(format!("no group with id \"{id}\"")));
     };
-    // Author as the caller's active identity when provided (until the workspace
-    // is synced, the client is the source of truth for who "you" currently are).
-    let author = body.persona_id.clone().unwrap_or(self_id);
+    let text = body.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::unprocessable("message text cannot be blank"));
+    }
+    if text.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(ApiError::unprocessable(format!(
+            "message text is limited to {MAX_MESSAGE_CHARS} characters"
+        )));
+    }
+
+    // Author as the caller's active identity when provided. Validated rather
+    // than trusted: an unchecked `personaId` let a client attribute a line to
+    // any persona in the workspace — including an AI one, which would put words
+    // in a character's mouth and feed them back to every agent as context.
+    let author = match &body.persona_id {
+        Some(persona_id) => {
+            let ws = state.workspace();
+            let persona = ws.personas.iter().find(|p| &p.id == persona_id).ok_or_else(|| {
+                ApiError::unprocessable(format!("no persona with id \"{persona_id}\""))
+            })?;
+            if persona.kind != crate::models::PersonaKind::User {
+                return Err(ApiError::unprocessable(
+                    "personaId must name a user identity; a message cannot be authored as an AI persona",
+                ));
+            }
+            persona_id.clone()
+        }
+        None => self_id,
+    };
 
     // Store the user's line (seeded with an empty read set) and hand it back.
     // It is not broadcast: the client already renders it from this response.
-    let message = Message::conversation(&id, author, body.text.clone(), Some(vec![]));
+    let message = Message::conversation(&id, author, text.to_string(), Some(vec![]));
     state.store(&id, message.clone());
 
     // Hand the turn to the group's coordinator; replies stream in over SSE.
@@ -297,98 +380,111 @@ async fn send_message(
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct EventBody {
-    /// A short description of what changed, e.g. "It starts to rain."
+    /// What changed, e.g. "It starts to rain."
+    #[schema(max_length = 1000)]
     description: String,
-    /// Urgent events preempt the current turn (discarding the in-flight agent);
-    /// ordinary ones fold into the context at the next agent boundary.
+    /// Urgent events preempt the current turn; ordinary ones fold into the
+    /// context at the next agent boundary.
     #[serde(default)]
     urgent: bool,
 }
 
-/// Posts an environment event into a group — rain, time passing, an emergency —
-/// letting the world outside the chat influence the agents. Accepted and queued
-/// for the group's coordinator; its effect (reactions, moods) arrives on the
-/// group's SSE stream.
-#[utoipa::path(post, path = "/groups/{id}/events", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
+/// Posts an environment event — rain, time passing, an emergency — letting the
+/// world outside the chat influence the agents. Its effect arrives on the SSE
+/// stream.
+#[utoipa::path(post, path = "/groups/{groupId}/events", tag = "chat",
+    params(("groupId" = String, Path, description = "The group to post the event into")),
     request_body = EventBody,
     responses(
-        (status = 202, description = "Event accepted"),
-        (status = 404, description = "Unknown group")))]
+        (status = 202, description = "Queued"),
+        (status = 404, description = "Unknown group"),
+        (status = 422, description = "Blank or over-long description")))]
 async fn post_event(
     state: CurrentAccount,
     Path(id): Path<String>,
     Json(body): Json<EventBody>,
-) -> StatusCode {
+) -> Result<axum::http::StatusCode, ApiError> {
     if state.workspace().turn_members(&id).is_none() {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::not_found(format!("no group with id \"{id}\"")));
+    }
+    let description = body.description.trim();
+    if description.is_empty() {
+        return Err(ApiError::unprocessable("event description cannot be blank"));
+    }
+    if description.chars().count() > MAX_EVENT_CHARS {
+        return Err(ApiError::unprocessable(format!(
+            "event description is limited to {MAX_EVENT_CHARS} characters"
+        )));
     }
     state.0.dispatch(
         &id,
-        AgentEvent::Environment { description: body.description, urgent: body.urgent },
+        AgentEvent::Environment { description: description.to_string(), urgent: body.urgent },
     );
-    StatusCode::ACCEPTED
+    Ok(axum::http::StatusCode::ACCEPTED)
 }
 
-/// Resumes a turn that was suspended by a failed agent inference: the agents who
-/// have not yet read the pending message respond to the current chat. A no-op if
-/// nothing is suspended (e.g. the pending turn was already voided by a newer
-/// message). Its effect arrives on the group's SSE stream.
-#[utoipa::path(post, path = "/groups/{id}/retry", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
+/// Resumes a turn suspended by a failed agent inference. A no-op if nothing is
+/// suspended. Its effect arrives on the SSE stream.
+#[utoipa::path(post, path = "/groups/{groupId}/retry", tag = "chat",
+    params(("groupId" = String, Path, description = "The group whose suspended turn to resume")),
     responses(
-        (status = 202, description = "Retry accepted"),
+        (status = 202, description = "Accepted"),
         (status = 404, description = "Unknown group")))]
-async fn retry_turn(state: CurrentAccount, Path(id): Path<String>) -> StatusCode {
+async fn retry_turn(
+    state: CurrentAccount,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
     if state.workspace().turn_members(&id).is_none() {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::not_found(format!("no group with id \"{id}\"")));
     }
     state.0.dispatch(&id, AgentEvent::Retry);
-    StatusCode::ACCEPTED
+    Ok(axum::http::StatusCode::ACCEPTED)
 }
 
-/// Cached conversation-starter suggestions for a group. Returned immediately from
-/// the server-side cache; if they're stale (the conversation moved on, or the
-/// part of day changed) a fresh generation is kicked off in the background and
-/// arrives on the group's `suggestions` SSE frame. The frontend only fetches and
-/// displays — it never generates. Empty (`generatedAt == 0`) before the first
-/// generation completes.
-#[utoipa::path(get, path = "/groups/{id}/suggestions", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
+/// Cached conversation-starter suggestions, served from the server-side cache.
+/// Empty (`generatedAt == 0`) until the first generation completes.
+//
+// If the cache is stale — the conversation moved on, or the part of day changed
+// — a fresh generation starts in the background and arrives on the
+// `suggestions` SSE frame. The frontend only fetches and displays.
+#[utoipa::path(get, path = "/groups/{groupId}/suggestions", tag = "chat",
+    params(("groupId" = String, Path, description = "The group whose suggestions to read")),
     responses(
-        (status = 200, description = "The cached suggestions (a background refresh may follow on the stream)", body = GroupSuggestions),
+        (status = 200, description = "The cached suggestions; a refresh may follow on the stream", body = GroupSuggestions),
         (status = 404, description = "Unknown group")))]
 async fn get_suggestions(
     state: CurrentAccount,
     Path(id): Path<String>,
-) -> Result<Json<GroupSuggestions>, StatusCode> {
+) -> Result<Json<GroupSuggestions>, ApiError> {
     if state.workspace().turn_members(&id).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::not_found(format!("no group with id \"{id}\"")));
     }
     // Return the cache now; regenerate in the background only if stale.
     state.0.request_suggestions(&id, false);
     Ok(Json(state.suggestions(&id)))
 }
 
-/// Forces a fresh suggestion generation for a group (the composer's "give me
-/// other ideas" action). Accepted and generated in the background; the result
-/// arrives on the group's `suggestions` SSE frame. Rate-limited server-side: a
-/// call inside the cooldown window, or while a generation is already running, is
-/// quietly ignored — so the button can't be used to hammer the model.
-#[utoipa::path(post, path = "/groups/{id}/suggestions/regenerate", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
+/// Creates a fresh set of suggestions (the composer's "give me other ideas").
+/// Generated in the background; the result arrives on the `suggestions` SSE
+/// frame. Rate-limited server-side — repeated calls coalesce.
+//
+// A `POST` to the same collection the `GET` reads, rather than the
+// `…/suggestions/regenerate` verb this replaced: creating a new set is what the
+// request does, and the resource it creates them for is already in the path.
+#[utoipa::path(post, path = "/groups/{groupId}/suggestions", tag = "chat",
+    params(("groupId" = String, Path, description = "The group to regenerate suggestions for")),
     responses(
-        (status = 202, description = "Regeneration accepted (or coalesced with a recent one)"),
+        (status = 202, description = "Accepted, or coalesced with a recent one"),
         (status = 404, description = "Unknown group")))]
 async fn regenerate_suggestions(
     state: CurrentAccount,
     Path(id): Path<String>,
-) -> StatusCode {
+) -> Result<axum::http::StatusCode, ApiError> {
     if state.workspace().turn_members(&id).is_none() {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::not_found(format!("no group with id \"{id}\"")));
     }
     state.0.request_suggestions(&id, true);
-    StatusCode::ACCEPTED
+    Ok(axum::http::StatusCode::ACCEPTED)
 }
 
 /// A turn-activity SSE frame: `true` while the group's agent loop runs a turn,
@@ -398,14 +494,20 @@ struct ActivityFrame {
     active: bool,
 }
 
-/// Server-Sent Events for a group: default `message` events (AI replies and
-/// moods), named `read` events (read receipts), named `activity` events (the
-/// agent loop turning busy/idle), and named `turn` events (the current
-/// processing round's per-member progress, seeded on connect).
-#[utoipa::path(get, path = "/groups/{id}/stream", tag = "chat",
-    params(("id" = String, Path, description = "Group id")),
-    responses((status = 200,
-        description = "text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `turn` frames carry a Turn, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions")))]
+/// Server-Sent Events for a group.
+///
+/// Frames: unnamed = `Message`; `read` = `ReadReceipt`; `activity` =
+/// `{ "active": bool }`; `turn` = `Turn`; `debug` = `AgentTrace`;
+/// `suggestions` = `GroupSuggestions`. `activity` and `turn` are seeded on connect.
+//
+// The token goes in the `Authorization` header like every other route — there
+// is deliberately no `?access_token=` fallback, since a forwarding proxy logs
+// URLs. `EventSource` cannot set headers, so a client reads this with `fetch`.
+// OpenAPI can't type per-event-name bodies, so the media type is all the
+// document can state; the frame shapes are in the doc comment above.
+#[utoipa::path(get, path = "/groups/{groupId}/stream", tag = "chat",
+    params(("groupId" = String, Path, description = "The group to stream")),
+    responses((status = 200, description = "An open event stream", content_type = "text/event-stream")))]
 async fn stream(state: CurrentAccount, Path(id): Path<String>) -> impl IntoResponse {
     // Subscribe before reading the activity flag: any change that races this
     // arrives on `live` afterwards, so the seed can only be stale, never lost.

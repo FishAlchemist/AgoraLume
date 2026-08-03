@@ -1,4 +1,5 @@
 import { authFetch } from './authFetch';
+import { jsonOrThrow } from './problem';
 import type { AccountSummary } from './types';
 import { versionedBase } from './version';
 
@@ -9,17 +10,13 @@ import { versionedBase } from './version';
  * contract (there's nothing to mock — creating accounts only makes sense
  * against a real backend), goes through `authFetch` so the admin's token is
  * attached, and doesn't pre-guess who's allowed to call it — a non-admin
- * caller just gets the backend's real 401 back (see `CurrentAdmin` in
+ * caller just gets the backend's real 403 back (see `CurrentAdmin` in
  * `backend/src/state.rs`), same as everywhere else this pattern is used.
  */
 
 async function getJson<T>(baseUrl: string, path: string): Promise<T> {
   const res = await authFetch(`${baseUrl}${path}`, { headers: { Accept: 'application/json' } });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(detail || `GET ${path} failed: ${res.status}`);
-  }
-  return (await res.json()) as T;
+  return jsonOrThrow<T>(res, `GET ${path}`);
 }
 
 /** Every existing account, for the admin dashboard's account list. */
@@ -44,11 +41,7 @@ export async function createAccount(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
   });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(detail || `createAccount failed: ${res.status}`);
-  }
-  return (await res.json()) as AccountSummary;
+  return jsonOrThrow<AccountSummary>(res, 'createAccount');
 }
 
 /**
@@ -71,9 +64,5 @@ export async function updateAccount(
       body: JSON.stringify(patch),
     },
   );
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(detail || `updateAccount failed: ${res.status}`);
-  }
-  return (await res.json()) as AccountSummary;
+  return jsonOrThrow<AccountSummary>(res, 'updateAccount');
 }

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::event::Event;
+use crate::api_error::ApiError;
 use crate::agent::turn::{
     AgentRuntime, coordinator_loop, current_time_of_day, generate_suggestions,
 };
@@ -204,7 +205,7 @@ pub struct GroupSummary {
 }
 
 /// A snapshot of the cumulative per-model usage, for building the
-/// `/debug/usage` response outside the lock and for persisting to disk. The
+/// `/usage` response outside the lock and for persisting to disk. The
 /// on-disk shape is bare (no version envelope) — losing this file just resets
 /// the readout to zero, not a data loss.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -641,7 +642,7 @@ impl AccountState {
 
     /// Every current member persona's own usage within a group, unsorted —
     /// the full by-persona breakdown behind `GET
-    /// /groups/{id}/debug/usage/by-persona`. Scoped to the group's *current*
+    /// /usage/by-persona?groupId=…`. Scoped to the group's *current*
     /// AI members (not every persona that ever produced a trace), matching
     /// who the debug panel shows traces for today — plus the synthetic
     /// [`SYSTEM_PERSONA_ID`] bucket (context compression, chat suggestions),
@@ -1553,6 +1554,12 @@ impl AppState {
         }
         let account = self.account_by_id(account_id);
         account.set_credentials(username.map(str::to_string), password.map(hash_password));
+        // The credentials that authorized every live session for this account
+        // no longer exist, so neither should the sessions. Changing a password
+        // is the operator's response to a compromised account; leaving the
+        // old tokens working (access for 15 minutes, refresh for 30 days)
+        // would make that response do nothing for whoever already had one.
+        self.tokens.revoke_subject(&Subject::Account(account_id.to_string()));
         Ok(account.credentials())
     }
 
@@ -1581,6 +1588,11 @@ impl AppState {
     /// unknown, expired, or was never a refresh token to begin with.
     pub fn refresh_access_token(&self, refresh_token: &str) -> Option<String> {
         self.tokens.refresh(refresh_token)
+    }
+
+    /// Ends one session — see [`TokenStore::revoke_tokens`].
+    pub fn logout(&self, access_token: Option<&str>, refresh_token: Option<&str>) {
+        self.tokens.revoke_tokens(access_token, refresh_token);
     }
 
     /// The subject an access token currently resolves to.
@@ -1635,9 +1647,16 @@ impl std::ops::Deref for CurrentAccount {
     }
 }
 
-/// Why [`CurrentAccount`] extraction failed — distinct from a generic 401 so
-/// a client (or a curious operator) can tell "no token" apart from "token
-/// doesn't belong to an account."
+/// Why an auth extractor rejected a request.
+///
+/// The four cases split across *two* status codes, and the split is the point.
+/// The first two mean "we don't know who you are" — a 401, which a client
+/// answers by refreshing its access token and retrying. The last two mean "we
+/// know exactly who you are, and it isn't allowed here" — a 403, where
+/// retrying with a fresher token of the same identity is guaranteed to fail
+/// again. Collapsing both into 401 (as this used to) made the frontend spend a
+/// refresh round-trip on every permission denial, and made the two
+/// indistinguishable to anything reading the response.
 pub enum AuthRejection {
     MissingToken,
     InvalidToken,
@@ -1647,15 +1666,30 @@ pub enum AuthRejection {
 
 impl axum::response::IntoResponse for AuthRejection {
     fn into_response(self) -> axum::response::Response {
-        let message = match self {
-            AuthRejection::MissingToken => "missing or malformed Authorization header",
-            AuthRejection::InvalidToken => "invalid or expired access token",
-            AuthRejection::NotAnAccount => {
-                "this token belongs to the admin role, which has no account to act as"
+        // RFC 9110 §15.5.2 requires a `WWW-Authenticate` challenge on every
+        // 401; RFC 6750 §3 defines the `error` parameter that distinguishes a
+        // token the server rejected from no token at all. A `Bearer` challenge
+        // (unlike `Basic`) triggers no browser credential dialog.
+        match self {
+            AuthRejection::MissingToken => ApiError::unauthorized(
+                "missing-token",
+                "missing or malformed Authorization header",
+                "Bearer",
+            ),
+            AuthRejection::InvalidToken => ApiError::unauthorized(
+                "invalid-token",
+                "invalid or expired access token",
+                "Bearer error=\"invalid_token\"",
+            ),
+            AuthRejection::NotAnAccount => ApiError::forbidden(
+                "not-an-account",
+                "this token belongs to the admin role, which has no account to act as",
+            ),
+            AuthRejection::NotAdmin => {
+                ApiError::forbidden("not-admin", "this route requires the admin role")
             }
-            AuthRejection::NotAdmin => "this route requires the admin role",
-        };
-        (axum::http::StatusCode::UNAUTHORIZED, message).into_response()
+        }
+        .into_response()
     }
 }
 

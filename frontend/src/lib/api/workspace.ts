@@ -8,6 +8,7 @@ import type {
   Settings,
 } from '../../types';
 import { authFetch } from './authFetch';
+import { jsonOrThrow, throwIfNotOk } from './problem';
 import { versionedBase } from './version';
 
 /** A full read of the backend-owned workspace (the SSOT). */
@@ -41,8 +42,7 @@ export class HttpWorkspaceApi {
     const res = await authFetch(`${this.baseUrl}${path}`, {
       headers: { Accept: 'application/json' },
     });
-    if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
-    return (await res.json()) as T;
+    return jsonOrThrow<T>(res, `GET ${path}`);
   }
 
   private async send(method: string, path: string, body?: unknown): Promise<void> {
@@ -51,7 +51,7 @@ export class HttpWorkspaceApi {
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`${method} ${path} failed: ${res.status}`);
+    await throwIfNotOk(res, `${method} ${path}`);
   }
 
   /** Like `send`, but for endpoints that return the created/updated record. */
@@ -61,8 +61,7 @@ export class HttpWorkspaceApi {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`${method} ${path} failed: ${res.status}`);
-    return (await res.json()) as T;
+    return jsonOrThrow<T>(res, `${method} ${path}`);
   }
 
   /** Reads the whole workspace in one shot (used to hydrate the store). */
@@ -72,7 +71,7 @@ export class HttpWorkspaceApi {
       this.get<Department[]>('/departments'),
       this.get<Persona[]>('/personas'),
       this.get<Group[]>('/groups'),
-      this.get<Settings>('/settings'),
+      this.get<Settings>('/preferences'),
     ]);
     return { organizations, departments, personas, groups, settings };
   }
@@ -117,8 +116,12 @@ export class HttpWorkspaceApi {
     return this.send('DELETE', `/groups/${id}`);
   }
 
+  // `/preferences`, not `/settings`: the backend renamed it to keep the
+  // account's own display choices distinct from `/llm/settings`, which is
+  // operator-level server configuration. The client-side type is still
+  // `Settings`.
   updateSettings(patch: Partial<Settings>): Promise<void> {
-    return this.send('PATCH', '/settings', patch);
+    return this.send('PATCH', '/preferences', patch);
   }
 
   // Persona memory. Backend-only: the mock has no agent loop to record it, and

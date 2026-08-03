@@ -1,6 +1,7 @@
 import type { GroupSuggestions, Message, Turn } from '../../types';
 import { authFetch } from './authFetch';
 import { FetchEventStream } from './eventStream';
+import { jsonOrThrow, throwIfNotOk } from './problem';
 import type {
   ActivityHandler,
   AgentTrace,
@@ -246,8 +247,7 @@ export class HttpChatApi implements ChatApi {
     const res = await authFetch(`${this.baseUrl}${path}`, {
       headers: { Accept: 'application/json' },
     });
-    if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
-    return (await res.json()) as T;
+    return jsonOrThrow<T>(res, `GET ${path}`);
   }
 
   async probe(): Promise<ServerMeta | null> {
@@ -277,13 +277,15 @@ export class HttpChatApi implements ChatApi {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, personaId }),
     });
-    if (!res.ok) throw new Error(`sendMessage failed: ${res.status}`);
-    return (await res.json()) as Message;
+    // The server validates length and authorship (a message may only be
+    // authored as a user identity) and explains a rejection in the problem
+    // document, so surfacing its `detail` is what lets the composer say why.
+    return jsonOrThrow<Message>(res, 'sendMessage');
   }
 
   async retry(groupId: string): Promise<void> {
     const res = await authFetch(`${this.baseUrl}/groups/${groupId}/retry`, { method: 'POST' });
-    if (!res.ok) throw new Error(`retry failed: ${res.status}`);
+    await throwIfNotOk(res, 'retry');
   }
 
   subscribe(groupId: string, handler: MessageHandler): () => void {
@@ -302,24 +304,29 @@ export class HttpChatApi implements ChatApi {
     return this.streams.subscribeTurn(groupId, handler);
   }
 
+  // Usage is two questions — "what did this cost" and "which character spent
+  // it" — each answerable for one group or for everything. The backend used to
+  // spell that as four routes under a `debug/` prefix; it is now two routes
+  // with an optional `groupId`, and these four methods are the two scopes of
+  // each.
   getUsage(): Promise<DebugUsage> {
-    return this.getJson<DebugUsage>('/debug/usage');
+    return this.getJson<DebugUsage>('/usage');
   }
 
   getGroupUsage(groupId: string): Promise<DebugUsage> {
-    return this.getJson<DebugUsage>(`/groups/${groupId}/debug/usage`);
+    return this.getJson<DebugUsage>(`/usage?groupId=${encodeURIComponent(groupId)}`);
   }
 
   getPersonaUsage(groupId: string): Promise<PersonaUsage[]> {
-    return this.getJson<PersonaUsage[]>(`/groups/${groupId}/debug/usage/by-persona`);
+    return this.getJson<PersonaUsage[]>(`/usage/by-persona?groupId=${encodeURIComponent(groupId)}`);
   }
 
   getGlobalPersonaUsage(): Promise<PersonaUsage[]> {
-    return this.getJson<PersonaUsage[]>('/debug/usage/by-persona');
+    return this.getJson<PersonaUsage[]>('/usage/by-persona');
   }
 
   listTraces(groupId: string): Promise<AgentTrace[]> {
-    return this.getJson<AgentTrace[]>(`/groups/${groupId}/debug/traces`);
+    return this.getJson<AgentTrace[]>(`/groups/${groupId}/traces`);
   }
 
   subscribeDebug(groupId: string, handler: DebugHandler): () => void {
@@ -330,11 +337,12 @@ export class HttpChatApi implements ChatApi {
     return this.getJson<GroupSuggestions>(`/groups/${groupId}/suggestions`);
   }
 
+  /** POST to the same collection the GET reads — it creates a new set. */
   async regenerateSuggestions(groupId: string): Promise<void> {
-    const res = await authFetch(`${this.baseUrl}/groups/${groupId}/suggestions/regenerate`, {
+    const res = await authFetch(`${this.baseUrl}/groups/${groupId}/suggestions`, {
       method: 'POST',
     });
-    if (!res.ok) throw new Error(`regenerateSuggestions failed: ${res.status}`);
+    await throwIfNotOk(res, 'regenerateSuggestions');
   }
 
   subscribeSuggestions(groupId: string, handler: SuggestionsHandler): () => void {

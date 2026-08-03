@@ -1,4 +1,5 @@
 import { authFetch } from './authFetch';
+import { jsonOrThrow } from './problem';
 import type { LlmModelsView, LlmSettingsPatch, LlmSettingsView } from './types';
 import { versionedBase } from './version';
 
@@ -21,11 +22,7 @@ import { versionedBase } from './version';
 
 async function getJson<T>(baseUrl: string, path: string): Promise<T> {
   const res = await authFetch(`${baseUrl}${path}`, { headers: { Accept: 'application/json' } });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(detail || `GET ${path} failed: ${res.status}`);
-  }
-  return (await res.json()) as T;
+  return jsonOrThrow<T>(res, `GET ${path}`);
 }
 
 /** The live LLM provider configuration, with the API key stripped to a presence flag. */
@@ -48,11 +45,7 @@ export async function updateLlmSettings(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
   });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(detail || `updateLlmSettings failed: ${res.status}`);
-  }
-  return (await res.json()) as LlmSettingsView;
+  return jsonOrThrow<LlmSettingsView>(res, 'updateLlmSettings');
 }
 
 /**
@@ -74,9 +67,5 @@ export async function listLlmModels(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(query),
   });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(detail || `listLlmModels failed: ${res.status}`);
-  }
-  return (await res.json()) as LlmModelsView;
+  return jsonOrThrow<LlmModelsView>(res, 'listLlmModels');
 }

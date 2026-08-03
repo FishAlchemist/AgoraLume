@@ -9,12 +9,14 @@
 mod accounts;
 mod auth;
 mod chat;
+mod contract;
 mod llm;
 mod workspace;
 
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -22,6 +24,7 @@ use utoipa::OpenApi;
 use utoipa::openapi::OpenApi as OpenApiDoc;
 use utoipa_axum::router::OpenApiRouter;
 
+use crate::routes::contract::SecurityAddon;
 use crate::state::AppState;
 
 /// Top-level API metadata. Paths and most schemas are contributed by the
@@ -30,11 +33,22 @@ use crate::state::AppState;
 /// request/response body.
 #[derive(OpenApi)]
 #[openapi(
-    components(schemas(crate::models::ReadReceipt, crate::models::Turn)),
+    modifiers(&SecurityAddon),
+    security(("bearerAuth" = [])),
+    servers(
+        (url = "/", description = "Same-origin: the bundled build, where the SPA and the API share a host"),
+        (url = "/api", description = "Behind an edge/dev proxy (VITE_API_PREFIX=/api)"),
+        (url = "http://127.0.0.1:8080", description = "A local backend (pnpm dev:api)")
+    ),
+    components(schemas(
+        crate::models::ReadReceipt,
+        crate::models::Turn,
+        crate::api_error::ApiError
+    )),
     info(
         title = "AgoraLume API",
         version = "0.1.0",
-        description = "AgoraLume API: user + multi-AI group chat with modular personas. The backend is the single source of truth for the workspace (organizations, departments, personas, groups, settings) and streams chat over SSE. This is the production API contract; the current build backs it with an in-memory store and simulated agent replies until an LLM is connected."
+        description = "User + multi-AI group chat with modular personas. The backend owns the workspace and streams chat over SSE.\n\nPOST creates (201), PATCH merges a partial body (200), DELETE returns 204. Failures are RFC 9457 problem documents; `type` is a stable `urn:agoralume:error:…`."
     ),
     tags(
         (name = "service", description = "Liveness and server mode"),
@@ -43,7 +57,8 @@ use crate::state::AppState;
         (name = "departments", description = "Sub-units within an organization"),
         (name = "personas", description = "User identities and AI agents"),
         (name = "groups", description = "Chat rooms and their membership"),
-        (name = "settings", description = "Client preferences"),
+        (name = "preferences", description = "The signed-in account's own display preferences"),
+        (name = "diagnostics", description = "Token usage, estimated cost, and agent traces"),
         (name = "llm", description = "Operator: real-model provider configuration"),
         (name = "auth", description = "Login and token refresh, shared by every role"),
         (name = "accounts", description = "Admin: provisioning and listing accounts")
@@ -112,10 +127,20 @@ pub fn router(state: Arc<AppState>, cors_allowed_origins: Option<&[String]>) -> 
 
     let (router, _) = versioned_api().split_for_parts();
     router
+        // Nothing this API accepts is large: the biggest legitimate body is a
+        // persona carrying a system prompt. axum's own default is 2 MiB, which
+        // is generous for a JSON API whose every field is a name, a short text,
+        // or a handful of ids — and a request body is read into memory before a
+        // handler ever sees it, so the limit is what bounds the cost of a
+        // deliberately oversized one.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
 }
+
+/// The largest request body any endpoint accepts, in bytes.
+const MAX_BODY_BYTES: usize = 512 * 1024;
 
 /// Parses `AGORALUME_CORS_ORIGINS` entries into an `AllowOrigin`, falling back
 /// to `Any` when unset, empty, every entry fails to parse as a header value
@@ -157,8 +182,14 @@ fn allow_origin_from(origins: Option<&[String]>) -> AllowOrigin {
 }
 
 /// The generated OpenAPI document, for serving or writing to `openapi.yml`.
+///
+/// The document-wide consistency passes run here rather than as derive-level
+/// modifiers because they walk the operations, which only exist once the
+/// handler routers have been merged — see [`contract::finalize`].
 pub fn openapi() -> OpenApiDoc {
-    versioned_api().into_openapi()
+    let mut doc = versioned_api().into_openapi();
+    contract::finalize(&mut doc);
+    doc
 }
 
 #[cfg(test)]
@@ -197,7 +228,7 @@ mod tests {
         Arc::new(AppState::new(operator, None, "test"))
     }
 
-    /// GETs `path` (unversioned, e.g. `/debug/usage` — [`API_VERSION`] is
+    /// GETs `path` (unversioned, e.g. `/usage` — [`API_VERSION`] is
     /// applied here, the one place a version bump touches this test module)
     /// through the fully assembled router and returns the parsed JSON body —
     /// end-to-end through actual route dispatch, not just the `AppState`
@@ -249,13 +280,13 @@ mod tests {
         let app = router(state, None);
 
         // The plain site-wide total — unaffected by the sibling by-persona route.
-        let (status, body) = get_json(app.clone(), "/debug/usage").await;
+        let (status, body) = get_json(app.clone(), "/usage").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["requests"], 1);
 
         // The global by-persona breakdown — a distinct path, not a 404 or a
-        // re-dispatch to `/debug/usage` above.
-        let (status, body) = get_json(app.clone(), "/debug/usage/by-persona").await;
+        // re-dispatch to `/usage` above.
+        let (status, body) = get_json(app.clone(), "/usage/by-persona").await;
         assert_eq!(status, StatusCode::OK);
         let list = body.as_array().expect("a JSON array");
         assert!(
@@ -263,15 +294,24 @@ mod tests {
             "aria's global entry should be present: {body}"
         );
 
-        // The group-scoped by-persona breakdown — same last path segment, a
-        // different route entirely.
-        let (status, body) = get_json(app, "/groups/lab/debug/usage/by-persona").await;
+        // The same two questions, scoped to one group by query parameter rather
+        // than by a parallel pair of paths.
+        let (status, body) = get_json(app.clone(), "/usage?groupId=lab").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["requests"], 1);
+
+        let (status, body) = get_json(app.clone(), "/usage/by-persona?groupId=lab").await;
         assert_eq!(status, StatusCode::OK);
         let list = body.as_array().expect("a JSON array");
         assert!(
             list.iter().any(|p| p["personaId"] == "aria"),
             "aria's group-scoped entry should be present: {body}"
         );
+
+        // A group the workspace doesn't have is a 404, not a silent zero — the
+        // scoped and unscoped forms must not be told apart by guessing an id.
+        let (status, _) = get_json(app, "/usage?groupId=no-such-group").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -529,6 +569,9 @@ mod tests {
         .await;
         let account_token = tokens["accessToken"].as_str().expect("an access token");
 
+        // 403, not 401: the token is perfectly valid, it just isn't admin.
+        // A client that saw 401 here would waste a refresh round-trip trying
+        // to fix an authentication problem it doesn't have.
         let (status, _) = patch_json_authed(
             app.clone(),
             "/llm/settings",
@@ -536,7 +579,7 @@ mod tests {
             serde_json::json!({ "enabled": false }),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::FORBIDDEN);
 
         let (status, _) = post_json_authed(
             app,
@@ -545,7 +588,7 @@ mod tests {
             serde_json::json!({ "baseUrl": "https://api.openai.com/v1" }),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -594,9 +637,10 @@ mod tests {
         let access_token = tokens["accessToken"].as_str().expect("an access token");
 
         // The admin role has no account/workspace of its own to resolve to —
-        // see `CurrentAccount`'s docs.
+        // see `CurrentAccount`'s docs. 403, not 401: the token authenticated
+        // fine, it just names a subject this route can't act as.
         let status = get_json_authed(app, "/organizations", access_token).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -653,7 +697,7 @@ mod tests {
             serde_json::json!({ "username": "bob", "password": "bob-pw" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
         assert_eq!(created["username"].as_str(), Some("bob"));
         assert!(created["accountId"].as_str().is_some_and(|id| !id.is_empty()));
 
@@ -708,7 +752,7 @@ mod tests {
             serde_json::json!({ "username": "carol", "password": "carol-pw" }),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -738,7 +782,7 @@ mod tests {
             serde_json::json!({ "username": "erin", "password": "erin-pw" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
 
         let (status, _) = post_json_authed(
             app,
@@ -838,7 +882,7 @@ mod tests {
             serde_json::json!({ "username": "gina-the-second" }),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -870,12 +914,134 @@ mod tests {
         let status = get_json_authed(app.clone(), "/groups/lounge/stream", access_token).await;
         assert_eq!(status, StatusCode::OK);
 
-        // A token in the query string alone must not work.
+        // A token in the query string alone must not work. Still 401 (not the
+        // new 403): there is no `Authorization` header at all here, so the
+        // server never authenticated anyone.
         let request = Request::builder()
             .uri(format!("{API_VERSION}/groups/lounge/stream?access_token={access_token}"))
             .body(Body::empty())
             .unwrap();
         let status = app.oneshot(request).await.unwrap().status();
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Seeds one account with known credentials and returns the assembled
+    /// router — the shared setup for the session-lifetime tests below.
+    fn app_with_alice() -> Router {
+        let dir = temp_dir();
+        let account_dir = dir.join("accounts").join("acct-1");
+        let creds = crate::auth::AccountCredentials {
+            username: "alice".to_string(),
+            password_hash: Some(crate::auth::hash_password("alice-pw")),
+            allow_admin_readonly: false,
+        };
+        crate::persist::Persistence::new(&account_dir).save_credentials(&creds);
+        router(not_mock_state(Some(dir), false), None)
+    }
+
+    #[tokio::test]
+    async fn changing_an_account_password_cuts_off_its_live_sessions() {
+        // The point of changing a compromised account's password is to lock out
+        // whoever already has a session. Before revocation existed, their
+        // access token kept working until it expired and their refresh token
+        // for another 30 days — so the operator's one lever did nothing.
+        let app = app_with_alice();
+        let (_, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "alice", "password": "alice-pw" }),
+        )
+        .await;
+        let access_token = tokens["accessToken"].as_str().expect("an access token").to_string();
+        let refresh_token = tokens["refreshToken"].as_str().expect("a refresh token").to_string();
+        assert_eq!(get_json_authed(app.clone(), "/organizations", &access_token).await, StatusCode::OK);
+
+        let admin_token = admin_access_token(app.clone()).await;
+        let (status, _) = patch_json_authed(
+            app.clone(),
+            "/accounts/acct-1",
+            &admin_token,
+            serde_json::json!({ "password": "rotated-pw" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(
+            get_json_authed(app.clone(), "/organizations", &access_token).await,
+            StatusCode::UNAUTHORIZED,
+            "the old access token must stop working immediately"
+        );
+        let (status, _) =
+            post_json(app, "/auth/refresh", serde_json::json!({ "refreshToken": refresh_token }))
+                .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the refresh token is the one that outlives everything; it must go too"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_the_presented_tokens_server_side() {
+        let app = app_with_alice();
+        let (_, tokens) = post_json(
+            app.clone(),
+            "/auth/login",
+            serde_json::json!({ "username": "alice", "password": "alice-pw" }),
+        )
+        .await;
+        let access_token = tokens["accessToken"].as_str().expect("an access token").to_string();
+        let refresh_token = tokens["refreshToken"].as_str().expect("a refresh token").to_string();
+
+        let (status, _) = post_json_authed(
+            app.clone(),
+            "/auth/logout",
+            &access_token,
+            serde_json::json!({ "refreshToken": refresh_token }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            get_json_authed(app.clone(), "/organizations", &access_token).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, _) =
+            post_json(app, "/auth/refresh", serde_json::json!({ "refreshToken": refresh_token }))
+                .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_message_cannot_be_authored_as_an_ai_persona() {
+        // `personaId` was taken on trust, so a crafted request could put words
+        // in a character's mouth — and those words then entered every other
+        // agent's context as something that character had said.
+        let app = router(state(), None);
+        let (status, groups) = get_json(app.clone(), "/groups").await;
+        assert_eq!(status, StatusCode::OK);
+        let group_id = groups[0]["id"].as_str().expect("a seeded group").to_string();
+
+        let (_, personas) = get_json(app.clone(), "/personas").await;
+        let ai_id = personas
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["kind"] == "ai")
+            .and_then(|p| p["id"].as_str())
+            .expect("a seeded AI persona")
+            .to_string();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("{API_VERSION}/groups/{group_id}/messages"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "text": "I agree with myself.", "personaId": ai_id })
+                    .to_string(),
+            ))
+            .unwrap();
+        let status = app.oneshot(request).await.unwrap().status();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

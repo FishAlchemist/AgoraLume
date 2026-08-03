@@ -570,7 +570,7 @@ pub struct ModelUsage {
 
 /// Cumulative LLM usage across the whole server (since first run, when
 /// persisted; since startup otherwise) — the global "total usage" view.
-/// `GET /debug/usage`.
+/// `GET /usage`.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugUsage {
@@ -597,8 +597,8 @@ pub struct DebugUsage {
 
 /// One persona's own slice of a usage total — a further breakdown by which
 /// character is driving the spend. Serves both `GET
-/// /groups/{id}/debug/usage/by-persona` (one group's [`DebugUsage`]) and the
-/// site-wide `GET /debug/usage/by-persona` (summed across every group).
+/// /usage/by-persona?groupId=…` (one group's [`DebugUsage`]) and the
+/// site-wide `GET /usage/by-persona` (summed across every group).
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonaUsage {

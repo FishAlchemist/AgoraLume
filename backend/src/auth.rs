@@ -183,6 +183,41 @@ impl TokenStore {
         Some(record.subject.clone())
     }
 
+    /// Drops exactly the tokens presented — one session's own sign-out.
+    ///
+    /// Deliberately takes no authorization of its own: possessing a token is
+    /// what entitles you to destroy it, and requiring a *valid* one would mean
+    /// an expired access token left its refresh token (good for a month) alive
+    /// with no way to retract it. Unknown tokens are silently ignored, so this
+    /// can't be used to probe which tokens exist.
+    pub fn revoke_tokens(&self, access: Option<&str>, refresh: Option<&str>) {
+        if let Some(token) = access {
+            self.access.lock().unwrap().remove(token);
+        }
+        if let Some(token) = refresh {
+            self.refresh.lock().unwrap().remove(token);
+        }
+    }
+
+    /// Drops every access and refresh token belonging to `subject`, ending all
+    /// of its live sessions at once.
+    ///
+    /// Called when an account's credentials change. Without it, changing a
+    /// password did nothing to whoever was already holding a token for that
+    /// account: their access token kept working until it expired, and their
+    /// refresh token — good for 30 days — kept minting new ones. "Change the
+    /// password" is the one lever an operator has when an account is
+    /// compromised, so it has to actually cut off the existing session rather
+    /// than only the next login.
+    ///
+    /// Every session of that subject goes, including the one that may have
+    /// asked for the change; re-logging in with the new password is the
+    /// intended follow-up.
+    pub fn revoke_subject(&self, subject: &Subject) {
+        self.access.lock().unwrap().retain(|_, record| record.subject != *subject);
+        self.refresh.lock().unwrap().retain(|_, record| record.subject != *subject);
+    }
+
     /// Mints a fresh access token for whoever `refresh_token` belongs to,
     /// without rotating the refresh token itself. `None` for an unknown,
     /// expired, or already-revoked refresh token.
@@ -291,6 +326,27 @@ mod tests {
         let store = TokenStore::default();
         let issued = store.issue(Subject::Admin);
         assert!(store.refresh(&issued.access_token).is_none());
+    }
+
+    #[test]
+    fn revoking_a_subject_kills_both_token_kinds_and_leaves_others_alone() {
+        let store = TokenStore::default();
+        let alice = store.issue(Subject::Account("acct-1".to_string()));
+        // A second session for the same account — a second device — must go too.
+        let alice_phone = store.issue(Subject::Account("acct-1".to_string()));
+        let bob = store.issue(Subject::Account("acct-2".to_string()));
+
+        store.revoke_subject(&Subject::Account("acct-1".to_string()));
+
+        assert_eq!(store.verify_access(&alice.access_token), None);
+        assert_eq!(store.verify_access(&alice_phone.access_token), None);
+        // The refresh token is the one that matters: it outlives the access
+        // token by a month, so a revocation that missed it would barely help.
+        assert!(store.refresh(&alice.refresh_token).is_none());
+        assert!(store.refresh(&alice_phone.refresh_token).is_none());
+
+        assert!(store.verify_access(&bob.access_token).is_some());
+        assert!(store.refresh(&bob.refresh_token).is_some());
     }
 
     #[test]

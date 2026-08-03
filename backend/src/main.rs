@@ -9,6 +9,7 @@
 //! Point the frontend at it with `VITE_API_BASE_URL=http://127.0.0.1:8080`.
 
 mod agent;
+mod api_error;
 mod auth;
 mod config;
 mod llm_config;

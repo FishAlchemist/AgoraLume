@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::api_error::ApiError;
 use crate::auth::Subject;
 use crate::state::AppState;
 
@@ -27,6 +28,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(login))
         .routes(routes!(refresh))
+        .routes(routes!(logout))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -56,19 +58,21 @@ struct TokenPair {
 /// Logs in as the admin (username `"admin"`) or a regular account (its own
 /// stored username). An account with no fixed password yet accepts this
 /// boot's generated one instead — see the server log at startup.
-#[utoipa::path(post, path = "/auth/login", tag = "auth",
+#[utoipa::path(post, path = "/auth/login", tag = "auth", security(()),
     request_body = LoginRequest,
     responses(
-        (status = 200, body = TokenPair),
-        (status = 401, description = "Unknown username or wrong password", body = String),
-    ))]
+        (status = 200, description = "A fresh token pair and the session's role", body = TokenPair),
+        (status = 401, description = "Unknown username or wrong password (not distinguished)")))]
 async fn login(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LoginRequest>,
-) -> Result<Json<TokenPair>, (StatusCode, String)> {
-    let (issued, subject) = state
-        .login(&body.username, &body.password)
-        .ok_or((StatusCode::UNAUTHORIZED, "invalid username or password".to_string()))?;
+) -> Result<Json<TokenPair>, ApiError> {
+    // One message for both "no such username" and "wrong password": saying
+    // which would confirm whether an account exists. The timing is equalized
+    // too — see `DUMMY_PASSWORD_HASH`.
+    let (issued, subject) = state.login(&body.username, &body.password).ok_or_else(|| {
+        ApiError::unauthorized("invalid-credentials", "invalid username or password", "Bearer")
+    })?;
     let role = match subject {
         Subject::Admin => "admin",
         Subject::Account(_) => "account",
@@ -95,18 +99,58 @@ struct AccessToken {
 /// Mints a fresh access token from a still-valid refresh token, without
 /// asking for the password again. The refresh token itself is not rotated —
 /// it keeps working until its own (much longer) expiry.
-#[utoipa::path(post, path = "/auth/refresh", tag = "auth",
+#[utoipa::path(post, path = "/auth/refresh", tag = "auth", security(()),
     request_body = RefreshRequest,
     responses(
-        (status = 200, body = AccessToken),
-        (status = 401, description = "Unknown, expired, or not actually a refresh token", body = String),
-    ))]
+        (status = 200, description = "A fresh access token; the refresh token is unchanged", body = AccessToken),
+        (status = 401, description = "Unknown, expired, revoked, or not a refresh token")))]
 async fn refresh(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RefreshRequest>,
-) -> Result<Json<AccessToken>, (StatusCode, String)> {
-    let access_token = state
-        .refresh_access_token(&body.refresh_token)
-        .ok_or((StatusCode::UNAUTHORIZED, "invalid or expired refresh token".to_string()))?;
+) -> Result<Json<AccessToken>, ApiError> {
+    let access_token = state.refresh_access_token(&body.refresh_token).ok_or_else(|| {
+        ApiError::unauthorized(
+            "invalid-token",
+            "invalid or expired refresh token",
+            "Bearer error=\"invalid_token\"",
+        )
+    })?;
     Ok(Json(AccessToken { access_token }))
+}
+
+/// The body of a sign-out request.
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LogoutRequest {
+    /// The session's refresh token, so it dies with the access token. Omitting
+    /// it leaves a token good for another 30 days alive, which is almost never
+    /// what a sign-out means.
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+/// Ends the current session: the presented access token (from the
+/// `Authorization` header) and refresh token stop working immediately.
+//
+// There was no way to do this before — a client could forget its tokens
+// locally, but the server kept honouring them until they expired.
+//
+// Public, deliberately: possessing a token is what entitles you to destroy it,
+// and requiring a *valid* access token would mean an already-expired one
+// stranded its refresh token with no way to retract it. Always answers 204,
+// whether or not the tokens existed, so it can't probe which are live.
+#[utoipa::path(post, path = "/auth/logout", tag = "auth", security(()),
+    request_body = LogoutRequest,
+    responses((status = 204, description = "Signed out (idempotent)")))]
+async fn logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<LogoutRequest>,
+) -> StatusCode {
+    let access_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    state.logout(access_token, body.refresh_token.as_deref());
+    StatusCode::NO_CONTENT
 }

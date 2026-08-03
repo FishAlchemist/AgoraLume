@@ -20,12 +20,11 @@ export interface paths {
      */
     post: operations["create_account"];
   };
-  "/v1beta/accounts/{account_id}": {
+  "/v1beta/accounts/{accountId}": {
     /**
-     * Changes an existing account's username, password, or both. Existing
-     * access/refresh tokens for that account keep working across the change —
-     * nothing here revokes them — the same as every other credentials update in
-     * this codebase (there's no token blocklist yet).
+     * Changes an existing account's username, password, or both. Every live
+     * session for that account is revoked: its tokens stop working immediately and
+     * the holder must sign in again.
      */
     patch: operations["update_account"];
   };
@@ -37,6 +36,13 @@ export interface paths {
      */
     post: operations["login"];
   };
+  "/v1beta/auth/logout": {
+    /**
+     * Ends the current session: the presented access token (from the
+     * `Authorization` header) and refresh token stop working immediately.
+     */
+    post: operations["logout"];
+  };
   "/v1beta/auth/refresh": {
     /**
      * Mints a fresh access token from a still-valid refresh token, without
@@ -45,216 +51,152 @@ export interface paths {
      */
     post: operations["refresh"];
   };
-  "/v1beta/debug/usage": {
-    /**
-     * Cumulative LLM usage — the global "total usage" readout: request count,
-     * token breakdown, cache-hit ratio, the running estimated cost (always an
-     * estimate, for reference only), and the same totals broken down by model.
-     * When persistence is on, this survives a server restart; the cost is accrued
-     * one trace at a time at whatever rate was configured when each trace was
-     * recorded, so a later change to the configured rates never reprices history.
-     */
-    get: operations["debug_usage"];
-  };
-  "/v1beta/debug/usage/by-persona": {
-    /**
-     * Usage broken down by persona, site-wide — the global analogue of
-     * [`group_debug_usage_by_persona`], for spotting which character is
-     * expensive across every group rather than within one chat. Covers every AI
-     * persona in the workspace plus the synthetic "system" bucket (context
-     * compression, chat suggestions); sorted by total tokens descending. No
-     * group to miss, so unlike the per-group endpoints there's no 404 case.
-     */
-    get: operations["global_debug_usage_by_persona"];
-  };
   "/v1beta/departments": {
+    /** Every department in the workspace, across all organizations. */
     get: operations["list_depts"];
+    /** Creates a department. */
     post: operations["create_dept"];
   };
-  "/v1beta/departments/{id}": {
+  "/v1beta/departments/{departmentId}": {
+    /** One department by id. */
     get: operations["get_dept"];
+    /** Deletes a department. */
     delete: operations["delete_dept"];
+    /** Merges a partial update onto a department. */
     patch: operations["update_dept"];
   };
   "/v1beta/groups": {
+    /** Every chat group in the workspace. */
     get: operations["list_groups"];
+    /** Creates a group. */
     post: operations["create_group"];
   };
-  "/v1beta/groups/{id}": {
+  "/v1beta/groups/{groupId}": {
+    /** One group by id. */
     get: operations["get_group"];
+    /** Deletes a group. */
     delete: operations["delete_group"];
+    /** Merges a partial update onto a group. */
     patch: operations["update_group"];
   };
-  "/v1beta/groups/{id}/debug/traces": {
+  "/v1beta/groups/{groupId}/events": {
     /**
-     * Recent agent traces for a group — the exact prompt each character received
-     * and what it decided — for hydrating the debug panel. Live updates then arrive
-     * as `debug` SSE frames on the group stream.
-     */
-    get: operations["debug_traces"];
-  };
-  "/v1beta/groups/{id}/debug/usage": {
-    /**
-     * One group's own cumulative LLM usage — independent of every other group's,
-     * unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
-     * every group's usage (plus any spend from groups since deleted); this is one
-     * group's own slice of it. 404s for an unknown group, matching every other
-     * `/groups/{id}/...` handler — [`group_debug_usage_by_persona`] needs the
-     * workspace to know the group's current members, so the two must agree on
-     * what "unknown group" means rather than one 200-with-zeros and the other
-     * silently returning nothing.
-     */
-    get: operations["group_debug_usage"];
-  };
-  "/v1beta/groups/{id}/debug/usage/by-persona": {
-    /**
-     * A group's usage broken down by persona — which character is driving the
-     * spend, within that group's own total from [`group_debug_usage`]. Covers
-     * the group's current AI members; sorted by total tokens descending, like
-     * the per-model breakdown inside each [`DebugUsage`].
-     */
-    get: operations["group_debug_usage_by_persona"];
-  };
-  "/v1beta/groups/{id}/events": {
-    /**
-     * Posts an environment event into a group — rain, time passing, an emergency —
-     * letting the world outside the chat influence the agents. Accepted and queued
-     * for the group's coordinator; its effect (reactions, moods) arrives on the
-     * group's SSE stream.
+     * Posts an environment event — rain, time passing, an emergency — letting the
+     * world outside the chat influence the agents. Its effect arrives on the SSE
+     * stream.
      */
     post: operations["post_event"];
   };
-  "/v1beta/groups/{id}/messages": {
+  "/v1beta/groups/{groupId}/messages": {
     /**
-     * A contiguous window of a group's message history, oldest first. One shape drives
-     * every navigation: the initial open (`before` + `since`), paging earlier
-     * (`anchor` + `before`), paging later (`anchor` + `after`), and jumping to an
-     * arbitrary line (`anchor` + `before` + `after`). With no query it returns the
-     * whole log.
+     * A contiguous window of message history, oldest first. Max 500 lines (160
+     * without an `anchor`).
      */
     get: operations["list_messages"];
     /**
-     * Posts a user message and kicks off the agents' turn. The returned line is the
-     * stored user message; AI replies, moods, and read receipts arrive on the
-     * group's SSE stream.
+     * Posts a user message and starts the agents' turn. Replies, moods, and read
+     * receipts arrive on the SSE stream.
      */
     post: operations["send_message"];
   };
-  "/v1beta/groups/{id}/retry": {
+  "/v1beta/groups/{groupId}/retry": {
     /**
-     * Resumes a turn that was suspended by a failed agent inference: the agents who
-     * have not yet read the pending message respond to the current chat. A no-op if
-     * nothing is suspended (e.g. the pending turn was already voided by a newer
-     * message). Its effect arrives on the group's SSE stream.
+     * Resumes a turn suspended by a failed agent inference. A no-op if nothing is
+     * suspended. Its effect arrives on the SSE stream.
      */
     post: operations["retry_turn"];
   };
-  "/v1beta/groups/{id}/stream": {
+  "/v1beta/groups/{groupId}/stream": {
     /**
-     * Server-Sent Events for a group: default `message` events (AI replies and
-     * moods), named `read` events (read receipts), named `activity` events (the
-     * agent loop turning busy/idle), and named `turn` events (the current
-     * processing round's per-member progress, seeded on connect).
+     * Server-Sent Events for a group.
+     * @description Frames: unnamed = `Message`; `read` = `ReadReceipt`; `activity` =
+     * `{ "active": bool }`; `turn` = `Turn`; `debug` = `AgentTrace`;
+     * `suggestions` = `GroupSuggestions`. `activity` and `turn` are seeded on connect.
      */
     get: operations["stream"];
   };
-  "/v1beta/groups/{id}/suggestions": {
+  "/v1beta/groups/{groupId}/suggestions": {
     /**
-     * Cached conversation-starter suggestions for a group. Returned immediately from
-     * the server-side cache; if they're stale (the conversation moved on, or the
-     * part of day changed) a fresh generation is kicked off in the background and
-     * arrives on the group's `suggestions` SSE frame. The frontend only fetches and
-     * displays — it never generates. Empty (`generatedAt == 0`) before the first
-     * generation completes.
+     * Cached conversation-starter suggestions, served from the server-side cache.
+     * Empty (`generatedAt == 0`) until the first generation completes.
      */
     get: operations["get_suggestions"];
-  };
-  "/v1beta/groups/{id}/suggestions/regenerate": {
     /**
-     * Forces a fresh suggestion generation for a group (the composer's "give me
-     * other ideas" action). Accepted and generated in the background; the result
-     * arrives on the group's `suggestions` SSE frame. Rate-limited server-side: a
-     * call inside the cooldown window, or while a generation is already running, is
-     * quietly ignored — so the button can't be used to hammer the model.
+     * Creates a fresh set of suggestions (the composer's "give me other ideas").
+     * Generated in the background; the result arrives on the `suggestions` SSE
+     * frame. Rate-limited server-side — repeated calls coalesce.
      */
     post: operations["regenerate_suggestions"];
   };
+  "/v1beta/groups/{groupId}/traces": {
+    /**
+     * Recent agent traces: the prompt each character received and what it decided.
+     * Live updates arrive as `debug` SSE frames.
+     */
+    get: operations["list_traces"];
+  };
   "/v1beta/health": {
-    /** Liveness probe — cheap "is the server up" check. */
+    /** Liveness probe, for an orchestrator rather than the app. */
     get: operations["health"];
   };
   "/v1beta/llm/models": {
     /**
-     * Lists the models a provider endpoint offers, so the Settings page can offer
-     * a picker instead of a blind text field. `apiKey` is optional: when omitted,
-     * the stored key is used, but *only* when `baseUrl` names the same endpoint
-     * already configured — otherwise the request must carry its own key. Without
-     * that check, an operator (or anything else that can reach this API) could
-     * point `baseUrl` at an arbitrary third-party URL and have the server hand it
-     * the real provider key in an outbound `Authorization` header. Admin-only
-     * (see [`CurrentAdmin`]) — it exists only to serve the edit workflow above,
-     * and it can spend the stored key on an outbound request, which a read-only
-     * account has no reason to trigger.
+     * Lists the models a provider endpoint offers, so the model field can be a
+     * picker. Admin-only. `apiKey` is required unless `baseUrl` matches the
+     * already-configured endpoint.
      */
     post: operations["list_llm_models"];
   };
   "/v1beta/llm/settings": {
     /**
-     * The live LLM provider configuration. `apiKey` is never included — only
-     * `hasApiKey`, whether one is currently stored. Requires an authenticated
-     * caller (see [`AuthenticatedSubject`]) — admin or a regular account, either
-     * is fine to *read* this shared, operator-level config. `canEdit` in the
-     * response tells the caller whether *writing* it (below) is open to them —
-     * today that's exactly "is this an admin token", but computed here from the
-     * resolved `Subject` rather than hard-coded on the frontend, so a future
-     * change to who's allowed to write only has to change this one line.
+     * The live LLM provider configuration. Any signed-in caller may read it;
+     * `canEdit` says whether this caller may write it.
      */
     get: operations["get_llm_settings"];
     /**
      * Merges a partial update onto the LLM provider configuration and applies it
-     * immediately — no restart needed. The candidate configuration is validated
-     * (the brain it describes must actually build) before anything is swapped in
-     * or written to `llm.toml`; an invalid patch is rejected with 422 and changes
-     * nothing. Admin-only (see [`CurrentAdmin`]) — a regular account can read
-     * this config through `GET /llm/settings` but not change shared, operator-
-     * level server config or its real-model spend.
+     * immediately. Admin-only.
      */
     patch: operations["update_llm_settings"];
   };
   "/v1beta/meta": {
-    /**
-     * The server's mode, so the client can distinguish a mock build (no LLM,
-     * in-memory) from a production one — separately from mere reachability.
-     */
+    /** The server's mode: mock build (no LLM, in-memory) vs. production. */
     get: operations["meta"];
   };
   "/v1beta/organizations": {
+    /** Every organization in the workspace. */
     get: operations["list_orgs"];
+    /** Creates an organization. */
     post: operations["create_org"];
   };
-  "/v1beta/organizations/{id}": {
+  "/v1beta/organizations/{organizationId}": {
+    /** One organization by id. */
     get: operations["get_org"];
+    /** Deletes an organization, cascading to its departments. */
     delete: operations["delete_org"];
+    /** Merges a partial update onto an organization. */
     patch: operations["update_org"];
   };
   "/v1beta/personas": {
+    /** Every persona in the workspace — the one user identity and every AI agent. */
     get: operations["list_personas"];
     /**
-     * Creates a persona. Rejects (409) a duplicate name (names are globally unique)
-     * or a second user identity (there is only ever one "you").
+     * Creates a persona. Names are globally unique, and there is only ever one
+     * user identity ("you"), so either collision is refused with 409.
      */
     post: operations["create_persona"];
   };
-  "/v1beta/personas/{id}": {
+  "/v1beta/personas/{personaId}": {
+    /** One persona by id. */
     get: operations["get_persona"];
     /**
-     * Deletes a persona. Refuses (409) to remove the last remaining user identity,
-     * since every group still needs a "you".
+     * Deletes a persona. The last remaining user identity can't go — every group
+     * still needs a "you".
      */
     delete: operations["delete_persona"];
     /**
-     * Updates a persona. 404 for an unknown id; 409 for a duplicate name or a change
-     * that would produce a second user identity.
+     * Merges a partial update onto a persona. `promptHash` is recomputed from the
+     * resulting prompt; any value sent for it is ignored.
      */
     patch: operations["update_persona"];
   };
@@ -264,19 +206,18 @@ export interface paths {
      * newest first. The memory-management UI groups the result by `promptHash`/label.
      */
     get: operations["list_memories"];
-    /**
-     * Writes a memory for a persona, tagged with its current identity hash. 404 for
-     * an unknown persona; 409 when the persona has no prompt to scope a memory to,
-     * or the content is blank.
-     */
+    /** Writes a memory for a persona, tagged with its current identity hash. */
     post: operations["create_memory"];
   };
   "/v1beta/personas/{personaId}/memories/{memoryId}": {
-    /**
-     * Deletes one of a persona's memories. 404 when no such memory belongs to that
-     * persona.
-     */
+    /** Deletes one of a persona's memories. */
     delete: operations["delete_memory"];
+  };
+  "/v1beta/preferences": {
+    /** The signed-in account's own display preferences. */
+    get: operations["get_preferences"];
+    /** Merges a partial update onto the account's preferences. */
+    patch: operations["update_preferences"];
   };
   "/v1beta/prompt-labels": {
     /**
@@ -285,16 +226,26 @@ export interface paths {
      */
     get: operations["list_prompt_labels"];
   };
-  "/v1beta/prompt-labels/{hash}": {
+  "/v1beta/prompt-labels/{promptHash}": {
     /**
      * Names an identity hash, or clears its name when the label is blank. Idempotent
      * (PUT), keyed by the full hash the client already holds from the persona.
      */
     put: operations["set_prompt_label"];
   };
-  "/v1beta/settings": {
-    get: operations["get_settings"];
-    patch: operations["update_settings"];
+  "/v1beta/usage": {
+    /**
+     * Cumulative LLM usage: requests, tokens, cache-hit ratio, estimated cost, and
+     * the same totals per model. Cost is always an estimate.
+     */
+    get: operations["usage"];
+  };
+  "/v1beta/usage/by-persona": {
+    /**
+     * The same usage broken down by persona, highest total tokens first. Unscoped,
+     * it also includes the synthetic `system` bucket (compression, suggestions).
+     */
+    get: operations["usage_by_persona"];
   };
 }
 
@@ -349,6 +300,40 @@ export interface components {
       usage?: null | components["schemas"]["TokenUsage"];
     };
     /**
+     * @description An RFC 9457 problem document — the body of every 4xx this API produces.
+     *
+     * Constructed through the named helpers below rather than field-by-field, so
+     * the slug used for a given status is decided in exactly one place and can't
+     * drift between handlers.
+     */
+    ApiError: {
+      /**
+       * @description The human-readable explanation of *this specific* occurrence — the
+       * sentence that used to be the entire `text/plain` body. Safe to show a
+       * user; never carries a secret, a stack trace, or a provider's raw
+       * response.
+       */
+      detail?: string | null;
+      /**
+       * Format: int32
+       * @description The HTTP status code, repeated in the body so a problem document stays
+       * meaningful when it's logged or forwarded away from its response.
+       */
+      status: number;
+      /**
+       * @description The status code's canonical reason phrase (e.g. `Forbidden`) — a short
+       * human summary of the problem *type*, not of this occurrence.
+       */
+      title: string;
+      /**
+       * @description Stable, machine-readable identifier for *what* went wrong, e.g.
+       * `urn:agoralume:error:not-admin`. Match on this rather than on `detail`,
+       * whose wording is free to change. Always present.
+       * @example urn:agoralume:error:not-found
+       */
+      type: string;
+    };
+    /**
      * @description An estimated cost breakdown for the accumulated usage. Always an estimate:
      * rates are operator-supplied and providers/models differ, so the UI labels it
      * "for reference only".
@@ -389,7 +374,7 @@ export interface components {
     /**
      * @description Cumulative LLM usage across the whole server (since first run, when
      * persisted; since startup otherwise) — the global "total usage" view.
-     * `GET /debug/usage`.
+     * `GET /usage`.
      */
     DebugUsage: {
       /**
@@ -432,13 +417,24 @@ export interface components {
         [key: string]: string;
       } | null;
     };
+    /** @description A partial Department: only the properties present are merged. `id` is ignored. */
+    DepartmentPatch: {
+      blurb?: string | null;
+      color?: string | null;
+      id?: string;
+      name?: string;
+      organizationId?: string;
+      variables?: {
+        [key: string]: string;
+      } | null;
+    };
     /** @description The body of an environment-event request. */
     EventBody: {
-      /** @description A short description of what changed, e.g. "It starts to rain." */
+      /** @description What changed, e.g. "It starts to rain." */
       description: string;
       /**
-       * @description Urgent events preempt the current turn (discarding the in-flight agent);
-       * ordinary ones fold into the context at the next agent boundary.
+       * @description Urgent events preempt the current turn; ordinary ones fold into the
+       * context at the next agent boundary.
        */
       urgent?: boolean;
     };
@@ -451,6 +447,13 @@ export interface components {
       name: string;
       personaIds: string[];
       selfPersonaId: string;
+    };
+    /** @description A partial Group: only the properties present are merged. `id` is ignored. */
+    GroupPatch: {
+      id?: string;
+      name?: string;
+      personaIds?: string[];
+      selfPersonaId?: string;
     };
     /**
      * @description Conversation-starter suggestions for a group: a few short first-person
@@ -587,6 +590,15 @@ export interface components {
       /** @description The fixed admin login name, or a regular account's own username. */
       username: string;
     };
+    /** @description The body of a sign-out request. */
+    LogoutRequest: {
+      /**
+       * @description The session's refresh token, so it dies with the access token. Omitting
+       * it leaves a token good for another 30 days alive, which is almost never
+       * what a sign-out means.
+       */
+      refreshToken?: string | null;
+    };
     /**
      * @description One persona-scoped memory: a fact a character chose to remember. Tagged with
      * the persona identity hash ([`Persona::prompt_hash`]) that was in force when it
@@ -692,6 +704,16 @@ export interface components {
         [key: string]: string;
       } | null;
     };
+    /** @description A partial Organization: only the properties present are merged. `id` is ignored. */
+    OrganizationPatch: {
+      blurb?: string | null;
+      color?: string | null;
+      id?: string;
+      name?: string;
+      variables?: {
+        [key: string]: string;
+      } | null;
+    };
     /**
      * @description A user identity or an AI agent. AI personas carry the system prompt and
      * variables the model needs; user personas are just a "you" to speak as.
@@ -725,11 +747,36 @@ export interface components {
      * @enum {string}
      */
     PersonaKind: "user" | "ai";
+    /** @description A partial Persona: only the properties present are merged. `id` is ignored. */
+    PersonaPatch: {
+      avatarUrl?: string | null;
+      blurb?: string | null;
+      color?: string;
+      departmentId?: string | null;
+      emoji?: string | null;
+      gradient?: string | null;
+      id?: string;
+      kind?: components["schemas"]["PersonaKind"];
+      name?: string;
+      organizationId?: string | null;
+      /**
+       * @description Content hash of the raw `system_prompt` template — the persona's identity
+       * "version". Server-computed and effectively read-only on the wire: it is
+       * recomputed on every create/update (and on load) and any value a client
+       * sends is ignored. `None` when there is no prompt (user identities). Full
+       * lowercase-hex SHA-256; the UI shows a truncated prefix. See [`prompt_hash`].
+       */
+      promptHash?: string | null;
+      systemPrompt?: string | null;
+      variables?: {
+        [key: string]: string;
+      } | null;
+    };
     /**
      * @description One persona's own slice of a usage total — a further breakdown by which
      * character is driving the spend. Serves both `GET
-     * /groups/{id}/debug/usage/by-persona` (one group's [`DebugUsage`]) and the
-     * site-wide `GET /debug/usage/by-persona` (summed across every group).
+     * /usage/by-persona?groupId=…` (one group's [`DebugUsage`]) and the
+     * site-wide `GET /usage/by-persona` (summed across every group).
      */
     PersonaUsage: {
       personaId: string;
@@ -792,8 +839,8 @@ export interface components {
     /** @description The body of a send request. */
     SendBody: {
       /**
-       * @description The "you" identity to author the message as. When omitted, the group's
-       * stored `selfPersonaId` is used.
+       * @description Which user identity to author as; must be a `user` persona, not an AI
+       * one. Omitted, the group's `selfPersonaId` is used.
        */
       personaId?: string | null;
       /** @description The message text. */
@@ -831,6 +878,13 @@ export interface components {
       chatFontSize: number;
       nativeLanguage: string;
       uiLanguage: string;
+    };
+    /** @description A partial Settings: only the properties present are merged. `id` is ignored. */
+    SettingsPatch: {
+      /** Format: int32 */
+      chatFontSize?: number;
+      nativeLanguage?: string;
+      uiLanguage?: string;
     };
     TokenPair: {
       /** @description Short-lived; sent as `Authorization: Bearer <token>` on every request. */
@@ -965,15 +1019,22 @@ export interface operations {
   /** Every existing account, for the admin dashboard's account list. */
   list_accounts: {
     responses: {
+      /** @description Every account's id and login name; never a password */
       200: {
         content: {
           "application/json": components["schemas"]["AccountSummary"][];
         };
       };
-      /** @description Missing/invalid token, or a valid token that isn't the admin role */
+      /** @description Not signed in */
       401: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
@@ -990,36 +1051,42 @@ export interface operations {
       };
     };
     responses: {
-      200: {
+      /** @description The created account */
+      201: {
         content: {
           "application/json": components["schemas"]["AccountSummary"];
         };
       };
-      /** @description Missing/invalid token, or a valid token that isn't the admin role */
+      /** @description Not signed in */
       401: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
-      /** @description empty username/password, a reserved or already-taken username, or no persistent data directory configured */
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Empty/reserved/taken username, empty password, or no persistent backend */
       422: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
   };
   /**
-   * Changes an existing account's username, password, or both. Existing
-   * access/refresh tokens for that account keep working across the change —
-   * nothing here revokes them — the same as every other credentials update in
-   * this codebase (there's no token blocklist yet).
+   * Changes an existing account's username, password, or both. Every live
+   * session for that account is revoked: its tokens stop working immediately and
+   * the holder must sign in again.
    */
   update_account: {
     parameters: {
       path: {
         /** @description The account to edit */
-        account_id: string;
+        accountId: string;
       };
     };
     requestBody: {
@@ -1028,21 +1095,28 @@ export interface operations {
       };
     };
     responses: {
+      /** @description The updated account; its sessions are revoked */
       200: {
         content: {
           "application/json": components["schemas"]["AccountSummary"];
         };
       };
-      /** @description Missing/invalid token, or a valid token that isn't the admin role */
+      /** @description Not signed in */
       401: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
-      /** @description unknown account_id, empty/reserved/already-taken username, empty password, or no persistent data directory configured */
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown id, empty/reserved/taken username, empty password, or no persistent backend */
       422: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
@@ -1059,16 +1133,34 @@ export interface operations {
       };
     };
     responses: {
+      /** @description A fresh token pair and the session's role */
       200: {
         content: {
           "application/json": components["schemas"]["TokenPair"];
         };
       };
-      /** @description Unknown username or wrong password */
+      /** @description Unknown username or wrong password (not distinguished) */
       401: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
+      };
+    };
+  };
+  /**
+   * Ends the current session: the presented access token (from the
+   * `Authorization` header) and refresh token stop working immediately.
+   */
+  logout: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["LogoutRequest"];
+      };
+    };
+    responses: {
+      /** @description Signed out (idempotent) */
+      204: {
+        content: never;
       };
     };
   };
@@ -1084,64 +1176,44 @@ export interface operations {
       };
     };
     responses: {
+      /** @description A fresh access token; the refresh token is unchanged */
       200: {
         content: {
           "application/json": components["schemas"]["AccessToken"];
         };
       };
-      /** @description Unknown, expired, or not actually a refresh token */
+      /** @description Unknown, expired, revoked, or not a refresh token */
       401: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
   };
-  /**
-   * Cumulative LLM usage — the global "total usage" readout: request count,
-   * token breakdown, cache-hit ratio, the running estimated cost (always an
-   * estimate, for reference only), and the same totals broken down by model.
-   * When persistence is on, this survives a server restart; the cost is accrued
-   * one trace at a time at whatever rate was configured when each trace was
-   * recorded, so a later change to the configured rates never reprices history.
-   */
-  debug_usage: {
-    responses: {
-      /** @description Cumulative LLM usage */
-      200: {
-        content: {
-          "application/json": components["schemas"]["DebugUsage"];
-        };
-      };
-    };
-  };
-  /**
-   * Usage broken down by persona, site-wide — the global analogue of
-   * [`group_debug_usage_by_persona`], for spotting which character is
-   * expensive across every group rather than within one chat. Covers every AI
-   * persona in the workspace plus the synthetic "system" bucket (context
-   * compression, chat suggestions); sorted by total tokens descending. No
-   * group to miss, so unlike the per-group endpoints there's no 404 case.
-   */
-  global_debug_usage_by_persona: {
-    responses: {
-      /** @description Every AI persona's usage, summed across every group */
-      200: {
-        content: {
-          "application/json": components["schemas"]["PersonaUsage"][];
-        };
-      };
-    };
-  };
+  /** Every department in the workspace, across all organizations. */
   list_depts: {
     responses: {
+      /** @description Every department, across all organizations */
       200: {
         content: {
           "application/json": components["schemas"]["Department"][];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
     };
   };
+  /** Creates a department. */
   create_dept: {
     requestBody: {
       content: {
@@ -1149,76 +1221,164 @@ export interface operations {
       };
     };
     responses: {
+      /** @description The created department */
       201: {
         content: {
           "application/json": components["schemas"]["Department"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
     };
   };
+  /** One department by id. */
   get_dept: {
     parameters: {
       path: {
-        id: string;
+        /** @description The department to read */
+        departmentId: string;
       };
     };
     responses: {
+      /** @description The department */
       200: {
         content: {
           "application/json": components["schemas"]["Department"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown department */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** Deletes a department. */
   delete_dept: {
     parameters: {
       path: {
-        id: string;
+        /** @description The department to delete */
+        departmentId: string;
       };
     };
     responses: {
+      /** @description Deleted */
       204: {
         content: never;
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown department */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** Merges a partial update onto a department. */
   update_dept: {
     parameters: {
       path: {
-        id: string;
+        /** @description The department to update */
+        departmentId: string;
       };
     };
     requestBody: {
       content: {
-        "application/json": components["schemas"]["Department"];
+        "application/json": components["schemas"]["DepartmentPatch"];
       };
     };
     responses: {
+      /** @description The updated department */
       200: {
         content: {
           "application/json": components["schemas"]["Department"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown department */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Malformed patch */
+      422: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** Every chat group in the workspace. */
   list_groups: {
     responses: {
+      /** @description Every group */
       200: {
         content: {
           "application/json": components["schemas"]["Group"][];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
     };
   };
+  /** Creates a group. */
   create_group: {
     requestBody: {
       content: {
@@ -1226,155 +1386,150 @@ export interface operations {
       };
     };
     responses: {
+      /** @description The created group */
       201: {
         content: {
           "application/json": components["schemas"]["Group"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
     };
   };
+  /** One group by id. */
   get_group: {
     parameters: {
       path: {
-        id: string;
+        /** @description The group to read */
+        groupId: string;
       };
     };
     responses: {
+      /** @description The group */
       200: {
         content: {
           "application/json": components["schemas"]["Group"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown group */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** Deletes a group. */
   delete_group: {
     parameters: {
       path: {
-        id: string;
+        /** @description The group to delete */
+        groupId: string;
       };
     };
     responses: {
+      /** @description Deleted */
       204: {
         content: never;
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown group */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** Merges a partial update onto a group. */
   update_group: {
     parameters: {
       path: {
-        id: string;
+        /** @description The group to update */
+        groupId: string;
       };
     };
     requestBody: {
       content: {
-        "application/json": components["schemas"]["Group"];
+        "application/json": components["schemas"]["GroupPatch"];
       };
     };
     responses: {
+      /** @description The updated group */
       200: {
         content: {
           "application/json": components["schemas"]["Group"];
         };
       };
-      404: {
-        content: never;
-      };
-    };
-  };
-  /**
-   * Recent agent traces for a group — the exact prompt each character received
-   * and what it decided — for hydrating the debug panel. Live updates then arrive
-   * as `debug` SSE frames on the group stream.
-   */
-  debug_traces: {
-    parameters: {
-      path: {
-        /** @description Group id */
-        id: string;
-      };
-    };
-    responses: {
-      /** @description Recent agent traces, oldest first */
-      200: {
+      /** @description Not signed in */
+      401: {
         content: {
-          "application/json": components["schemas"]["AgentTrace"][];
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
-    };
-  };
-  /**
-   * One group's own cumulative LLM usage — independent of every other group's,
-   * unlike [`debug_usage`]. The site-wide total shown in Settings is the sum of
-   * every group's usage (plus any spend from groups since deleted); this is one
-   * group's own slice of it. 404s for an unknown group, matching every other
-   * `/groups/{id}/...` handler — [`group_debug_usage_by_persona`] needs the
-   * workspace to know the group's current members, so the two must agree on
-   * what "unknown group" means rather than one 200-with-zeros and the other
-   * silently returning nothing.
-   */
-  group_debug_usage: {
-    parameters: {
-      path: {
-        /** @description Group id */
-        id: string;
-      };
-    };
-    responses: {
-      /** @description One group's own cumulative LLM usage */
-      200: {
+      /** @description Not permitted for this identity */
+      403: {
         content: {
-          "application/json": components["schemas"]["DebugUsage"];
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
       /** @description Unknown group */
       404: {
-        content: never;
-      };
-    };
-  };
-  /**
-   * A group's usage broken down by persona — which character is driving the
-   * spend, within that group's own total from [`group_debug_usage`]. Covers
-   * the group's current AI members; sorted by total tokens descending, like
-   * the per-model breakdown inside each [`DebugUsage`].
-   */
-  group_debug_usage_by_persona: {
-    parameters: {
-      path: {
-        /** @description Group id */
-        id: string;
-      };
-    };
-    responses: {
-      /** @description That group's usage, one entry per current AI member */
-      200: {
         content: {
-          "application/json": components["schemas"]["PersonaUsage"][];
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
-      /** @description Unknown group */
-      404: {
-        content: never;
+      /** @description Malformed patch */
+      422: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
   /**
-   * Posts an environment event into a group — rain, time passing, an emergency —
-   * letting the world outside the chat influence the agents. Accepted and queued
-   * for the group's coordinator; its effect (reactions, moods) arrives on the
-   * group's SSE stream.
+   * Posts an environment event — rain, time passing, an emergency — letting the
+   * world outside the chat influence the agents. Its effect arrives on the SSE
+   * stream.
    */
   post_event: {
     parameters: {
       path: {
-        /** @description Group id */
-        id: string;
+        /** @description The group to post the event into */
+        groupId: string;
       };
     };
     requestBody: {
@@ -1383,66 +1538,90 @@ export interface operations {
       };
     };
     responses: {
-      /** @description Event accepted */
+      /** @description Queued */
       202: {
         content: never;
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Unknown group */
       404: {
-        content: never;
-      };
-    };
-  };
-  /**
-   * A contiguous window of a group's message history, oldest first. One shape drives
-   * every navigation: the initial open (`before` + `since`), paging earlier
-   * (`anchor` + `before`), paging later (`anchor` + `after`), and jumping to an
-   * arbitrary line (`anchor` + `before` + `after`). With no query it returns the
-   * whole log.
-   */
-  list_messages: {
-    parameters: {
-      query?: {
-        /**
-         * @description The line to build the window around (its id). Omitted, the window ends at
-         * the newest line — the initial open and "jump to latest".
-         */
-        anchor?: string | null;
-        /** @description How many lines before the anchor (or before the tail) to include. */
-        before?: number | null;
-        /** @description How many lines after the anchor to include. Ignored without an `anchor`. */
-        after?: number | null;
-        /**
-         * @description The client's read mark (epoch millis), for the initial open only (no
-         * `anchor`): the window is extended back to cover every line newer than this,
-         * so the whole unread run loads and its divider stays exact.
-         */
-        since?: number | null;
-      };
-      path: {
-        /** @description Group id */
-        id: string;
-      };
-    };
-    responses: {
-      /** @description Message history window, oldest first */
-      200: {
         content: {
-          "application/json": components["schemas"]["Message"][];
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Blank or over-long description */
+      422: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
   };
   /**
-   * Posts a user message and kicks off the agents' turn. The returned line is the
-   * stored user message; AI replies, moods, and read receipts arrive on the
-   * group's SSE stream.
+   * A contiguous window of message history, oldest first. Max 500 lines (160
+   * without an `anchor`).
+   */
+  list_messages: {
+    parameters: {
+      query?: {
+        /** @description Line id to centre the window on. Omitted, the window ends at the newest line. */
+        anchor?: string | null;
+        /** @description Lines before the anchor (or before the tail). Clamped to 500. */
+        before?: number | null;
+        /** @description Lines after the anchor. Ignored without an `anchor`. Clamped to 500. */
+        after?: number | null;
+        /**
+         * @description Read mark (epoch ms). Without an `anchor`, widens the window back to cover
+         * every unread line.
+         */
+        since?: number | null;
+      };
+      path: {
+        /** @description The group whose history to read */
+        groupId: string;
+      };
+    };
+    responses: {
+      /** @description The window, oldest first; empty for an unknown group */
+      200: {
+        content: {
+          "application/json": components["schemas"]["Message"][];
+        };
+      };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  /**
+   * Posts a user message and starts the agents' turn. Replies, moods, and read
+   * receipts arrive on the SSE stream.
    */
   send_message: {
     parameters: {
       path: {
-        /** @description Group id */
-        id: string;
+        /** @description The group to post into */
+        groupId: string;
       };
     };
     requestBody: {
@@ -1451,119 +1630,225 @@ export interface operations {
       };
     };
     responses: {
-      /** @description The stored user message */
+      /** @description The stored message */
       200: {
         content: {
           "application/json": components["schemas"]["Message"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Unknown group */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Blank or over-long text, or a `personaId` that is not a user identity */
+      422: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
   /**
-   * Resumes a turn that was suspended by a failed agent inference: the agents who
-   * have not yet read the pending message respond to the current chat. A no-op if
-   * nothing is suspended (e.g. the pending turn was already voided by a newer
-   * message). Its effect arrives on the group's SSE stream.
+   * Resumes a turn suspended by a failed agent inference. A no-op if nothing is
+   * suspended. Its effect arrives on the SSE stream.
    */
   retry_turn: {
     parameters: {
       path: {
-        /** @description Group id */
-        id: string;
+        /** @description The group whose suspended turn to resume */
+        groupId: string;
       };
     };
     responses: {
-      /** @description Retry accepted */
+      /** @description Accepted */
       202: {
         content: never;
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Unknown group */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
   /**
-   * Server-Sent Events for a group: default `message` events (AI replies and
-   * moods), named `read` events (read receipts), named `activity` events (the
-   * agent loop turning busy/idle), and named `turn` events (the current
-   * processing round's per-member progress, seeded on connect).
+   * Server-Sent Events for a group.
+   * @description Frames: unnamed = `Message`; `read` = `ReadReceipt`; `activity` =
+   * `{ "active": bool }`; `turn` = `Turn`; `debug` = `AgentTrace`;
+   * `suggestions` = `GroupSuggestions`. `activity` and `turn` are seeded on connect.
    */
   stream: {
     parameters: {
       path: {
-        /** @description Group id */
-        id: string;
+        /** @description The group to stream */
+        groupId: string;
       };
     };
     responses: {
-      /** @description text/event-stream: `message` frames carry a Message, `read` frames carry a ReadReceipt, `activity` frames carry `{ active: bool }`, `turn` frames carry a Turn, `debug` frames carry an AgentTrace, `suggestions` frames carry a GroupSuggestions */
+      /** @description An open event stream */
       200: {
-        content: never;
+        content: {
+          "text/event-stream": unknown;
+        };
+      };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
   /**
-   * Cached conversation-starter suggestions for a group. Returned immediately from
-   * the server-side cache; if they're stale (the conversation moved on, or the
-   * part of day changed) a fresh generation is kicked off in the background and
-   * arrives on the group's `suggestions` SSE frame. The frontend only fetches and
-   * displays — it never generates. Empty (`generatedAt == 0`) before the first
-   * generation completes.
+   * Cached conversation-starter suggestions, served from the server-side cache.
+   * Empty (`generatedAt == 0`) until the first generation completes.
    */
   get_suggestions: {
     parameters: {
       path: {
-        /** @description Group id */
-        id: string;
+        /** @description The group whose suggestions to read */
+        groupId: string;
       };
     };
     responses: {
-      /** @description The cached suggestions (a background refresh may follow on the stream) */
+      /** @description The cached suggestions; a refresh may follow on the stream */
       200: {
         content: {
           "application/json": components["schemas"]["GroupSuggestions"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Unknown group */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
   /**
-   * Forces a fresh suggestion generation for a group (the composer's "give me
-   * other ideas" action). Accepted and generated in the background; the result
-   * arrives on the group's `suggestions` SSE frame. Rate-limited server-side: a
-   * call inside the cooldown window, or while a generation is already running, is
-   * quietly ignored — so the button can't be used to hammer the model.
+   * Creates a fresh set of suggestions (the composer's "give me other ideas").
+   * Generated in the background; the result arrives on the `suggestions` SSE
+   * frame. Rate-limited server-side — repeated calls coalesce.
    */
   regenerate_suggestions: {
     parameters: {
       path: {
-        /** @description Group id */
-        id: string;
+        /** @description The group to regenerate suggestions for */
+        groupId: string;
       };
     };
     responses: {
-      /** @description Regeneration accepted (or coalesced with a recent one) */
+      /** @description Accepted, or coalesced with a recent one */
       202: {
         content: never;
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Unknown group */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
-  /** Liveness probe — cheap "is the server up" check. */
+  /**
+   * Recent agent traces: the prompt each character received and what it decided.
+   * Live updates arrive as `debug` SSE frames.
+   */
+  list_traces: {
+    parameters: {
+      path: {
+        /** @description The group whose traces to read */
+        groupId: string;
+      };
+    };
+    responses: {
+      /** @description Traces, oldest first */
+      200: {
+        content: {
+          "application/json": components["schemas"]["AgentTrace"][];
+        };
+      };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown group */
+      404: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  /** Liveness probe, for an orchestrator rather than the app. */
   health: {
     responses: {
-      /** @description Service is up */
+      /** @description Up; the body is the literal `ok` */
       200: {
         content: {
           "text/plain": string;
@@ -1572,16 +1857,9 @@ export interface operations {
     };
   };
   /**
-   * Lists the models a provider endpoint offers, so the Settings page can offer
-   * a picker instead of a blind text field. `apiKey` is optional: when omitted,
-   * the stored key is used, but *only* when `baseUrl` names the same endpoint
-   * already configured — otherwise the request must carry its own key. Without
-   * that check, an operator (or anything else that can reach this API) could
-   * point `baseUrl` at an arbitrary third-party URL and have the server hand it
-   * the real provider key in an outbound `Authorization` header. Admin-only
-   * (see [`CurrentAdmin`]) — it exists only to serve the edit workflow above,
-   * and it can spend the stored key on an outbound request, which a read-only
-   * account has no reason to trigger.
+   * Lists the models a provider endpoint offers, so the model field can be a
+   * picker. Admin-only. `apiKey` is required unless `baseUrl` matches the
+   * already-configured endpoint.
    */
   list_llm_models: {
     requestBody: {
@@ -1590,58 +1868,61 @@ export interface operations {
       };
     };
     responses: {
+      /** @description The models that endpoint reports */
       200: {
         content: {
           "application/json": components["schemas"]["LlmModelsView"];
         };
       };
-      /** @description Missing/invalid token, or a valid token that isn't the admin role */
+      /** @description Not signed in */
       401: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
-      /** @description empty baseUrl, no usable key, or the endpoint rejected the request */
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Empty or non-HTTP(S) baseUrl, no usable key, or the endpoint refused */
       422: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
   };
   /**
-   * The live LLM provider configuration. `apiKey` is never included — only
-   * `hasApiKey`, whether one is currently stored. Requires an authenticated
-   * caller (see [`AuthenticatedSubject`]) — admin or a regular account, either
-   * is fine to *read* this shared, operator-level config. `canEdit` in the
-   * response tells the caller whether *writing* it (below) is open to them —
-   * today that's exactly "is this an admin token", but computed here from the
-   * resolved `Subject` rather than hard-coded on the frontend, so a future
-   * change to who's allowed to write only has to change this one line.
+   * The live LLM provider configuration. Any signed-in caller may read it;
+   * `canEdit` says whether this caller may write it.
    */
   get_llm_settings: {
     responses: {
+      /** @description The live configuration; the API key is reduced to `hasApiKey` */
       200: {
         content: {
           "application/json": components["schemas"]["LlmSettingsView"];
         };
       };
-      /** @description Missing or invalid access token */
+      /** @description Not signed in */
       401: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
   };
   /**
    * Merges a partial update onto the LLM provider configuration and applies it
-   * immediately — no restart needed. The candidate configuration is validated
-   * (the brain it describes must actually build) before anything is swapped in
-   * or written to `llm.toml`; an invalid patch is rejected with 422 and changes
-   * nothing. Admin-only (see [`CurrentAdmin`]) — a regular account can read
-   * this config through `GET /llm/settings` but not change shared, operator-
-   * level server config or its real-model spend.
+   * immediately. Admin-only.
    */
   update_llm_settings: {
     requestBody: {
@@ -1650,33 +1931,36 @@ export interface operations {
       };
     };
     responses: {
-      /** @description Applied immediately; persisted to llm.toml */
+      /** @description Applied and persisted to llm.toml; no restart needed */
       200: {
         content: {
           "application/json": components["schemas"]["LlmSettingsView"];
         };
       };
-      /** @description Missing/invalid token, or a valid token that isn't the admin role */
+      /** @description Not signed in */
       401: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
-      /** @description e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct */
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The resulting configuration would not build; nothing changed */
       422: {
         content: {
-          "text/plain": string;
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
   };
-  /**
-   * The server's mode, so the client can distinguish a mock build (no LLM,
-   * in-memory) from a production one — separately from mere reachability.
-   */
+  /** The server's mode: mock build (no LLM, in-memory) vs. production. */
   meta: {
     responses: {
-      /** @description Server capabilities */
+      /** @description Server capabilities and mode */
       200: {
         content: {
           "application/json": components["schemas"]["ServerMeta"];
@@ -1684,15 +1968,30 @@ export interface operations {
       };
     };
   };
+  /** Every organization in the workspace. */
   list_orgs: {
     responses: {
+      /** @description Every organization */
       200: {
         content: {
           "application/json": components["schemas"]["Organization"][];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
     };
   };
+  /** Creates an organization. */
   create_org: {
     requestBody: {
       content: {
@@ -1700,80 +1999,166 @@ export interface operations {
       };
     };
     responses: {
+      /** @description The created organization */
       201: {
         content: {
           "application/json": components["schemas"]["Organization"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
     };
   };
+  /** One organization by id. */
   get_org: {
     parameters: {
       path: {
-        id: string;
+        /** @description The organization to read */
+        organizationId: string;
       };
     };
     responses: {
+      /** @description The organization */
       200: {
         content: {
           "application/json": components["schemas"]["Organization"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown organization */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** Deletes an organization, cascading to its departments. */
   delete_org: {
     parameters: {
       path: {
-        id: string;
+        /** @description The organization to delete */
+        organizationId: string;
       };
     };
     responses: {
-      /** @description Deleted (cascades to its departments) */
+      /** @description Deleted, cascading to its departments */
       204: {
         content: never;
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown organization */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** Merges a partial update onto an organization. */
   update_org: {
     parameters: {
       path: {
-        id: string;
+        /** @description The organization to update */
+        organizationId: string;
       };
     };
     requestBody: {
       content: {
-        "application/json": components["schemas"]["Organization"];
+        "application/json": components["schemas"]["OrganizationPatch"];
       };
     };
     responses: {
+      /** @description The updated organization */
       200: {
         content: {
           "application/json": components["schemas"]["Organization"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown organization */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Malformed patch */
+      422: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** Every persona in the workspace — the one user identity and every AI agent. */
   list_personas: {
     responses: {
+      /** @description Every persona */
       200: {
         content: {
           "application/json": components["schemas"]["Persona"][];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
     };
   };
   /**
-   * Creates a persona. Rejects (409) a duplicate name (names are globally unique)
-   * or a second user identity (there is only ever one "you").
+   * Creates a persona. Names are globally unique, and there is only ever one
+   * user identity ("you"), so either collision is refused with 409.
    */
   create_persona: {
     requestBody: {
@@ -1782,84 +2167,161 @@ export interface operations {
       };
     };
     responses: {
+      /** @description The created persona */
       201: {
         content: {
           "application/json": components["schemas"]["Persona"];
         };
       };
-      /** @description Refused: name already in use, or a second user identity */
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Name taken, or a second user identity */
       409: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
+  /** One persona by id. */
   get_persona: {
     parameters: {
       path: {
-        id: string;
+        /** @description The persona to read */
+        personaId: string;
       };
     };
     responses: {
+      /** @description The persona */
       200: {
         content: {
           "application/json": components["schemas"]["Persona"];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown persona */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
   /**
-   * Deletes a persona. Refuses (409) to remove the last remaining user identity,
-   * since every group still needs a "you".
+   * Deletes a persona. The last remaining user identity can't go — every group
+   * still needs a "you".
    */
   delete_persona: {
     parameters: {
       path: {
-        id: string;
+        /** @description The persona to delete */
+        personaId: string;
       };
     };
     responses: {
+      /** @description Deleted */
       204: {
         content: never;
       };
-      404: {
-        content: never;
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
-      /** @description Refused: last remaining user identity */
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown persona */
+      404: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Refused: the last user identity */
       409: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
   /**
-   * Updates a persona. 404 for an unknown id; 409 for a duplicate name or a change
-   * that would produce a second user identity.
+   * Merges a partial update onto a persona. `promptHash` is recomputed from the
+   * resulting prompt; any value sent for it is ignored.
    */
   update_persona: {
     parameters: {
       path: {
-        id: string;
+        /** @description The persona to update */
+        personaId: string;
       };
     };
     requestBody: {
       content: {
-        "application/json": components["schemas"]["Persona"];
+        "application/json": components["schemas"]["PersonaPatch"];
       };
     };
     responses: {
+      /** @description The updated persona */
       200: {
         content: {
           "application/json": components["schemas"]["Persona"];
         };
       };
-      404: {
-        content: never;
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
-      /** @description Refused: name already in use, or a second user identity */
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown persona */
+      404: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Name taken, or a second user identity */
       409: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Malformed patch */
+      422: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
@@ -1870,28 +2332,42 @@ export interface operations {
   list_memories: {
     parameters: {
       path: {
+        /** @description The persona whose memories to list */
         personaId: string;
       };
     };
     responses: {
+      /** @description Every memory, newest first */
       200: {
         content: {
           "application/json": components["schemas"]["Memory"][];
         };
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown persona */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
-  /**
-   * Writes a memory for a persona, tagged with its current identity hash. 404 for
-   * an unknown persona; 409 when the persona has no prompt to scope a memory to,
-   * or the content is blank.
-   */
+  /** Writes a memory for a persona, tagged with its current identity hash. */
   create_memory: {
     parameters: {
       path: {
+        /** @description The persona to remember this for */
         personaId: string;
       };
     };
@@ -1901,37 +2377,127 @@ export interface operations {
       };
     };
     responses: {
+      /** @description The created memory */
       201: {
         content: {
           "application/json": components["schemas"]["Memory"];
         };
       };
-      404: {
-        content: never;
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
-      /** @description Refused: persona has no prompt to scope a memory to, or blank content */
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown persona */
+      404: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The persona has no prompt to scope a memory to, or blank content */
       409: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
-  /**
-   * Deletes one of a persona's memories. 404 when no such memory belongs to that
-   * persona.
-   */
+  /** Deletes one of a persona's memories. */
   delete_memory: {
     parameters: {
       path: {
+        /** @description The persona the memory belongs to */
         personaId: string;
+        /** @description The memory to delete */
         memoryId: string;
       };
     };
     responses: {
+      /** @description Deleted */
       204: {
         content: never;
       };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown memory for that persona */
       404: {
-        content: never;
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  /** The signed-in account's own display preferences. */
+  get_preferences: {
+    responses: {
+      /** @description This account's preferences */
+      200: {
+        content: {
+          "application/json": components["schemas"]["Settings"];
+        };
+      };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  /** Merges a partial update onto the account's preferences. */
+  update_preferences: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SettingsPatch"];
+      };
+    };
+    responses: {
+      /** @description The updated preferences */
+      200: {
+        content: {
+          "application/json": components["schemas"]["Settings"];
+        };
+      };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Malformed patch */
+      422: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };
@@ -1941,9 +2507,22 @@ export interface operations {
    */
   list_prompt_labels: {
     responses: {
+      /** @description Every named identity hash */
       200: {
         content: {
           "application/json": components["schemas"]["PromptLabel"][];
+        };
+      };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
@@ -1955,7 +2534,8 @@ export interface operations {
   set_prompt_label: {
     parameters: {
       path: {
-        hash: string;
+        /** @description The full persona identity hash to name */
+        promptHash: string;
       };
     };
     requestBody: {
@@ -1964,36 +2544,99 @@ export interface operations {
       };
     };
     responses: {
+      /** @description The stored label; empty when cleared */
       200: {
         content: {
           "application/json": components["schemas"]["PromptLabel"];
         };
       };
-    };
-  };
-  get_settings: {
-    responses: {
-      200: {
+      /** @description Not signed in */
+      401: {
         content: {
-          "application/json": components["schemas"]["Settings"];
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
         };
       };
     };
   };
-  update_settings: {
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["Settings"];
+  /**
+   * Cumulative LLM usage: requests, tokens, cache-hit ratio, estimated cost, and
+   * the same totals per model. Cost is always an estimate.
+   */
+  usage: {
+    parameters: {
+      query?: {
+        /** @description One group only. Omitted, covers the whole account. */
+        groupId?: string | null;
       };
     };
     responses: {
+      /** @description Usage for the requested scope */
       200: {
         content: {
-          "application/json": components["schemas"]["Settings"];
+          "application/json": components["schemas"]["DebugUsage"];
         };
       };
-      422: {
-        content: never;
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown `groupId` */
+      404: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  /**
+   * The same usage broken down by persona, highest total tokens first. Unscoped,
+   * it also includes the synthetic `system` bucket (compression, suggestions).
+   */
+  usage_by_persona: {
+    parameters: {
+      query?: {
+        /** @description One group only. Omitted, covers the whole account. */
+        groupId?: string | null;
+      };
+    };
+    responses: {
+      /** @description One entry per persona */
+      200: {
+        content: {
+          "application/json": components["schemas"]["PersonaUsage"][];
+        };
+      };
+      /** @description Not signed in */
+      401: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Not permitted for this identity */
+      403: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Unknown `groupId` */
+      404: {
+        content: {
+          "application/problem+json": components["schemas"]["ApiError"];
+        };
       };
     };
   };

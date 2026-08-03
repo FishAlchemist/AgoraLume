@@ -1,18 +1,18 @@
 //! Operator config for the real-model provider: endpoint, key, tuning, and
-//! pricing. Separate from `/settings` (`routes::workspace`), which is
-//! client-side preferences with no secret in it — this is server config with
-//! one, so it gets its own path and a response type that's never a straight
-//! serialization of the stored settings (see [`LlmSettingsView`]).
+//! pricing. Separate from `/preferences` (`routes::workspace`), which is the
+//! signed-in person's own display choices with no secret in it — this is server
+//! config with one, so it gets its own path and a response type that's never a
+//! straight serialization of the stored settings (see [`LlmSettingsView`]).
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::agent::llm::normalize_base_url;
+use crate::api_error::ApiError;
 use crate::models::{LlmModelsQuery, LlmModelsView, LlmSettingsPatch, LlmSettingsView};
 use crate::state::{AppState, AuthenticatedSubject, CurrentAdmin};
 
@@ -24,19 +24,15 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
     ))
 }
 
-/// The live LLM provider configuration. `apiKey` is never included — only
-/// `hasApiKey`, whether one is currently stored. Requires an authenticated
-/// caller (see [`AuthenticatedSubject`]) — admin or a regular account, either
-/// is fine to *read* this shared, operator-level config. `canEdit` in the
-/// response tells the caller whether *writing* it (below) is open to them —
-/// today that's exactly "is this an admin token", but computed here from the
-/// resolved `Subject` rather than hard-coded on the frontend, so a future
-/// change to who's allowed to write only has to change this one line.
+/// The live LLM provider configuration. Any signed-in caller may read it;
+/// `canEdit` says whether this caller may write it.
+//
+// `apiKey` is never included — only `hasApiKey`. Reading is open to admin and
+// regular accounts alike (see [`AuthenticatedSubject`]); `canEdit` is computed
+// here from the resolved `Subject` rather than hard-coded on the frontend, so a
+// future change to who may write only has to change this one line.
 #[utoipa::path(get, path = "/llm/settings", tag = "llm",
-    responses(
-        (status = 200, body = LlmSettingsView),
-        (status = 401, description = "Missing or invalid access token", body = String),
-    ))]
+    responses((status = 200, description = "The live configuration; the API key is reduced to `hasApiKey`", body = LlmSettingsView)))]
 async fn get_llm_settings(
     AuthenticatedSubject(subject): AuthenticatedSubject,
     State(s): State<Arc<AppState>>,
@@ -47,29 +43,26 @@ async fn get_llm_settings(
 }
 
 /// Merges a partial update onto the LLM provider configuration and applies it
-/// immediately — no restart needed. The candidate configuration is validated
-/// (the brain it describes must actually build) before anything is swapped in
-/// or written to `llm.toml`; an invalid patch is rejected with 422 and changes
-/// nothing. Admin-only (see [`CurrentAdmin`]) — a regular account can read
-/// this config through `GET /llm/settings` but not change shared, operator-
-/// level server config or its real-model spend.
+/// immediately. Admin-only.
+//
+// The candidate configuration is validated — the brain it describes must
+// actually build — before anything is swapped in or written to `llm.toml`, so a
+// rejected patch changes nothing. Admin-only (see [`CurrentAdmin`]): a regular
+// account can read this config but not change shared operator-level server
+// config or its real-model spend.
 #[utoipa::path(patch, path = "/llm/settings", tag = "llm",
     request_body = LlmSettingsPatch,
     responses(
-        (status = 200, description = "Applied immediately; persisted to llm.toml", body = LlmSettingsView),
-        (status = 401, description = "Missing/invalid token, or a valid token that isn't the admin role", body = String),
-        (status = 422, description = "e.g. enabled=true without both baseUrl and model, or an endpoint that fails to construct", body = String),
-    ))]
+        (status = 200, description = "Applied and persisted to llm.toml; no restart needed", body = LlmSettingsView),
+        (status = 422, description = "The resulting configuration would not build; nothing changed")))]
 async fn update_llm_settings(
     _admin: CurrentAdmin,
     State(s): State<Arc<AppState>>,
     Json(patch): Json<LlmSettingsPatch>,
-) -> Result<Json<LlmSettingsView>, (StatusCode, String)> {
+) -> Result<Json<LlmSettingsView>, ApiError> {
     let mut settings = s.llm_settings();
     patch.apply(&mut settings);
-    let applied = s
-        .apply_llm_settings(settings)
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let applied = s.apply_llm_settings(settings).map_err(ApiError::unprocessable)?;
     if s.auth_required() {
         tracing::info!("LLM provider settings updated by admin");
     } else {
@@ -82,39 +75,62 @@ async fn update_llm_settings(
     Ok(Json(view))
 }
 
-/// Lists the models a provider endpoint offers, so the Settings page can offer
-/// a picker instead of a blind text field. `apiKey` is optional: when omitted,
-/// the stored key is used, but *only* when `baseUrl` names the same endpoint
-/// already configured — otherwise the request must carry its own key. Without
-/// that check, an operator (or anything else that can reach this API) could
-/// point `baseUrl` at an arbitrary third-party URL and have the server hand it
-/// the real provider key in an outbound `Authorization` header. Admin-only
-/// (see [`CurrentAdmin`]) — it exists only to serve the edit workflow above,
-/// and it can spend the stored key on an outbound request, which a read-only
-/// account has no reason to trigger.
+/// Lists the models a provider endpoint offers, so the model field can be a
+/// picker. Admin-only. `apiKey` is required unless `baseUrl` matches the
+/// already-configured endpoint.
+//
+// That last rule is the credential guard: without it, pointing `baseUrl` at an
+// arbitrary third-party URL and omitting `apiKey` would have the server hand
+// that URL the real provider key in an outbound `Authorization` header. A POST
+// rather than a GET because the body may carry a key, and a URL gets logged by
+// every proxy in between. Admin-only (see [`CurrentAdmin`]) — it can spend the
+// stored key on an outbound request.
 #[utoipa::path(post, path = "/llm/models", tag = "llm",
     request_body = LlmModelsQuery,
     responses(
-        (status = 200, body = LlmModelsView),
-        (status = 401, description = "Missing/invalid token, or a valid token that isn't the admin role", body = String),
-        (status = 422, description = "empty baseUrl, no usable key, or the endpoint rejected the request", body = String),
-    ))]
+        (status = 200, description = "The models that endpoint reports", body = LlmModelsView),
+        (status = 422, description = "Empty or non-HTTP(S) baseUrl, no usable key, or the endpoint refused")))]
 async fn list_llm_models(
     _admin: CurrentAdmin,
     State(s): State<Arc<AppState>>,
     Json(query): Json<LlmModelsQuery>,
-) -> Result<Json<LlmModelsView>, (StatusCode, String)> {
+) -> Result<Json<LlmModelsView>, ApiError> {
     let base_url = query.base_url.trim();
     if base_url.is_empty() {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "baseUrl is required".to_string()));
+        return Err(ApiError::unprocessable("baseUrl is required"));
     }
+    check_outbound_scheme(base_url).map_err(ApiError::unprocessable)?;
     let stored = s.llm_settings();
-    let api_key = resolve_api_key(query.api_key, base_url, stored.base_url.as_deref(), stored.api_key)
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    let models = crate::agent::llm::list_models(base_url, &api_key)
-        .await
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let api_key =
+        resolve_api_key(query.api_key, base_url, stored.base_url.as_deref(), stored.api_key)
+            .map_err(ApiError::unprocessable)?;
+    let models =
+        crate::agent::llm::list_models(base_url, &api_key).await.map_err(ApiError::unprocessable)?;
     Ok(Json(LlmModelsView { models }))
+}
+
+/// Refuses a `baseUrl` this server has no business dialling.
+///
+/// This endpoint is the one place the API makes an *outbound* request to an
+/// address the caller chose, so the caller's string is treated as hostile even
+/// though only an admin can reach it. A scheme check stops the categories that
+/// aren't HTTP at all — `file://`, `gopher://`, and anything else a URL parser
+/// downstream might be talked into.
+///
+/// Private and loopback addresses are deliberately **not** blocked: running a
+/// local model server (Ollama, LM Studio, llama.cpp) at `127.0.0.1` or on a LAN
+/// host is a first-class way to use this project, and blocking RFC 1918 would
+/// break that to defend against a caller who already holds an admin token and
+/// can rewrite `llm.toml` anyway. The residual risk is that an admin can use
+/// the server as an HTTP client against hosts it can reach; that is inherent to
+/// the feature, not incidental to it.
+fn check_outbound_scheme(base_url: &str) -> Result<(), String> {
+    let lowered = base_url.to_ascii_lowercase();
+    if lowered.starts_with("http://") || lowered.starts_with("https://") {
+        Ok(())
+    } else {
+        Err("baseUrl must be an http:// or https:// URL".to_string())
+    }
 }
 
 /// The api-key half of [`list_llm_models`]'s guard, pulled out as a pure

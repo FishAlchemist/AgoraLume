@@ -1,5 +1,6 @@
 import { useAuth } from '../../store/auth';
 import { useConnection } from '../../store/connection';
+import { logout } from './auth';
 import { versionedBase } from './version';
 
 // Concurrent 401s (a page loading several resources at once) must trigger one
@@ -43,12 +44,39 @@ export async function refreshAccessToken(): Promise<boolean> {
 }
 
 /**
+ * Signs out for real: clears the local session *and* revokes both tokens
+ * server-side.
+ *
+ * Clearing the store alone only made this browser forget the tokens — the
+ * server kept honouring them until they expired, so a captured token outlived
+ * the sign-out by up to 30 days (the refresh token's lifetime). Local state is
+ * cleared first and unconditionally: a network failure must never leave the
+ * user still signed in on the screen, so the server call is best-effort.
+ */
+export async function signOut(): Promise<void> {
+  const { backendUrl } = useConnection.getState();
+  const { accessToken, refreshToken } = useAuth.getState();
+  useAuth.getState().clear();
+  if (!backendUrl) return;
+  try {
+    await logout(backendUrl, accessToken, refreshToken);
+  } catch {
+    // Offline, or a backend that's already gone. The tokens die with it.
+  }
+}
+
+/**
  * `fetch`, with the stored access token attached as `Authorization: Bearer`.
  * A 401 triggers one refresh-and-retry — the access token is short-lived by
  * design (15 minutes), so this is the expected way it renews, not a rare
  * failure path. If the refresh token itself is missing or no longer works,
  * the session is cleared so the login gate (see `pages/LoginPage`) reappears;
  * the original 401 is still returned to the caller either way.
+ *
+ * A 403 is deliberately *not* retried: it means the server authenticated this
+ * caller and refused them anyway, so a fresher token of the same identity
+ * would be refused identically. The backend used to answer 401 for that case
+ * too, which sent every permission denial through a pointless refresh.
  */
 export async function authFetch(input: string, init: RequestInit = {}): Promise<Response> {
   const attempt = () => {
